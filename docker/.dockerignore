@@ -1,0 +1,6 @@
+target/
+.git/
+.env*
+flux/
+docker/
+README.md

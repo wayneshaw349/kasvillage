@@ -1,0 +1,18 @@
+# --- Stage 1: Builder ---
+FROM rust:1.75-slim-bookworm as builder
+WORKDIR /usr/src/app
+COPY . .
+# Note: This assumes you have a binary target named "validator" in Cargo.toml
+# If not, change "--bin validator" to your actual binary name
+RUN cargo build --release --bin validator
+
+# --- Stage 2: Runtime ---
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/src/app/target/release/validator /usr/local/bin/validator
+
+# Validators might not need incoming ports, but we expose 80 just in case
+EXPOSE 80
+
+CMD ["validator"]

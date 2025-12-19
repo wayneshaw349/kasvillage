@@ -28,4 +28,4 @@ jobs:
           file: ./docker/Dockerfile.tier1-frontend
           push: true
           # REPLACE 'yourusername' below with your actual Docker Hub username!
-          tags: kasking/kasvillage-frontend:v1
+          tags: wayneshaw349/kasvillage-frontend:v1

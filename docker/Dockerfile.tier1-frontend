@@ -1,0 +1,29 @@
+# --- Stage 1: The Builder ---
+FROM rust:1.75-slim-bookworm as builder
+WORKDIR /usr/src/app
+
+# Copy manifest files first
+COPY Cargo.toml Cargo.lock ./
+
+# Create a dummy main file to build dependencies 
+mkdir src
+RUN echo "fn main() {}" > src/main.rs
+RUN cargo build --release
+
+# Now copy your REAL source code
+COPY src ./src
+
+# Build your application for release
+RUN touch src/main.rs && cargo build --release
+
+# --- Stage 2: The Runtime ---
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Copy the binary
+COPY --from=builder /usr/src/app/target/release/kasvillage /usr/local/bin/app
+
+EXPOSE 8080
+
+CMD ["app"]

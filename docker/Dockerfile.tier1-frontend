@@ -1,29 +1,83 @@
-# --- Stage 1: The Builder ---
-FROM rust:1.75-slim-bookworm as builder
-WORKDIR /usr/src/app
+# Dockerfile for KasVillage L2 Frontend (Tier 1 - Public)
+# ============================================================================
+# Stage 1: Build Rust binary
+# ============================================================================
+FROM rust:1.75-slim as builder
 
-# Copy manifest files first
+WORKDIR /build
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy source code (CORRECTED for your GitHub repo)
 COPY Cargo.toml Cargo.lock ./
-
-# Create a dummy main file to build dependencies 
-mkdir src
-RUN echo "fn main() {}" > src/main.rs
-RUN cargo build --release
-
-# Now copy your REAL source code
 COPY src ./src
 
-# Build your application for release
-RUN touch src/main.rs && cargo build --release
+# Build with L2 frontend feature only
+# Note: We assume the package name in Cargo.toml is "kasvillage-l2" OR we build default
+RUN cargo build --release --bin kasvillage-l2 2>&1 | tee build.log
 
-# --- Stage 2: The Runtime ---
+# Check binary was created
+RUN ls -lh target/release/kasvillage-l2 || (cat build.log && exit 1)
+
+# ============================================================================
+# Stage 2: Runtime image
+# ============================================================================
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy the binary
-COPY --from=builder /usr/src/app/target/release/kasvillage /usr/local/bin/app
+# Create non-root user for security
+RUN useradd -m -u 1000 -s /bin/bash kasvillage
 
-EXPOSE 8080
+# Copy binary from builder
+COPY --from=builder /build/target/release/kasvillage-l2 /usr/local/bin/kasvillage-l2
 
-CMD ["app"]
+# Make binary executable
+RUN chmod +x /usr/local/bin/kasvillage-l2
+
+# Set working directory
+WORKDIR /app
+
+# Create necessary directories
+RUN mkdir -p /app/cache /app/logs && \
+    chown -R kasvillage:kasvillage /app
+
+# Switch to non-root user
+USER kasvillage
+
+# ============================================================================
+# Environment Variables
+# ============================================================================
+ENV L2_API_PORT=8080
+ENV L2_WS_PORT=8081
+ENV LOG_LEVEL=info
+
+# ============================================================================
+# Health Check
+# ============================================================================
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:${L2_API_PORT}/api/health || exit 1
+
+# ============================================================================
+# Ports & Entry
+# ============================================================================
+EXPOSE 8080 8081 9090
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+CMD ["kasvillage-l2", \
+     "--port", "8080", \
+     "--ws-port", "8081", \
+     "--network", "testnet", \
+     "--mode", "frontend-only"]

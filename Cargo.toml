@@ -79,15 +79,4 @@ generic-array = "1.3.5"
 num-traits = "0.2.19"
 num-bigint = "0.4.6"
 
-# -----------------------------------------------------------------------------
-# CONFIGURATION
-# -----------------------------------------------------------------------------
 
-# !!! [[bin]] SECTION REMOVED !!!
-# Rust will now automatically look for src/main.rs
-# and name the binary "kasvillage-l2" (matching the package name at top)
-
-[lib]
-name = "kasvillage_l2"
-path = "src/lib.rs"
-crate-type = ["cdylib", "staticlib"]

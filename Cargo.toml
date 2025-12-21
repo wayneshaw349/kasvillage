@@ -3,7 +3,6 @@ name = "kasvillage-l2"
 version = "0.1.0"
 edition = "2021"
 
-# Optimize for size and speed in release mode
 [profile.release]
 opt-level = 3
 lto = true
@@ -14,17 +13,17 @@ strip = true
 # DEPENDENCIES
 # -----------------------------------------------------------------------------
 [dependencies]
-# --- AWS for Akash Backups ---
+# --- AWS ---
 aws-config = "1.1"
 aws-sdk-s3 = "1.14"
 
-# --- Core Async & Runtime ---
+# --- Core ---
 tokio = { version = "1.36", features = ["full"] }
 futures = "0.3"
 async-trait = "0.1"
 num_cpus = "1.16"
 
-# --- Web Server & Networking ---
+# --- Web ---
 actix-web = "4.5"
 actix-rt = "2.9"
 actix-web-actors = "4.3"
@@ -44,8 +43,7 @@ base64 = "0.22"
 # --- Database ---
 rusqlite = { version = "0.31", features = ["bundled"] }
 
-# --- Cryptography: L1 (Kaspa/Bitcoin) ---
-# FIXES "could not find ecdh": We explicitly enable the "ecdh" feature here
+# --- Crypto ---
 k256 = { version = "0.13.4", features = ["arithmetic", "ecdsa", "schnorr", "serde", "ecdh"] }
 sha2 = "0.10"
 blake2 = "0.10"
@@ -56,11 +54,9 @@ aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 rand = "0.8"
 getrandom = "0.2"
-
-# FIXES "unresolved import hkdf": We explicitly include the crate here
 hkdf = "0.12.4"
 
-# --- Cryptography: L2 (ZK & FROST) ---
+# --- L2 Crypto ---
 frost-secp256k1 = "1.0.0"
 halo2_proofs = "0.3.0"
 pasta_curves = { version = "0.5", features = ["repr-c", "serde"] }
@@ -68,11 +64,9 @@ ff = "0.13"
 group = "0.13"
 subtle = "2.5"
 neptune = "10.0.0"
-
-# Explicitly alias rand_core for Halo2 compatibility
 rand_core_legacy = { package = "rand_core", version = "0.6" }
 
-# --- Utilities ---
+# --- Utils ---
 uuid = { version = "1.7", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1.0"
@@ -89,12 +83,10 @@ num-bigint = "0.4.6"
 # CONFIGURATION
 # -----------------------------------------------------------------------------
 
-# This builds your 46k line backend file
-[[bin]]
-name = "kasvillage-backend"
-path = "src/bin/backend.rs"
+# !!! [[bin]] SECTION REMOVED !!!
+# Rust will now automatically look for src/main.rs
+# and name the binary "kasvillage-l2" (matching the package name at top)
 
-# This keeps the library structure valid
 [lib]
 name = "kasvillage_l2"
 path = "src/lib.rs"

@@ -1,4 +1,4 @@
-# Dockerfile for KasVillage Backend (Rust)
+# Dockerfile for KasVillage Backend (Standard Rust Setup)
 # ============================================================================
 # Stage 1: Build
 # ============================================================================
@@ -18,15 +18,16 @@ RUN apt-get update && apt-get install -y \
 
 # Copy configuration and source
 COPY Cargo.toml .
-# No Cargo.lock yet, so we don't copy it
+# No Cargo.lock yet
 COPY src ./src
 
-# Build the BACKEND binary
-# We explicitly target the name defined in [[bin]] of Cargo.toml
-RUN cargo build --release --bin kasvillage-backend 2>&1 | tee build.log
+# Build the binary
+# We removed the --bin flag. Rust will auto-detect src/main.rs
+# and name the binary "kasvillage-l2" (matching Cargo.toml package name)
+RUN cargo build --release 2>&1 | tee build.log
 
-# Verify the binary exists (This is where your build failed last time)
-RUN ls -lh target/release/kasvillage-backend || (cat build.log && exit 1)
+# Verify the binary exists (Look for kasvillage-l2 now)
+RUN ls -lh target/release/kasvillage-l2 || (cat build.log && exit 1)
 
 # ============================================================================
 # Stage 2: Runtime
@@ -42,8 +43,8 @@ RUN apt-get update && apt-get install -y \
 # Create user
 RUN useradd -m -u 1000 -s /bin/bash kasvillage
 
-# Copy the binary from the builder
-COPY --from=builder /build/target/release/kasvillage-backend /usr/local/bin/app
+# Copy the binary from the builder (Note the name change!)
+COPY --from=builder /build/target/release/kasvillage-l2 /usr/local/bin/app
 
 # Permissions
 RUN chmod +x /usr/local/bin/app

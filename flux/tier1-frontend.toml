@@ -1,0 +1,29 @@
+# Flux App Configuration for KasVillage UI
+version = "1.0"
+
+[metadata]
+name = "kasvillage-frontend"
+description = "KasVillage L2 - Community UI"
+owner = "wayneshaw349" 
+
+[docker]
+# CRITICAL: This points to your REACT image, not the backend!
+image = "wayneshaw349/kasvillage-ui:v1"
+containerPort = 80
+
+[networking]
+# Flux will map this internal port 80 to a public URL
+port = 80
+allowedPorts = [80]
+# Enable this if you want a custom domain later (e.g. app.kasvillage.io)
+domains = [""] 
+
+[resources]
+# Low specs are fine for a static website
+cpu = 0.5
+ram = 1024  # 1 GB
+hdd = 5     # 5 GB Storage
+
+[environment]
+# This helps the UI know it is running in "Production" mode
+NODE_ENV = "production"

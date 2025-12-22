@@ -1,0 +1,48 @@
+---
+version: "2.0"
+
+services:
+  backend:
+    # This matches the image we just successfully built!
+    image: wayneshaw349/kasvillage-frontend:v1
+    expose:
+      - port: 8080
+        as: 80
+        to:
+          - global: true
+    env:
+      - "RUST_LOG=info"
+      - "APP_MODE=backend"
+      - "AWS_REGION=us-east-1"
+      - "AWS_BUCKET_NAME=kasvillage-backups"
+      # NOTE: You must add AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+      # manually in the Cloudmos "Variables" section!
+
+profiles:
+  compute:
+    backend-profile:
+      resources:
+        cpu:
+          units: 2.0
+        memory:
+          size: 4Gi
+        storage:
+          size: 20Gi  # Plenty of space for blockchain data/logs
+
+  placement:
+    dcloud:
+      attributes:
+        host: akash
+      signedBy:
+        anyOf:
+          - "akash1365yvmc4s7awdyj3n2sav7xfx76adc6dnmlx63"
+      pricing:
+        backend-profile:
+          denom: uakt
+          amount: 5000 # Max price per block (approx $5-8/month)
+
+deployment:
+  backend:
+    dcloud:
+      profile: backend-profile
+      count: 1

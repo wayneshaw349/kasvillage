@@ -1,29 +1,60 @@
-# --- Stage 1: The Builder ---
-FROM rust:1.75-slim-bookworm as builder
-WORKDIR /usr/src/app
+# Dockerfile for KasVillage Backend (Standard Rust Setup)
+# ============================================================================
+# Stage 1: Build
+# ============================================================================
+# UPDATED: Using 'latest' to fix "edition2024" errors
+FROM rust:latest as builder
 
-# Copy manifest files first
-COPY Cargo.toml Cargo.lock ./
+WORKDIR /build
 
-# Create a dummy main file to build dependencies
-mkdir src
-RUN echo "fn main() {}" > src/main.rs
-RUN cargo build --release
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    git \
+    clang \
+    && rm -rf /var/lib/apt/lists/*
 
-# Now copy your REAL source code
+# Copy configuration and source
+COPY Cargo.toml .
+# No Cargo.lock yet
 COPY src ./src
 
-# Build your application for release
-RUN touch src/main.rs && cargo build --release
+# Build the binary
+# Rust will auto-detect src/main.rs and name the binary "kasvillage-l2"
+RUN cargo build --release 2>&1 | tee build.log
 
-# --- Stage 2: The Runtime ---
+# Verify the binary exists
+RUN ls -lh target/release/kasvillage-l2 || (cat build.log && exit 1)
+
+# ============================================================================
+# Stage 2: Runtime
+# ============================================================================
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy the binary
-COPY --from=builder /usr/src/app/target/release/kasvillage /usr/local/bin/app
+# Create user
+RUN useradd -m -u 1000 -s /bin/bash kasvillage
 
+# Copy the binary from the builder
+COPY --from=builder /build/target/release/kasvillage-l2 /usr/local/bin/app
+
+# Permissions
+RUN chmod +x /usr/local/bin/app
+WORKDIR /app
+RUN chown -R kasvillage:kasvillage /app
+USER kasvillage
+
+# Config
 EXPOSE 8080
+ENTRYPOINT ["/usr/bin/tini", "--"]
 
+# Run the app
 CMD ["app"]

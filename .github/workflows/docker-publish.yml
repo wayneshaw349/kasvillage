@@ -28,7 +28,7 @@ jobs:
           # context remains "." so it can see Cargo.toml in the root
           context: .
           # UPDATED: This now points to the src folder
-          file: ./src/Dockerfile 
+          file: ./Dockerfile 
           push: true
           platforms: linux/amd64
           tags: |

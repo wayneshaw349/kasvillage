@@ -1,6 +1,11 @@
 target/
 .git/
-.env*
-flux/
-docker/
+.github/
+node_modules/
+dist/
+.gitignore
+.env
+.env.local
 README.md
+LICENSE
+*.md

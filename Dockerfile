@@ -1,12 +1,6 @@
-# ============================================================================
-# KASVILLAGE-L2 AKASH DEPLOYMENT DOCKERFILE
-# Using latest Rust to support Edition 2024 and rustc 1.88+ dependencies
-# ============================================================================
-
 # Stage 1: Build
-FROM rust:1.88-slim-bookworm AS builder
+FROM rust:1.83-slim-bookworm AS builder
 
-# Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
@@ -16,18 +10,12 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy manifests
-COPY Cargo.toml Cargo.lock ./
-
-# Pre-build dummy to cache heavy dependencies
+COPY Cargo.toml Cargo.lock* ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release || true
 RUN rm -rf src
 
-# Copy actual source code
 COPY src ./src
-
-# Build the actual binary
 RUN cargo build --release
 
 # Stage 2: Runtime
@@ -42,7 +30,6 @@ RUN apt-get update && apt-get install -y \
 RUN useradd -m -u 1000 kasvillage
 WORKDIR /app
 
-# Copy binary from builder stage
 COPY --from=builder /app/target/release/kasvillage-l2 /usr/local/bin/kasvillage
 
 RUN chown -R kasvillage:kasvillage /app
@@ -53,9 +40,7 @@ ENV APP_MODE=backend
 
 EXPOSE 8080
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8080/api/health || exit 1
 
-# Start server
 CMD ["kasvillage", "--port", "8080", "--network", "mainnet"]

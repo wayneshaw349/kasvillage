@@ -1118,6 +1118,14 @@ pub fn fr_to_bytes(f: Fq) -> [u8; 32] {
     field_to_bytes(f)
 }
 
+/// Get current unix timestamp in seconds
+pub fn get_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 /// Convert field to full 256-bit integer as [u64; 4] (little-endian)
 pub fn field_to_u64_array(f: Fq) -> [u64; 4] {
     let repr = f.to_repr();
@@ -23959,6 +23967,501 @@ mod tests_sanctions {
 }
 
 // ============================================================================
+// SECTION: NETWORK-BASED SANCTION SCREENING (OFAC/EU API)
+// ============================================================================
+//
+// Enhanced sanction screening with network fetching:
+//   1. Local cache for fast lookups
+//   2. Network API calls to OFAC/EU databases
+//   3. Background sync every 6 hours
+//   4. Confidence scoring based on network health
+//
+// ============================================================================
+
+/// Sanction list types for multi-jurisdiction compliance
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum SanctionListType {
+    OFAC,
+    EU,
+    UN,
+    UK,
+    Custom,
+}
+
+/// Entity on a sanctions list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SanctionedEntity {
+    pub pubkey: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub reason: String,
+    pub date_added: u64,
+    pub list_type: SanctionListType,
+}
+
+/// Result of screening a pubkey against sanctions lists
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SanctionScreeningResult {
+    pub is_sanctioned: bool,
+    pub pubkey: String,
+    pub reasons: Vec<String>,
+    pub lists: Vec<SanctionListType>,
+    pub confidence: f64,
+    pub checked_at: u64,
+}
+
+/// Network-based sanction screening with local cache
+pub struct SanctionNetwork {
+    local_cache: Arc<RwLock<HashMap<String, SanctionedEntity>>>,
+    ofac_url: String,
+    eu_url: String,
+    update_interval_secs: u64,
+    last_sync: Arc<RwLock<u64>>,
+    network_healthy: Arc<RwLock<bool>>,
+}
+
+impl SanctionNetwork {
+    /// Create new SanctionNetwork with initial entities
+    pub async fn new(
+        ofac_url: String,
+        eu_url: String,
+        initial_list: Vec<SanctionedEntity>,
+    ) -> Self {
+        let mut cache = HashMap::new();
+        for entity in initial_list {
+            cache.insert(entity.pubkey.clone(), entity);
+        }
+
+        Self {
+            local_cache: Arc::new(RwLock::new(cache)),
+            ofac_url,
+            eu_url,
+            update_interval_secs: 21600, // 6 hours
+            last_sync: Arc::new(RwLock::new(get_unix_timestamp())),
+            network_healthy: Arc::new(RwLock::new(true)),
+        }
+    }
+
+    /// Screen a pubkey against sanctions lists
+    pub async fn screen_pubkey(&self, pubkey: &str) -> SanctionScreeningResult {
+        let cache = self.local_cache.read().await;
+        
+        if let Some(entity) = cache.get(pubkey) {
+            return SanctionScreeningResult {
+                is_sanctioned: true,
+                pubkey: pubkey.to_string(),
+                reasons: vec![entity.reason.clone()],
+                lists: vec![entity.list_type.clone()],
+                confidence: 0.99,
+                checked_at: get_unix_timestamp(),
+            };
+        }
+        drop(cache);
+
+        // Cache miss - try network if healthy
+        let network_ok = *self.network_healthy.read().await;
+        if network_ok {
+            if let Ok(result) = self.network_screen(pubkey).await {
+                return result;
+            }
+        }
+
+        // Fallback: not sanctioned but uncertain confidence
+        SanctionScreeningResult {
+            is_sanctioned: false,
+            pubkey: pubkey.to_string(),
+            reasons: vec![],
+            lists: vec![],
+            confidence: if network_ok { 0.95 } else { 0.5 },
+            checked_at: get_unix_timestamp(),
+        }
+    }
+
+    /// Network-based screening
+    async fn network_screen(&self, pubkey: &str) -> Result<SanctionScreeningResult, String> {
+        // Try OFAC
+        if let Ok(result) = self.query_ofac(pubkey).await {
+            if result.is_sanctioned {
+                self.cache_entity(pubkey, result.clone()).await;
+                return Ok(result);
+            }
+        }
+
+        // Try EU
+        if let Ok(result) = self.query_eu_list(pubkey).await {
+            if result.is_sanctioned {
+                self.cache_entity(pubkey, result.clone()).await;
+                return Ok(result);
+            }
+        }
+
+        Ok(SanctionScreeningResult {
+            is_sanctioned: false,
+            pubkey: pubkey.to_string(),
+            reasons: vec![],
+            lists: vec![],
+            confidence: 0.95,
+            checked_at: get_unix_timestamp(),
+        })
+    }
+
+    /// Query OFAC API
+    async fn query_ofac(&self, pubkey: &str) -> Result<SanctionScreeningResult, String> {
+        let client = reqwest::Client::new();
+        let url = format!("{}/check?pubkey={}", self.ofac_url, pubkey);
+
+        match client.get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+            Ok(response) => {
+                match response.json::<SanctionScreeningResult>().await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(format!("OFAC parse error: {}", e)),
+                }
+            }
+            Err(e) => {
+                *self.network_healthy.write().await = false;
+                Err(format!("OFAC network error: {}", e))
+            }
+        }
+    }
+
+    /// Query EU sanctions API
+    async fn query_eu_list(&self, pubkey: &str) -> Result<SanctionScreeningResult, String> {
+        let client = reqwest::Client::new();
+        let url = format!("{}/check?pubkey={}", self.eu_url, pubkey);
+
+        match client.get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+            Ok(response) => {
+                match response.json::<SanctionScreeningResult>().await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(format!("EU parse error: {}", e)),
+                }
+            }
+            Err(_e) => Err("EU network error".to_string()),
+        }
+    }
+
+    /// Cache a sanctioned entity
+    async fn cache_entity(&self, pubkey: &str, result: SanctionScreeningResult) {
+        if result.is_sanctioned {
+            let entity = SanctionedEntity {
+                pubkey: pubkey.to_string(),
+                name: format!("Unknown_{}", &pubkey[..pubkey.len().min(8)]),
+                aliases: vec![],
+                reason: result.reasons.first().cloned().unwrap_or_default(),
+                date_added: get_unix_timestamp(),
+                list_type: result.lists.first().cloned().unwrap_or(SanctionListType::OFAC),
+            };
+            self.local_cache.write().await.insert(pubkey.to_string(), entity);
+        }
+    }
+
+    /// Background sync task (call from tokio::spawn)
+    pub async fn background_sync(&self) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(self.update_interval_secs)).await;
+
+            match self.full_sync().await {
+                Ok(_) => {
+                    *self.network_healthy.write().await = true;
+                    log::info!("Sanction list sync successful");
+                }
+                Err(e) => {
+                    *self.network_healthy.write().await = false;
+                    log::error!("Sanction list sync failed: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Full sync from all sanction list APIs
+    async fn full_sync(&self) -> Result<(), String> {
+        let client = reqwest::Client::new();
+
+        // Sync OFAC
+        let ofac_resp = client
+            .get(&format!("{}/all", self.ofac_url))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("OFAC sync failed: {}", e))?;
+
+        let ofac_entities: Vec<SanctionedEntity> = ofac_resp
+            .json()
+            .await
+            .map_err(|e| format!("OFAC parse failed: {}", e))?;
+
+        // Sync EU
+        let eu_resp = client
+            .get(&format!("{}/all", self.eu_url))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("EU sync failed: {}", e))?;
+
+        let eu_entities: Vec<SanctionedEntity> = eu_resp
+            .json()
+            .await
+            .map_err(|e| format!("EU parse failed: {}", e))?;
+
+        // Merge into cache
+        let mut cache = self.local_cache.write().await;
+        for entity in ofac_entities.into_iter().chain(eu_entities) {
+            cache.insert(entity.pubkey.clone(), entity);
+        }
+
+        *self.last_sync.write().await = get_unix_timestamp();
+        Ok(())
+    }
+
+    /// Get cache size
+    pub async fn cache_size(&self) -> usize {
+        self.local_cache.read().await.len()
+    }
+
+    /// Check if network is healthy
+    pub async fn is_healthy(&self) -> bool {
+        *self.network_healthy.read().await
+    }
+}
+
+/// Health status for sanction network
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SanctionNetworkHealth {
+    pub cache_size: usize,
+    pub is_healthy: bool,
+    pub last_sync: u64,
+}
+
+/// Geo-blocking configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoBlockingConfig {
+    pub enabled: bool,
+    pub blocked_countries: HashSet<String>,
+    pub require_country_verification: bool,
+}
+
+/// Enhanced geo-blocking service
+pub struct GeoBlockingServiceV2 {
+    config: Arc<RwLock<GeoBlockingConfig>>,
+}
+
+impl GeoBlockingServiceV2 {
+    pub fn new(config: GeoBlockingConfig) -> Self {
+        Self {
+            config: Arc::new(RwLock::new(config)),
+        }
+    }
+
+    pub async fn check_location(&self, country_code: &str) -> Result<bool, String> {
+        let cfg = self.config.read().await;
+        if !cfg.enabled {
+            return Ok(true);
+        }
+        Ok(!cfg.blocked_countries.contains(&country_code.to_uppercase()))
+    }
+
+    pub async fn update_blocked_countries(&self, countries: HashSet<String>) {
+        let mut cfg = self.config.write().await;
+        cfg.blocked_countries = countries;
+    }
+}
+
+/// Compliance check request for API
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComplianceCheckRequestV2 {
+    pub pubkey: String,
+    pub country_code: Option<String>,
+    pub amount_kas: Option<u64>,
+}
+
+/// Compliance check response for API
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComplianceCheckResponseV2 {
+    pub pubkey: String,
+    pub is_compliant: bool,
+    pub sanction_result: SanctionScreeningResult,
+    pub geo_allowed: Option<bool>,
+    pub reason: String,
+}
+
+/// Combined compliance engine
+pub struct ComplianceEngineV2 {
+    sanction_network: Arc<SanctionNetwork>,
+    geo_blocking: Arc<GeoBlockingServiceV2>,
+}
+
+impl ComplianceEngineV2 {
+    pub fn new(sanction_network: Arc<SanctionNetwork>, geo_blocking: Arc<GeoBlockingServiceV2>) -> Self {
+        Self {
+            sanction_network,
+            geo_blocking,
+        }
+    }
+
+    pub async fn check_transaction(&self, req: &ComplianceCheckRequestV2) -> ComplianceCheckResponseV2 {
+        let sanction_result = self.sanction_network.screen_pubkey(&req.pubkey).await;
+
+        let geo_allowed = if let Some(country) = &req.country_code {
+            self.geo_blocking.check_location(country).await.ok()
+        } else {
+            None
+        };
+
+        let is_compliant = !sanction_result.is_sanctioned &&
+            geo_allowed.unwrap_or(true);
+
+        let reason = if sanction_result.is_sanctioned {
+            format!("Sanctioned: {}", sanction_result.reasons.join(", "))
+        } else if geo_allowed == Some(false) {
+            format!("Country {} blocked", req.country_code.as_deref().unwrap_or("unknown"))
+        } else {
+            "Compliant".to_string()
+        };
+
+        ComplianceCheckResponseV2 {
+            pubkey: req.pubkey.clone(),
+            is_compliant,
+            sanction_result,
+            geo_allowed,
+            reason,
+        }
+    }
+}
+
+/// Initialize compliance system with default blocked countries
+pub async fn initialize_compliance_v2(
+    ofac_url: String,
+    eu_url: String,
+) -> (Arc<SanctionNetwork>, Arc<ComplianceEngineV2>) {
+    let sanction_network = Arc::new(SanctionNetwork::new(
+        ofac_url,
+        eu_url,
+        vec![],
+    ).await);
+
+    let geo_blocking = Arc::new(GeoBlockingServiceV2::new(GeoBlockingConfig {
+        enabled: true,
+        blocked_countries: {
+            let mut set = HashSet::new();
+            set.insert("KP".to_string()); // North Korea
+            set.insert("IR".to_string()); // Iran
+            set.insert("SY".to_string()); // Syria
+            set.insert("CU".to_string()); // Cuba
+            set.insert("RU".to_string()); // Russia (partial)
+            set
+        },
+        require_country_verification: true,
+    }));
+
+    let engine = Arc::new(ComplianceEngineV2::new(sanction_network.clone(), geo_blocking));
+
+    // Start background sync
+    let sync_network = sanction_network.clone();
+    tokio::spawn(async move {
+        sync_network.background_sync().await;
+    });
+
+    (sanction_network, engine)
+}
+
+// Actix-web API handlers for compliance
+async fn compliance_check_v2_handler(
+    engine: web::Data<Arc<ComplianceEngineV2>>,
+    req: web::Json<ComplianceCheckRequestV2>,
+) -> impl actix_web::Responder {
+    let result = engine.check_transaction(&req).await;
+    HttpResponse::Ok().json(result)
+}
+
+async fn sanction_screen_handler(
+    network: web::Data<Arc<SanctionNetwork>>,
+    pubkey: web::Path<String>,
+) -> impl actix_web::Responder {
+    let result = network.screen_pubkey(&pubkey).await;
+    HttpResponse::Ok().json(result)
+}
+
+/// Configure compliance API routes
+pub fn configure_compliance_routes_v2(cfg: &mut web::ServiceConfig) {
+    cfg.service(
+        web::scope("/api/compliance")
+            .route("/check", web::post().to(compliance_check_v2_handler))
+            .route("/screen/{pubkey}", web::get().to(sanction_screen_handler))
+    );
+}
+
+#[cfg(test)]
+mod tests_sanction_network {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_sanction_network_cache() {
+        let entities = vec![
+            SanctionedEntity {
+                pubkey: "02a1b2c3d4e5f6".to_string(),
+                name: "Bad Actor".to_string(),
+                aliases: vec![],
+                reason: "OFAC SDN".to_string(),
+                date_added: get_unix_timestamp(),
+                list_type: SanctionListType::OFAC,
+            },
+        ];
+
+        let network = SanctionNetwork::new(
+            "http://mock".to_string(),
+            "http://mock".to_string(),
+            entities,
+        ).await;
+
+        let result = network.screen_pubkey("02a1b2c3d4e5f6").await;
+        assert!(result.is_sanctioned);
+        assert_eq!(result.confidence, 0.99);
+    }
+
+    #[tokio::test]
+    async fn test_geo_blocking_v2() {
+        let geo = GeoBlockingServiceV2::new(GeoBlockingConfig {
+            enabled: true,
+            blocked_countries: {
+                let mut set = HashSet::new();
+                set.insert("XX".to_string());
+                set
+            },
+            require_country_verification: true,
+        });
+
+        assert!(geo.check_location("US").await.unwrap());
+        assert!(!geo.check_location("XX").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_compliance_engine_v2() {
+        let network = SanctionNetwork::new(
+            "http://mock".to_string(),
+            "http://mock".to_string(),
+            vec![],
+        ).await;
+
+        let geo = GeoBlockingServiceV2::new(GeoBlockingConfig {
+            enabled: true,
+            blocked_countries: HashSet::new(),
+            require_country_verification: false,
+        });
+
+        let engine = ComplianceEngineV2::new(Arc::new(network), Arc::new(geo));
+
+        let req = ComplianceCheckRequestV2 {
+            pubkey: "02clean123".to_string(),
+            country_code: Some("US".to_string()),
+            amount_kas: Some(10000),
+        };
+
+        let result = engine.check_transaction(&req).await;
+        assert!(result.is_compliant);
+    }
+}
+
+// ============================================================================
 // SECTION: SUBSCRIPTION-MATCHED FEE DISTRIBUTION (Time-Weighted)
 // ============================================================================
 // 
@@ -31970,24 +32473,47 @@ pub mod circuit_binary {
 // BINARY ENTRY POINT - Uncomment and compile with: cargo run --features binary
 // ============================================================================
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use circuit_binary::*;
     
     let args: Vec<String> = std::env::args().collect();
     
+    // Check for server mode (Akash deployment)
+    if let Some(port_arg) = args.iter().find(|a| a.starts_with("--port")) {
+        let port: u16 = if port_arg.contains('=') {
+            port_arg.split('=').nth(1).unwrap_or("8080").parse().unwrap_or(8080)
+        } else {
+            args.iter()
+                .position(|a| a == "--port")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(8080)
+        };
+        
+        println!("🚀 Starting KasVillage L2 Server Mode...");
+        println!("📡 Listening on 0.0.0.0:{}", port);
+        
+        // Start API server (blocks forever)
+        start_api_server("0.0.0.0", port).await?;
+        return Ok(());
+    }
+    
     print_circuit_info();
     
     if args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
-        println!("Usage: circuit_test [OPTIONS]");
+        println!("Usage: kasvillage [OPTIONS]");
         println!();
         println!("Options:");
-        println!("  --mock      Run MockProver only (fast, no real proof)");
-        println!("  --bench     Run 5 benchmark iterations");
-        println!("  --bench=N   Run N benchmark iterations");
-        println!("  --help, -h  Show this help");
+        println!("  --port PORT   Start API server on PORT (Akash mode)");
+        println!("  --network N   Use network N (mainnet/testnet)");
+        println!("  --mock        Run MockProver only (fast, no real proof)");
+        println!("  --bench       Run 5 benchmark iterations");
+        println!("  --bench=N     Run N benchmark iterations");
+        println!("  --help, -h    Show this help");
         println!();
         println!("Default: Run full keygen → prove → verify cycle");
-        return;
+        return Ok(());
     }
     
     if args.contains(&"--mock".to_string()) {
@@ -32017,6 +32543,8 @@ fn main() {
         result.print_report();
         std::process::exit(if result.success { 0 } else { 1 });
     }
+    
+    Ok(())
 }
 
 

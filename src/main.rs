@@ -126,6 +126,13 @@ use base64::Engine;
 use hex;
 use serde_json;
 use serde_json::json;
+
+// ============================================================================
+// FIRESTORE + REDIS IMPORTS (for Firestore integration)
+// ============================================================================
+use firestore::FirestoreDb;
+use redis::{Commands, Connection};
+use chrono::{DateTime, Utc};
 use tokio::sync::{RwLock, mpsc, broadcast};
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::{
@@ -20886,7 +20893,7 @@ impl ProofVerificationService {
         let proof_hash = ProofWithValidatorStakes::compute_proof_hash(&proof);
 
         // Create proof object
-        let mut proof_obj = ProofWithValidatorStakes::new(
+        let proof_obj = ProofWithValidatorStakes::new(
             proof,
             withdrawal_hash,
             100_000_000, // Threshold: 1 KAS
@@ -32475,6 +32482,445 @@ pub mod circuit_binary {
 // ```
 
 // ============================================================================
+// FIRESTORE CACHE IMPLEMENTATION
+// ============================================================================
+
+pub struct FirestoreCache {
+    db: FirestoreDb,
+    redis: redis::Client,
+}
+
+impl FirestoreCache {
+    pub async fn new(project_id: &str, redis_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let db = FirestoreDb::new(project_id).await?;
+        let redis = redis::Client::open(redis_url)?;
+        redis.get_connection()?.ping()?;
+        
+        Ok(FirestoreCache { db, redis })
+    }
+    
+    fn get_cache<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
+        if let Ok(mut conn) = self.redis.get_connection() {
+            if let Ok(data) = conn.get::<_, String>(key) {
+                if let Ok(obj) = serde_json::from_str::<T>(&data) {
+                    return Some(obj);
+                }
+            }
+        }
+        None
+    }
+    
+    fn set_cache<T: serde::Serialize>(&self, key: &str, value: &T, ttl_secs: usize) {
+        if let Ok(mut conn) = self.redis.get_connection() {
+            if let Ok(json) = serde_json::to_string(value) {
+                let _: Result<(), _> = conn.set_ex(key, json, ttl_secs);
+            }
+        }
+    }
+    
+    fn invalidate_cache(&self, key: &str) {
+        if let Ok(mut conn) = self.redis.get_connection() {
+            let _: Result<(), _> = conn.del(key);
+        }
+    }
+}
+
+// ============================================================================
+// FIRESTORE DATA STRUCTURES
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostNodeFrontend {
+    pub host_id: u64,
+    pub owner_pubkey: String,
+    pub name: String,
+    pub description: String,
+    pub owner_tier: String,
+    pub theme: String,
+    pub items: Vec<HostNodeItemFrontend>,
+    pub xp: u64,
+    pub reliability: f64,
+    pub apartment: String,
+    pub created_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostNodeItemFrontend {
+    pub id: u64,
+    pub name: String,
+    pub price: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visuals: Option<ProductVisualFrontend>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProductVisualFrontend {
+    pub platform: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DAppMarketplaceItemFrontend {
+    pub id: u64,
+    pub name: String,
+    pub category: String,
+    pub board: String,
+    pub trustScore: u64,
+    pub stakeKas: f64,
+    pub owner: String,
+    pub ownerPubkey: String,
+    pub description: String,
+    pub availableForSwap: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub askingPrice: Option<f64>,
+    pub monthlyThroughput: f64,
+    pub activeUsers: u64,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sourceCodeUrl: Option<String>,
+    pub isOpenSource: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CouponFrontend {
+    pub coupon_id: u64,
+    pub host_id: u64,
+    pub code: String,
+    pub coupon_type: String,
+    pub value: f64,
+    pub title: String,
+    pub item_name: String,
+    pub link: String,
+    pub host_name: String,
+}
+
+// ============================================================================
+// FIRESTORE QUERY FUNCTIONS
+// ============================================================================
+
+async fn query_host_node(
+    firestore_cache: &FirestoreCache,
+    pubkey: &str,
+) -> Result<Option<HostNodeFrontend>, String> {
+    let docs = firestore_cache.db
+        .fluent()
+        .select()
+        .from("host_nodes")
+        .where_(|q| {
+            q.and(
+                q.field("owner_pubkey").eq(pubkey),
+                q.field("status").eq("active")
+            )
+        })
+        .limit(1)
+        .query()
+        .await
+        .map_err(|e| format!("Firestore error: {}", e))?;
+    
+    if let Some(doc) = docs.first() {
+        let host = serde_json::from_value::<HostNodeFrontend>(doc.document.clone())
+            .map_err(|e| format!("Parse error: {}", e))?;
+        return Ok(Some(host));
+    }
+    
+    Ok(None)
+}
+
+async fn query_host_items(
+    firestore_cache: &FirestoreCache,
+    host_id: u64,
+) -> Result<Vec<HostNodeItemFrontend>, String> {
+    let docs = firestore_cache.db
+        .fluent()
+        .select()
+        .from("host_items")
+        .where_(|q| q.field("host_id").eq(host_id as i64))
+        .query()
+        .await
+        .map_err(|e| format!("Firestore error: {}", e))?;
+    
+    let items = docs
+        .iter()
+        .filter_map(|doc| serde_json::from_value::<HostNodeItemFrontend>(doc.document.clone()).ok())
+        .collect();
+    
+    Ok(items)
+}
+
+async fn query_all_host_nodes(
+    firestore_cache: &FirestoreCache,
+) -> Result<Vec<HostNodeFrontend>, String> {
+    let docs = firestore_cache.db
+        .fluent()
+        .select()
+        .from("host_nodes")
+        .where_(|q| q.field("status").eq("active"))
+        .query()
+        .await
+        .map_err(|e| format!("Firestore error: {}", e))?;
+    
+    let hosts = docs
+        .iter()
+        .filter_map(|doc| serde_json::from_value::<HostNodeFrontend>(doc.document.clone()).ok())
+        .collect();
+    
+    Ok(hosts)
+}
+
+async fn query_dapps(
+    firestore_cache: &FirestoreCache,
+) -> Result<Vec<DAppMarketplaceItemFrontend>, String> {
+    let docs = firestore_cache.db
+        .fluent()
+        .select()
+        .from("dapps")
+        .where_(|q| {
+            q.and(
+                q.field("board").not_eq("REJECTED"),
+                q.field("status").eq("active")
+            )
+        })
+        .query()
+        .await
+        .map_err(|e| format!("Firestore error: {}", e))?;
+    
+    let dapps = docs
+        .iter()
+        .filter_map(|doc| serde_json::from_value::<DAppMarketplaceItemFrontend>(doc.document.clone()).ok())
+        .collect();
+    
+    Ok(dapps)
+}
+
+async fn query_coupons(
+    firestore_cache: &FirestoreCache,
+) -> Result<Vec<CouponFrontend>, String> {
+    let now = Utc::now().timestamp_millis();
+    
+    let docs = firestore_cache.db
+        .fluent()
+        .select()
+        .from("coupons")
+        .where_(|q| {
+            q.and(
+                q.field("status").eq("active"),
+                q.field("expires_at").greater_than(now)
+            )
+        })
+        .query()
+        .await
+        .map_err(|e| format!("Firestore error: {}", e))?;
+    
+    let mut coupons = Vec::new();
+    
+    for doc in docs {
+        if let Ok(mut coupon) = serde_json::from_value::<CouponFrontend>(doc.document.clone()) {
+            if let Ok(host_docs) = firestore_cache.db
+                .fluent()
+                .select()
+                .from("host_nodes")
+                .where_(|q| q.field("host_id").eq(coupon.host_id as i64))
+                .limit(1)
+                .query()
+                .await
+            {
+                if let Some(host_doc) = host_docs.first() {
+                    if let Ok(host) = serde_json::from_value::<HostNodeFrontend>(host_doc.document.clone()) {
+                        coupon.host_name = host.name;
+                    }
+                }
+            }
+            
+            coupons.push(coupon);
+        }
+    }
+    
+    Ok(coupons)
+}
+
+async fn query_storefront(
+    firestore_cache: &FirestoreCache,
+    pubkey: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let docs = firestore_cache.db
+        .fluent()
+        .select()
+        .from("storefront_layouts")
+        .where_(|q| q.field("owner_pubkey").eq(pubkey))
+        .limit(1)
+        .query()
+        .await
+        .map_err(|e| format!("Firestore error: {}", e))?;
+    
+    if let Some(doc) = docs.first() {
+        let layout = serde_json::from_value(doc.document.clone())
+            .map_err(|e| format!("Parse error: {}", e))?;
+        return Ok(Some(layout));
+    }
+    
+    Ok(None)
+}
+
+// ============================================================================
+// FIRESTORE API ENDPOINTS
+// ============================================================================
+
+pub async fn api_get_host_node_firestore(
+    pubkey: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let cache_key = format!("host_node:{}", pubkey);
+    
+    if let Some(cached) = state.firestore_cache.get_cache::<HostNodeFrontend>(&cache_key) {
+        return HttpResponse::Ok()
+            .insert_header(("X-Cache", "HIT"))
+            .json(json!({"success": true, "data": cached}));
+    }
+    
+    match query_host_node(&state.firestore_cache, &pubkey).await {
+        Ok(Some(mut host)) => {
+            if let Ok(items) = query_host_items(&state.firestore_cache, host.host_id).await {
+                host.items = items;
+            }
+            
+            state.firestore_cache.set_cache(&cache_key, &host, 1800);
+            
+            HttpResponse::Ok()
+                .insert_header(("X-Cache", "MISS"))
+                .json(json!({"success": true, "data": host}))
+        }
+        Ok(None) => HttpResponse::NotFound().json(json!({"success": false, "error": "Host not found"})),
+        Err(e) => {
+            eprintln!("Firestore error: {}", e);
+            HttpResponse::InternalServerError().json(json!({"success": false, "error": "Database error"}))
+        }
+    }
+}
+
+pub async fn api_get_host_nodes_firestore(
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let cache_key = "host_nodes:all";
+    
+    if let Some(cached) = state.firestore_cache.get_cache::<Vec<HostNodeFrontend>>(cache_key) {
+        return HttpResponse::Ok()
+            .insert_header(("X-Cache", "HIT"))
+            .json(json!({"success": true, "data": cached, "count": cached.len()}));
+    }
+    
+    match query_all_host_nodes(&state.firestore_cache).await {
+        Ok(mut hosts) => {
+            for host in &mut hosts {
+                if let Ok(items) = query_host_items(&state.firestore_cache, host.host_id).await {
+                    host.items = items;
+                }
+            }
+            
+            let count = hosts.len();
+            state.firestore_cache.set_cache(cache_key, &hosts, 3600);
+            
+            HttpResponse::Ok()
+                .insert_header(("X-Cache", "MISS"))
+                .json(json!({"success": true, "data": hosts, "count": count}))
+        }
+        Err(e) => {
+            eprintln!("Firestore error: {}", e);
+            HttpResponse::InternalServerError().json(json!({"success": false, "error": "Failed to load storefronts"}))
+        }
+    }
+}
+
+pub async fn api_get_dapps_firestore(
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let cache_key = "dapps:all";
+    
+    if let Some(cached) = state.firestore_cache.get_cache::<Vec<DAppMarketplaceItemFrontend>>(cache_key) {
+        return HttpResponse::Ok()
+            .insert_header(("X-Cache", "HIT"))
+            .json(json!({"success": true, "data": cached, "count": cached.len()}));
+    }
+    
+    match query_dapps(&state.firestore_cache).await {
+        Ok(dapps) => {
+            let count = dapps.len();
+            state.firestore_cache.set_cache(cache_key, &dapps, 1800);
+            
+            HttpResponse::Ok()
+                .insert_header(("X-Cache", "MISS"))
+                .json(json!({"success": true, "data": dapps, "count": count}))
+        }
+        Err(e) => {
+            eprintln!("Firestore error: {}", e);
+            HttpResponse::InternalServerError().json(json!({"success": false, "error": "Failed to load DApps"}))
+        }
+    }
+}
+
+pub async fn api_get_coupons_firestore(
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let cache_key = "coupons:active";
+    
+    if let Some(cached) = state.firestore_cache.get_cache::<Vec<CouponFrontend>>(cache_key) {
+        return HttpResponse::Ok()
+            .insert_header(("X-Cache", "HIT"))
+            .json(json!({"success": true, "data": cached, "count": cached.len()}));
+    }
+    
+    match query_coupons(&state.firestore_cache).await {
+        Ok(coupons) => {
+            let count = coupons.len();
+            state.firestore_cache.set_cache(cache_key, &coupons, 600);
+            
+            HttpResponse::Ok()
+                .insert_header(("X-Cache", "MISS"))
+                .json(json!({"success": true, "data": coupons, "count": count}))
+        }
+        Err(e) => {
+            eprintln!("Firestore error: {}", e);
+            HttpResponse::InternalServerError().json(json!({"success": false, "error": "Failed to load coupons"}))
+        }
+    }
+}
+
+pub async fn api_get_storefront_firestore(
+    pubkey: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let cache_key = format!("storefront:{}", pubkey);
+    
+    if let Some(cached) = state.firestore_cache.get_cache::<serde_json::Value>(&cache_key) {
+        return HttpResponse::Ok()
+            .insert_header(("X-Cache", "HIT"))
+            .json(json!({"success": true, "data": cached}));
+    }
+    
+    match query_storefront(&state.firestore_cache, &pubkey).await {
+        Ok(Some(layout)) => {
+            state.firestore_cache.set_cache(&cache_key, &layout, 1800);
+            
+            HttpResponse::Ok()
+                .insert_header(("X-Cache", "MISS"))
+                .json(json!({"success": true, "data": layout}))
+        }
+        Ok(None) => {
+            let default = json!({
+                "sections": [],
+                "theme": {"id": "warm-earth", "name": "Warm Earth"},
+                "updatedAt": 0
+            });
+            
+            HttpResponse::Ok().json(json!({"success": true, "data": default}))
+        }
+        Err(e) => {
+            eprintln!("Firestore error: {}", e);
+            HttpResponse::InternalServerError().json(json!({"success": false, "error": "Failed to load layout"}))
+        }
+    }
+}
+
+// ============================================================================
 // BINARY ENTRY POINT - Uncomment and compile with: cargo run --features binary
 // ============================================================================
 
@@ -33199,6 +33645,12 @@ pub struct ConsignmentContract {
     /// Buyer's XP collateral locked
     pub xp_collateral_locked: u64,
     
+    /// Optional KAS collateral from seller (voluntary assurance - in sompi)
+    pub seller_kas_collateral_optional: Option<u64>,
+    
+    /// Optional KAS collateral locked from seller
+    pub seller_kas_collateral_locked: Option<u64>,
+    
     /// Current state
     pub state: ConsignmentState,
     
@@ -33244,6 +33696,8 @@ impl ConsignmentContract {
             platform_fee,
             xp_collateral_required: xp_required,
             xp_collateral_locked: 0,
+            seller_kas_collateral_optional: None,
+            seller_kas_collateral_locked: None,
             state: ConsignmentState::Created,
             created_at: current_timestamp(),
             state_transitions: vec![(ConsignmentState::Created, current_timestamp())],
@@ -33277,6 +33731,31 @@ impl ConsignmentContract {
 
         self.xp_collateral_locked = self.xp_collateral_required;
         self.transition_to(ConsignmentState::FundsLocked);
+        Ok(())
+    }
+
+    /// Seller optionally locks KAS collateral as assurance
+    pub fn set_seller_kas_collateral(
+        &mut self,
+        kas_amount_sompi: u64,
+        seller_balance: u64,
+    ) -> ProductionResult<()> {
+        if kas_amount_sompi == 0 {
+            return Err(ProductionError::ValidationError(
+                "KAS collateral must be > 0".to_string(),
+            ));
+        }
+        if seller_balance < kas_amount_sompi {
+            return Err(ProductionError::ValidationError(
+                format!(
+                    "Insufficient KAS for collateral: need {}, have {}",
+                    kas_amount_sompi, seller_balance
+                ),
+            ));
+        }
+        
+        self.seller_kas_collateral_optional = Some(kas_amount_sompi);
+        self.seller_kas_collateral_locked = Some(kas_amount_sompi);
         Ok(())
     }
 
@@ -45932,7 +46411,214 @@ impl FrontendAppState {
     }
 }
 
-/// GET /api/health - Circuit breaker and system health
+// ============================================================================
+// STATS & COUNTERPARTY RESPONSE STRUCTS
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UserStatsResponse {
+    pub pubkey: String,
+    pub xp_balance: u64,
+    pub tier: String,
+    pub transactions_completed: u64,
+    pub transactions_failed: u64,
+    pub deadlock_count: u64,
+    pub p_complete: f64,
+    pub p_dispute: f64,
+    pub p_hist: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeadlockStatsResponse {
+    pub total_deadlocks: u64,
+    pub recovered_count: u64,
+    pub frozen_count: u64,
+    pub recovery_rate: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompletionStatsResponse {
+    pub total_transactions: u64,
+    pub completed_count: u64,
+    pub success_rate: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BayesianStatsResponse {
+    pub p_complete: f64,
+    pub p_dispute: f64,
+    pub p_hist: f64,
+    pub risk_band: String,
+}
+
+/// GET /api/user/stats/{pubkey} - Get user transaction & XP stats
+pub async fn api_user_stats(
+    state: web::Data<FrontendAppState>,
+    pubkey: web::Path<String>,
+) -> impl Responder {
+    let pubkey_str = pubkey.into_inner();
+    
+    let inner = state.inner.read().await;
+    
+    let user: FrontendUser = match inner.users.get(&pubkey_str) {
+        Some(u) => u.clone(),
+        None => return HttpResponse::NotFound().json(serde_json::json!({
+            "success": false,
+            "error": "User not found"
+        })),
+    };
+    
+    let mut deadlock_count = 0u64;
+    let mut tx_completed = 0u64;
+    let mut tx_failed = 0u64;
+    
+    for (_, agreement) in &inner.consignments {
+        let is_participant = hex::encode(agreement.seller_pubkey) == pubkey_str 
+            || hex::encode(agreement.consigner_pubkey) == pubkey_str
+            || hex::encode(agreement.buyer_pubkey) == pubkey_str;
+        
+        if is_participant {
+            match agreement.state {
+                ConsignmentAgreementState::Deadlocked => deadlock_count += 1,
+                ConsignmentAgreementState::Completed | ConsignmentAgreementState::CompletedWithSlash => tx_completed += 1,
+                ConsignmentAgreementState::Cancelled => tx_failed += 1,
+                _ => {}
+            }
+        }
+    }
+    
+    let total_tx = tx_completed.saturating_add(tx_failed);
+    let p_hist = if total_tx > 0 {
+        (tx_completed as f64) / (total_tx as f64)
+    } else {
+        0.5
+    };
+    
+    let p_complete = (p_hist * 0.85).min(1.0);
+    let p_dispute = (1.0 - p_hist) * 0.35;
+    
+    HttpResponse::Ok().json(UserStatsResponse {
+        pubkey: pubkey_str,
+        xp_balance: user.xp,
+        tier: user.tier,
+        transactions_completed: tx_completed,
+        transactions_failed: tx_failed,
+        deadlock_count,
+        p_complete,
+        p_dispute,
+        p_hist,
+    })
+}
+
+/// GET /api/stats/deadlock - Get overall deadlock statistics
+pub async fn api_deadlock_stats(
+    state: web::Data<FrontendAppState>,
+) -> impl Responder {
+    let inner = state.inner.read().await;
+    
+    let total_deadlocks = inner.consignments.values()
+        .filter(|a| a.state == ConsignmentAgreementState::Deadlocked)
+        .count() as u64;
+    
+    let recovered = inner.consignments.values()
+        .filter(|a| a.state == ConsignmentAgreementState::Completed || a.state == ConsignmentAgreementState::CompletedWithSlash)
+        .count() as u64;
+    
+    let frozen = total_deadlocks;
+    let recovery_rate = if total_deadlocks > 0 {
+        (recovered as f64) / ((total_deadlocks + recovered) as f64)
+    } else {
+        0.0
+    };
+    
+    HttpResponse::Ok().json(DeadlockStatsResponse {
+        total_deadlocks,
+        recovered_count: recovered,
+        frozen_count: frozen,
+        recovery_rate,
+    })
+}
+
+/// GET /api/stats/completion - Get transaction completion statistics
+pub async fn api_completion_stats(
+    state: web::Data<FrontendAppState>,
+) -> impl Responder {
+    let inner = state.inner.read().await;
+    
+    let completed = inner.consignments.values()
+        .filter(|a| a.state == ConsignmentAgreementState::Completed || a.state == ConsignmentAgreementState::CompletedWithSlash)
+        .count() as u64;
+    
+    let total = inner.consignments.len() as u64;
+    let success_rate = if total > 0 {
+        (completed as f64) / (total as f64)
+    } else {
+        0.0
+    };
+    
+    HttpResponse::Ok().json(CompletionStatsResponse {
+        total_transactions: total,
+        completed_count: completed,
+        success_rate,
+    })
+}
+
+/// GET /api/stats/bayesian/{pubkey} - Get Bayesian probability report for user
+pub async fn api_bayesian_stats(
+    state: web::Data<FrontendAppState>,
+    pubkey: web::Path<String>,
+) -> impl Responder {
+    let pubkey_str = pubkey.into_inner();
+    
+    let inner = state.inner.read().await;
+    
+    if !inner.users.contains_key(&pubkey_str) {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "success": false,
+            "error": "User not found"
+        }));
+    }
+    
+    let mut tx_completed = 0u64;
+    let mut tx_failed = 0u64;
+    
+    for (_, agreement) in &inner.consignments {
+        let is_participant = hex::encode(agreement.seller_pubkey) == pubkey_str 
+            || hex::encode(agreement.consigner_pubkey) == pubkey_str
+            || hex::encode(agreement.buyer_pubkey) == pubkey_str;
+        
+        if is_participant {
+            match agreement.state {
+                ConsignmentAgreementState::Completed | ConsignmentAgreementState::CompletedWithSlash => tx_completed += 1,
+                ConsignmentAgreementState::Deadlocked | ConsignmentAgreementState::Cancelled => tx_failed += 1,
+                _ => {}
+            }
+        }
+    }
+    
+    let alpha = 1.0 + tx_completed as f64;
+    let beta = 1.0 + tx_failed as f64;
+    let p_hist = alpha / (alpha + beta);
+    
+    let p_complete = (p_hist * 0.90).min(1.0);
+    let p_dispute = ((1.0 - p_hist) * 0.40).min(1.0);
+    
+    let risk_band = if p_complete >= 0.80 {
+        "🟢 GREEN".to_string()
+    } else if p_complete >= 0.50 {
+        "🟡 YELLOW".to_string()
+    } else {
+        "🔴 RED".to_string()
+    };
+    
+    HttpResponse::Ok().json(BayesianStatsResponse {
+        p_complete,
+        p_dispute,
+        p_hist,
+        risk_band,
+    })
+}
+
 pub async fn api_health(state: web::Data<FrontendAppState>) -> impl Responder {
     let mut inner = state.inner.write().await;
     inner.circuit_breaker.check_cooldown();
@@ -48073,11 +48759,197 @@ pub async fn api_sanctions_status(
 }
 
 // ============================================================================
+// SECTION 3B: FRONTEND STOREFRONT API ENDPOINTS
+// ============================================================================
+
+/// Frontend Host Node structure for storefront
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostNodeFrontend {
+    pub host_id: u64,
+    pub owner_pubkey: String,
+    pub name: String,
+    pub description: String,
+    pub owner_tier: String,
+    pub theme: String,
+    pub items: Vec<HostNodeItemFrontend>,
+    pub xp: u64,
+    pub reliability: f64,
+    pub apartment: String,
+    pub created_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostNodeItemFrontend {
+    pub id: u64,
+    pub name: String,
+    pub price: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visuals: Option<ProductVisualFrontend>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProductVisualFrontend {
+    pub platform: String,
+    pub url: String,
+}
+
+/// Frontend DApp Marketplace structure
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DAppMarketplaceItemFrontend {
+    pub id: u64,
+    pub name: String,
+    pub category: String,
+    pub board: String,
+    pub trustScore: u64,
+    pub stakeKas: f64,
+    pub owner: String,
+    pub ownerPubkey: String,
+    pub description: String,
+    pub availableForSwap: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub askingPrice: Option<f64>,
+    pub monthlyThroughput: f64,
+    pub activeUsers: u64,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sourceCodeUrl: Option<String>,
+    pub isOpenSource: bool,
+}
+
+/// Frontend Coupon structure
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CouponFrontend {
+    pub coupon_id: u64,
+    pub host_id: u64,
+    pub code: String,
+    pub coupon_type: String,
+    pub value: f64,
+    pub title: String,
+    pub item_name: String,
+    pub link: String,
+    pub host_name: String,
+}
+
+/// GET /api/host-node/:pubkey - Get user's host node (storefront)
+pub async fn api_get_host_node(
+    pubkey: web::Path<String>,
+    _state: web::Data<AppState>,
+) -> impl Responder {
+    // TODO: Implement database query
+    // Query from host_nodes table WHERE owner_pubkey = pubkey
+    // Join with host_node_items for products
+    
+    // Example response structure
+    let example = HostNodeFrontend {
+        host_id: 101,
+        owner_pubkey: pubkey.to_string(),
+        name: "RetroKicks".to_string(),
+        description: "Vintage sneakers & restoration".to_string(),
+        owner_tier: "Market Host".to_string(),
+        theme: "WarmBazaar".to_string(),
+        items: vec![],
+        xp: 850,
+        reliability: 0.95,
+        apartment: "9B".to_string(),
+        created_at: 1735000000,
+    };
+    
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "data": example
+    }))
+}
+
+/// GET /api/host-nodes - Get all public host nodes
+pub async fn api_get_host_nodes(
+    _state: web::Data<AppState>,
+) -> impl Responder {
+    // TODO: Implement database query
+    // Query all active host_nodes from database
+    // Filter: status = 'active'
+    
+    let example: Vec<HostNodeFrontend> = vec![];
+    
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "data": example
+    }))
+}
+
+/// GET /api/dapps - Get all DApps for marketplace
+pub async fn api_get_dapps(
+    _state: web::Data<AppState>,
+) -> impl Responder {
+    // TODO: Implement database query
+    // Query dapps table
+    // Filter: board != 'REJECTED', status = 'active'
+    // Convert internal DAppListing to DAppMarketplaceItemFrontend
+    
+    let example: Vec<DAppMarketplaceItemFrontend> = vec![];
+    
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "data": example
+    }))
+}
+
+/// GET /api/coupons - Get all active coupons
+pub async fn api_get_coupons(
+    _state: web::Data<AppState>,
+) -> impl Responder {
+    // TODO: Implement database query
+    // Query coupons table
+    // Filter: status = 'active', expires_at > now()
+    // JOIN with host_nodes to get host_name (CRITICAL!)
+    
+    let example: Vec<CouponFrontend> = vec![];
+    
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "data": example
+    }))
+}
+
+/// GET /api/storefront/:pubkey - Get saved storefront layout
+pub async fn api_get_storefront(
+    pubkey: web::Path<String>,
+    _state: web::Data<AppState>,
+) -> impl Responder {
+    // TODO: Implement database query
+    // Query storefront_layouts table WHERE owner_pubkey = pubkey
+    // Return layout JSON or empty default
+    
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "data": {
+            "sections": [],
+            "theme": {
+                "id": "warm-earth",
+                "name": "Warm Earth",
+                "primary": "#78350f",
+                "secondary": "#fef3c7",
+                "accent": "#f97316",
+                "text": "#1c1917",
+                "background": "linear-gradient(135deg, #fef3c7 0%, #fde68a 100%)"
+            },
+            "updatedAt": 0
+        }
+    }))
+}
+
+// ============================================================================
 // SECTION 4: ROUTE CONFIGURATION
 // ============================================================================
 
 pub fn configure_routes_additions(cfg: &mut web::ServiceConfig) {
     cfg
+        // Frontend Storefront API (NEW)
+        .route("/api/host-node/{pubkey}", web::get().to(api_get_host_node))
+        .route("/api/host-nodes", web::get().to(api_get_host_nodes))
+        .route("/api/dapps", web::get().to(api_get_dapps))
+        .route("/api/coupons", web::get().to(api_get_coupons))
+        .route("/api/storefront/{pubkey}", web::get().to(api_get_storefront))
+        
         // Missing handlers
         .route("/api/circuit-breaker/status", web::get().to(api_circuit_breaker_status))
         .route("/api/consignment/release", web::post().to(api_consignment_release))
@@ -48086,6 +48958,12 @@ pub fn configure_routes_additions(cfg: &mut web::ServiceConfig) {
         .route("/api/storefront/visit", web::post().to(api_storefront_visit))
         .route("/api/storefront/click", web::post().to(api_storefront_click))
         .route("/api/price", web::get().to(api_get_price))
+        
+        // Stats & Counterparty APIs (real Bayesian data)
+        .route("/api/user/stats/{pubkey}", web::get().to(api_user_stats))
+        .route("/api/stats/deadlock", web::get().to(api_deadlock_stats))
+        .route("/api/stats/completion", web::get().to(api_completion_stats))
+        .route("/api/stats/bayesian/{pubkey}", web::get().to(api_bayesian_stats))
         
         // Onboarding (bot detection)
         .route("/api/onboarding/start", web::post().to(api_onboarding_start))
@@ -48096,6 +48974,7 @@ pub fn configure_routes_additions(cfg: &mut web::ServiceConfig) {
         .route("/api/sanctions/check", web::post().to(api_sanctions_check))
         .route("/api/sanctions/status", web::get().to(api_sanctions_status));
 }
+
 
 // ============================================================================
 // SECTION 5: APP STATE ADDITIONS

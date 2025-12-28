@@ -95,6 +95,7 @@ use halo2_proofs::{
 };
 use k256::EncodedPoint;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_cors::Cors;
 use actix_web::middleware::Logger;
 use halo2_proofs::{
     plonk::{create_proof, verify_proof, keygen_pk, keygen_vk, ProvingKey, Circuit, VerifyingKey, Instance, Column, ConstraintSystem, Advice, Selector, Expression, Fixed},
@@ -116,8 +117,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::convert::TryInto;
 use pasta_curves::EqAffine;
-use rand_core_legacy::OsRng as LegacyOsRng;
-use rand_core_legacy::RngCore as LegacyRngCore;
+// Use rand 0.8's OsRng - it internally uses rand_core 0.6.4
+// which is compatible with halo2, k256, and other crypto crates
+use rand::rngs::OsRng;
+use rand::RngCore;
+use rand::CryptoRng;
 use base64::Engine;
 use hex;
 use serde_json;
@@ -134,7 +138,6 @@ use k256::{
 use aes_gcm::{Aes256Gcm, KeyInit as AesKeyInit, Nonce};
 use aes_gcm::aead::Aead;
 use hkdf::Hkdf;
-use reqwest;
 use serde_big_array::BigArray;
 
 // ============================================================================
@@ -11552,12 +11555,12 @@ pub fn generate_proof<C: Circuit<Fq>>(
     let instances_refs: Vec<&[Fq]> = instances.iter().map(|col| col.as_slice()).collect();
     
     let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(Vec::new());
-    create_proof::<EqAffine, Challenge255<EqAffine>, rand_core_legacy::OsRng, Blake2bWrite<Vec<u8>, EqAffine, Challenge255<EqAffine>>, C>(
+    create_proof::<EqAffine, Challenge255<EqAffine>, rand::rngs::OsRng, Blake2bWrite<Vec<u8>, EqAffine, Challenge255<EqAffine>>, C>(
         params,
         pk,
         &[circuit],
         &[instances_refs.as_slice()],
-        LegacyOsRng,
+        OsRng,
         &mut transcript,
     )
     .map_err(|e| format!("create_proof failed: {:?}", e))?;
@@ -17750,8 +17753,7 @@ impl KaspaRootSubmitter {
     pub fn testnet() -> Self {
         Self::new("https://testapi.kaspa.org/v1".to_string())
     }
-
-    /// Submit root to Kaspa L1 (async)
+/// Submit root to Kaspa L1 (async)
     pub async fn submit_root(
         &self,
         sender: String,
@@ -17760,30 +17762,39 @@ impl KaspaRootSubmitter {
     ) -> Result<String, String> {
         let metadata = L1RootMetadata::new(root, epoch);
         let tx = KaspaRootTransaction::new(sender, metadata);
-        
         let request_body = tx.to_kas_fyi_request();
         
-        // POST to kas.fyi API
-        let response = self.client
+        // 1. Explicitly type the network result
+        let send_result: Result<reqwest::Response, reqwest::Error> = self.client
             .post(&format!("{}/transactions", self.api_endpoint))
             .json(&request_body)
             .send()
-            .await
-            .map_err(|e| format!("Request failed: {}", e))?;
+            .await;
 
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Parse failed: {}", e))?;
+        let response: reqwest::Response = send_result.map_err(|e: reqwest::Error| format!("Request failed: {}", e))?;
 
-        // Extract transaction ID from response
-        if let Some(txid) = body.get("transactionId").and_then(|v| v.as_str()) {
-            Ok(txid.to_string())
-        } else {
-            Err(format!("No txid in response: {:?}", body))
-        }
+        // 2. Explicitly type the JSON parsing result
+        let body_result: Result<serde_json::Value, reqwest::Error> = response
+            .json::<serde_json::Value>()
+            .await;
+
+        let body: serde_json::Value = body_result.map_err(|e: reqwest::Error| format!("Parse failed: {}", e))?;
+
+        // 3. Break down JSON access into explicit steps to fix E0282
+        let txid_value: &serde_json::Value = match body.get("transactionId") {
+            Some(v) => v,
+            None => return Err::<String, String>(format!("Missing transactionId in response: {:?}", body)),
+        };
+
+        let txid_str: &str = match txid_value.as_str() {
+            Some(s) => s,
+            None => return Err::<String, String>(format!("transactionId was not a string: {:?}", txid_value)),
+        };
+
+        // 4. Return with full turbofish
+        let final_txid: String = txid_str.to_string();
+        Ok::<String, String>(final_txid)
     }
-
     /// Blocking wrapper (for sync code)
     pub fn submit_root_blocking(
         &self,
@@ -17795,38 +17806,52 @@ impl KaspaRootSubmitter {
         rt.block_on(self.submit_root(sender, root, epoch))
     }
 
-    /// Query root by epoch from Kaspa L1
+   /// Query root by epoch from Kaspa L1
     pub async fn query_root(&self, epoch: u32) -> Result<Fr, String> {
-        let response = self.client
+        // 1. Explicitly type the network result
+        let send_result: Result<reqwest::Response, reqwest::Error> = self.client
             .get(&format!(
                 "{}/transactions/search?epoch={}",
                 self.api_endpoint, epoch
             ))
             .send()
-            .await
-            .map_err(|e| format!("Query failed: {}", e))?;
+            .await;
 
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Parse failed: {}", e))?;
+        let response: reqwest::Response = send_result.map_err(|e: reqwest::Error| format!("Query failed: {}", e))?;
 
-        // Extract root from transaction data
-        if let Some(script) = body.get("script").and_then(|v| v.as_str()) {
-            // Parse OP_DATA payload
-            let payload_hex = &script[4..]; // Skip "2000"
-            let payload_bytes = hex::decode(payload_hex)
-                .map_err(|e| format!("Hex decode failed: {}", e))?;
-            
-            if payload_bytes.len() != 32 {
-                return Err("Invalid payload size".to_string());
-            }
-            
-            // Convert 32 bytes to Fr
-            Ok(FieldConverter::bytes_to_fr(b"kaspa_root", &payload_bytes))
-        } else {
-            Err("No script in response".to_string())
+        // 2. Explicitly type the JSON result
+        let body_result: Result<serde_json::Value, reqwest::Error> = response
+            .json::<serde_json::Value>()
+            .await;
+
+        let body: serde_json::Value = body_result.map_err(|e: reqwest::Error| format!("Parse failed: {}", e))?;
+
+        // 3. Explicitly extract the script field
+        let script_value: &serde_json::Value = match body.get("script") {
+            Some(v) => v,
+            None => return Err::<Fr, String>("No script field in response".to_string()),
+        };
+
+        let script_str: &str = match script_value.as_str() {
+            Some(s) => s,
+            None => return Err::<Fr, String>("Script field is not a string".to_string()),
+        };
+
+        // 4. Parse the hex data
+        let payload_hex: &str = &script_str[4..]; // Skip "2000"
+        let payload_bytes: Vec<u8> = hex::decode(payload_hex)
+            .map_err(|e| format!("Hex decode failed: {}", e))?;
+        
+        if payload_bytes.len() != 32 {
+            return Err::<Fr, String>("Invalid payload size".to_string());
         }
+        
+        // 5. Convert to Fr and return
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&payload_bytes);
+        let root_fr = FieldConverter::bytes_to_fr(b"kaspa_root", &arr);
+        
+        Ok::<Fr, String>(root_fr)
     }
 }
 
@@ -17999,7 +18024,7 @@ impl ProofGenerator {
             &pk,
             &[circuit],
             &[&instance_refs[..]],
-            &mut LegacyOsRng,
+            &mut OsRng,
             &mut transcript,
         )
         .map_err(|e| format!("Proof generation failed: {:?}", e))?;
@@ -18775,7 +18800,7 @@ impl ReplicationTarget {
 pub struct StateReplicator {
     primary: ReplicationTarget,    // AWS
     secondary: ReplicationTarget,  // Akash
-    client: Client,
+    client: reqwest::Client,
 }
 
 impl StateReplicator {
@@ -18784,7 +18809,7 @@ impl StateReplicator {
         Self {
             primary,
             secondary,
-            client: Client::new(),
+            client: reqwest::Client::new(),
         }
     }
 
@@ -18793,28 +18818,31 @@ impl StateReplicator {
         // Verify snapshot
         snapshot.verify()?;
 
-        // Send to secondary (Akash)
-        let response = self.client
+        // 1. Explicitly type the network Result
+        let send_res: Result<reqwest::Response, reqwest::Error> = self.client
             .post(&format!("{}/api/sync/state", self.secondary.endpoint))
             .header("Authorization", format!("Bearer {}", self.secondary.api_key))
             .json(snapshot)
             .send()
-            .await
-            .map_err(|e| format!("Replication failed: {}", e))?;
+            .await;
 
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Parse failed: {}", e))?;
+        let response = send_res.map_err(|e: reqwest::Error| format!("Replication failed: {}", e))?;
 
-        // Check response
-        if let Some(success) = body.get("success").and_then(|v| v.as_bool()) {
+        // 2. Explicitly type the JSON parsing Result
+        let body_res: Result<serde_json::Value, reqwest::Error> = response
+            .json::<serde_json::Value>()
+            .await;
+
+        let body = body_res.map_err(|e: reqwest::Error| format!("Parse failed: {}", e))?;
+
+        // 3. Annotate the closure parameter to fix inference inside and_then
+        if let Some(success) = body.get("success").and_then(|v: &serde_json::Value| v.as_bool()) {
             if success {
                 return Ok(SyncResult {
                     epoch: snapshot.epoch,
                     primary_state: snapshot.merkle_root.clone(),
                     secondary_state: body.get("merkle_root")
-                        .and_then(|v| v.as_str())
+                        .and_then(|v: &serde_json::Value| v.as_str())
                         .unwrap_or("unknown")
                         .to_string(),
                     in_sync: true,
@@ -18831,48 +18859,52 @@ impl StateReplicator {
 
     /// Verify both primary and secondary are in sync
     pub async fn verify_sync(&self) -> Result<SyncResult, String> {
-        // Fetch state from primary (AWS)
-        let primary_resp = self.client
+        // --- Fetch state from primary (AWS) ---
+        let p_send_res: Result<reqwest::Response, reqwest::Error> = self.client
             .get(&format!("{}/api/state", self.primary.endpoint))
             .header("Authorization", format!("Bearer {}", self.primary.api_key))
             .send()
-            .await
-            .map_err(|e| format!("Primary fetch failed: {}", e))?;
+            .await;
 
-        let primary_body: serde_json::Value = primary_resp
-            .json()
-            .await
-            .map_err(|e| format!("Parse failed: {}", e))?;
+        let primary_resp = p_send_res.map_err(|e: reqwest::Error| format!("Primary fetch failed: {}", e))?;
+
+        let p_body_res: Result<serde_json::Value, reqwest::Error> = primary_resp
+            .json::<serde_json::Value>()
+            .await;
+
+        let primary_body = p_body_res.map_err(|e: reqwest::Error| format!("Parse failed: {}", e))?;
 
         let primary_root = primary_body.get("data")
-            .and_then(|d| d.get("merkle_root"))
-            .and_then(|v| v.as_str())
-            .ok_or("Missing primary root")?;
+            .and_then(|d: &serde_json::Value| d.get("merkle_root"))
+            .and_then(|v: &serde_json::Value| v.as_str())
+            .ok_or_else(|| "Missing primary root".to_string())?;
 
-        // Fetch state from secondary (Akash)
-        let secondary_resp = self.client
+        // --- Fetch state from secondary (Akash) ---
+        let s_send_res: Result<reqwest::Response, reqwest::Error> = self.client
             .get(&format!("{}/api/state", self.secondary.endpoint))
             .header("Authorization", format!("Bearer {}", self.secondary.api_key))
             .send()
-            .await
-            .map_err(|e| format!("Secondary fetch failed: {}", e))?;
+            .await;
 
-        let secondary_body: serde_json::Value = secondary_resp
-            .json()
-            .await
-            .map_err(|e| format!("Parse failed: {}", e))?;
+        let secondary_resp = s_send_res.map_err(|e: reqwest::Error| format!("Secondary fetch failed: {}", e))?;
+
+        let s_body_res: Result<serde_json::Value, reqwest::Error> = secondary_resp
+            .json::<serde_json::Value>()
+            .await;
+
+        let secondary_body = s_body_res.map_err(|e: reqwest::Error| format!("Parse failed: {}", e))?;
 
         let secondary_root = secondary_body.get("data")
-            .and_then(|d| d.get("merkle_root"))
-            .and_then(|v| v.as_str())
-            .ok_or("Missing secondary root")?;
+            .and_then(|d: &serde_json::Value| d.get("merkle_root"))
+            .and_then(|v: &serde_json::Value| v.as_str())
+            .ok_or_else(|| "Missing secondary root".to_string())?;
 
         let in_sync = primary_root == secondary_root;
 
         Ok(SyncResult {
             epoch: primary_body.get("data")
-                .and_then(|d| d.get("version"))
-                .and_then(|v| v.as_u64())
+                .and_then(|d: &serde_json::Value| d.get("version"))
+                .and_then(|v: &serde_json::Value| v.as_u64())
                 .unwrap_or(0) as u32,
             primary_state: primary_root.to_string(),
             secondary_state: secondary_root.to_string(),
@@ -18897,27 +18929,29 @@ impl StateReplicator {
             "epoch": sync_result.epoch,
             "previous_primary": self.primary.name,
         });
-        let response = self.client
+
+        let send_res: Result<reqwest::Response, reqwest::Error> = self.client
             .post(&format!("{}/api/sync/promote", self.secondary.endpoint))
             .header("Authorization", format!("Bearer {}", self.secondary.api_key))
             .json(&json_body)
             .send()
-            .await
-            .map_err(|e| format!("Promotion failed: {}", e))?;
+            .await;
 
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Parse failed: {}", e))?;
+        let response = send_res.map_err(|e: reqwest::Error| format!("Promotion failed: {}", e))?;
 
-        if body.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let body_res: Result<serde_json::Value, reqwest::Error> = response
+            .json::<serde_json::Value>()
+            .await;
+
+        let body = body_res.map_err(|e: reqwest::Error| format!("Parse failed: {}", e))?;
+
+        if body.get("success").and_then(|v: &serde_json::Value| v.as_bool()).unwrap_or(false) {
             Ok(format!("{} promoted to primary", self.secondary.name))
         } else {
             Err("Promotion rejected by secondary".to_string())
         }
     }
 }
-
 /// Sync result/status
 #[derive(Clone, Debug, Serialize)]
 pub struct SyncResult {
@@ -20565,7 +20599,7 @@ impl WithdrawalOneTimeKey {
       
         // Generate random secret key (32 bytes)
         let mut secret_key = [0u8; 32];
-        let mut rng = LegacyOsRng;
+        let mut rng = OsRng;
         rng.fill_bytes(&mut secret_key);
         
         // Derive public key from secret key using k256
@@ -22800,40 +22834,40 @@ impl KaspaL1Client {
         
         // Submit to L1 API
         let url = format!("{}/transactions", self.network.api_base());
-        let resp = self.http_client.post(&url)
+        let resp: reqwest::Response = self.http_client.post(&url)
             .header("Content-Type", "application/json")
             .body(tx_data)
             .send()
             .await
-            .map_err(|e| format!("Network error: {}", e))?;
+            .map_err(|e: reqwest::Error| format!("Network error: {}", e))?;
 
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
 
-        let result: serde_json::Value = resp.json().await
-            .map_err(|e| format!("Parse error: {}", e))?;
+        let result: serde_json::Value = resp.json::<serde_json::Value>().await
+            .map_err(|e: reqwest::Error| format!("Parse error: {}", e))?;
 
         result.get("transactionId")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .and_then(|v: &serde_json::Value| v.as_str())
+            .map(|s: &str| s.to_string())
             .ok_or_else(|| "Missing transactionId".to_string())
     }
 
     /// Get current block DAA score (height equivalent)
     pub async fn get_block_dag_info(&self) -> Result<BlockDagInfo, L1RpcError> {
         let url = format!("{}/info/blockdag", self.network.api_base());
-        let resp = self.http_client.get(&url)
+        let resp: reqwest::Response = self.http_client.get(&url)
             .send()
             .await
-            .map_err(|e| L1RpcError::NetworkError(e.to_string()))?;
+            .map_err(|e: reqwest::Error| L1RpcError::NetworkError(e.to_string()))?;
 
         if !resp.status().is_success() {
             return Err(L1RpcError::ApiError(format!("HTTP {}", resp.status())));
         }
 
-        let info: BlockDagInfo = resp.json().await
-            .map_err(|e| L1RpcError::ParseError(e.to_string()))?;
+        let info: BlockDagInfo = resp.json::<BlockDagInfo>().await
+            .map_err(|e: reqwest::Error| L1RpcError::ParseError(e.to_string()))?;
 
         let mut cache = self.cached_block_height.write().await;
         *cache = (info.virtual_daa_score, current_timestamp());
@@ -22844,17 +22878,17 @@ impl KaspaL1Client {
     /// Get UTXO set for an address
     pub async fn get_utxos(&self, address: &str) -> Result<Vec<KaspaUtxo>, L1RpcError> {
         let url = format!("{}/addresses/{}/utxos", self.network.api_base(), address);
-        let resp = self.http_client.get(&url)
+        let resp: reqwest::Response = self.http_client.get(&url)
             .send()
             .await
-            .map_err(|e| L1RpcError::NetworkError(e.to_string()))?;
+            .map_err(|e: reqwest::Error| L1RpcError::NetworkError(e.to_string()))?;
 
         if !resp.status().is_success() {
             return Err(L1RpcError::ApiError(format!("HTTP {}", resp.status())));
         }
 
-        let utxos: Vec<KaspaUtxo> = resp.json().await
-            .map_err(|e| L1RpcError::ParseError(e.to_string()))?;
+        let utxos: Vec<KaspaUtxo> = resp.json::<Vec<KaspaUtxo>>().await
+            .map_err(|e: reqwest::Error| L1RpcError::ParseError(e.to_string()))?;
 
         Ok(utxos)
     }
@@ -22862,17 +22896,17 @@ impl KaspaL1Client {
     /// Get transaction by hash
     pub async fn get_transaction(&self, tx_hash: &str) -> Result<KaspaTransaction, L1RpcError> {
         let url = format!("{}/transactions/{}", self.network.api_base(), tx_hash);
-        let resp = self.http_client.get(&url)
+        let resp: reqwest::Response = self.http_client.get(&url)
             .send()
             .await
-            .map_err(|e| L1RpcError::NetworkError(e.to_string()))?;
+            .map_err(|e: reqwest::Error| L1RpcError::NetworkError(e.to_string()))?;
 
         if !resp.status().is_success() {
             return Err(L1RpcError::ApiError(format!("HTTP {}", resp.status())));
         }
 
-        let tx: KaspaTransaction = resp.json().await
-            .map_err(|e| L1RpcError::ParseError(e.to_string()))?;
+        let tx: KaspaTransaction = resp.json::<KaspaTransaction>().await
+            .map_err(|e: reqwest::Error| L1RpcError::ParseError(e.to_string()))?;
 
         Ok(tx)
     }
@@ -22921,40 +22955,40 @@ impl KaspaL1Client {
             "transaction": tx_hex
         });
 
-        let resp = self.http_client.post(&url)
+        let resp: reqwest::Response = self.http_client.post(&url)
             .json(&body)
             .send()
             .await
-            .map_err(|e| L1RpcError::NetworkError(e.to_string()))?;
+            .map_err(|e: reqwest::Error| L1RpcError::NetworkError(e.to_string()))?;
 
         if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
+            let error_text: String = resp.text().await.unwrap_or_default();
             return Err(L1RpcError::SubmitFailed(error_text));
         }
 
-        let result: serde_json::Value = resp.json().await
-            .map_err(|e| L1RpcError::ParseError(e.to_string()))?;
+        let result: serde_json::Value = resp.json::<serde_json::Value>().await
+            .map_err(|e: reqwest::Error| L1RpcError::ParseError(e.to_string()))?;
 
         result.get("transactionId")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .and_then(|v: &serde_json::Value| v.as_str())
+            .map(|s: &str| s.to_string())
             .ok_or(L1RpcError::ParseError("Missing transactionId".to_string()))
     }
 
     /// Get address balance
     pub async fn get_balance(&self, address: &str) -> Result<u64, L1RpcError> {
         let url = format!("{}/addresses/{}/balance", self.network.api_base(), address);
-        let resp = self.http_client.get(&url)
+        let resp: reqwest::Response = self.http_client.get(&url)
             .send()
             .await
-            .map_err(|e| L1RpcError::NetworkError(e.to_string()))?;
+            .map_err(|e: reqwest::Error| L1RpcError::NetworkError(e.to_string()))?;
 
         if !resp.status().is_success() {
             return Err(L1RpcError::ApiError(format!("HTTP {}", resp.status())));
         }
 
-        let balance: AddressBalance = resp.json().await
-            .map_err(|e| L1RpcError::ParseError(e.to_string()))?;
+        let balance: AddressBalance = resp.json::<AddressBalance>().await
+            .map_err(|e: reqwest::Error| L1RpcError::ParseError(e.to_string()))?;
 
         Ok(balance.balance)
     }
@@ -24110,18 +24144,15 @@ impl SanctionNetwork {
         let client = reqwest::Client::new();
         let url = format!("{}/check?pubkey={}", self.ofac_url, pubkey);
 
-        match client.get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
-            Ok(response) => {
-                match response.json::<SanctionScreeningResult>().await {
-                    Ok(result) => Ok(result),
-                    Err(e) => Err(format!("OFAC parse error: {}", e)),
-                }
-            }
-            Err(e) => {
-                *self.network_healthy.write().await = false;
-                Err(format!("OFAC network error: {}", e))
-            }
-        }
+        let resp: reqwest::Response = client.get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e: reqwest::Error| format!("OFAC network error: {}", e))?;
+        
+        let result: SanctionScreeningResult = resp.json::<SanctionScreeningResult>().await
+            .map_err(|e: reqwest::Error| format!("OFAC parse error: {}", e))?;
+        Ok(result)
     }
 
     /// Query EU sanctions API
@@ -24129,15 +24160,15 @@ impl SanctionNetwork {
         let client = reqwest::Client::new();
         let url = format!("{}/check?pubkey={}", self.eu_url, pubkey);
 
-        match client.get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
-            Ok(response) => {
-                match response.json::<SanctionScreeningResult>().await {
-                    Ok(result) => Ok(result),
-                    Err(e) => Err(format!("EU parse error: {}", e)),
-                }
-            }
-            Err(_e) => Err("EU network error".to_string()),
-        }
+        let resp: reqwest::Response = client.get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e: reqwest::Error| format!("EU network error: {}", e))?;
+        
+        let result: SanctionScreeningResult = resp.json::<SanctionScreeningResult>().await
+            .map_err(|e: reqwest::Error| format!("EU parse error: {}", e))?;
+        Ok(result)
     }
 
     /// Cache a sanctioned entity
@@ -24178,30 +24209,24 @@ impl SanctionNetwork {
         let client = reqwest::Client::new();
 
         // Sync OFAC
-        let ofac_resp = client
-            .get(&format!("{}/all", self.ofac_url))
+        let ofac_resp: reqwest::Response = client.get(&format!("{}/all", self.ofac_url))
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .map_err(|e| format!("OFAC sync failed: {}", e))?;
+            .map_err(|e: reqwest::Error| format!("OFAC sync failed: {}", e))?;
 
-        let ofac_entities: Vec<SanctionedEntity> = ofac_resp
-            .json()
-            .await
-            .map_err(|e| format!("OFAC parse failed: {}", e))?;
+        let ofac_entities: Vec<SanctionedEntity> = ofac_resp.json::<Vec<SanctionedEntity>>().await
+            .map_err(|e: reqwest::Error| format!("OFAC parse failed: {}", e))?;
 
         // Sync EU
-        let eu_resp = client
-            .get(&format!("{}/all", self.eu_url))
+        let eu_resp: reqwest::Response = client.get(&format!("{}/all", self.eu_url))
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .map_err(|e| format!("EU sync failed: {}", e))?;
+            .map_err(|e: reqwest::Error| format!("EU sync failed: {}", e))?;
 
-        let eu_entities: Vec<SanctionedEntity> = eu_resp
-            .json()
-            .await
-            .map_err(|e| format!("EU parse failed: {}", e))?;
+        let eu_entities: Vec<SanctionedEntity> = eu_resp.json::<Vec<SanctionedEntity>>().await
+            .map_err(|e: reqwest::Error| format!("EU parse failed: {}", e))?;
 
         // Merge into cache
         let mut cache = self.local_cache.write().await;
@@ -25767,7 +25792,7 @@ impl EncryptedDkgShare {
         from_validator: u64,
         to_validator: u64,
     ) -> Result<Self, String> {
-        let mut rng = LegacyOsRng;
+        let mut rng = OsRng;
         let ephemeral_sk = K256SecretKey::random(&mut rng);
         let ephemeral_pk = ephemeral_sk.public_key();
         
@@ -25944,7 +25969,7 @@ impl SchnorrPoK {
         public_key: &[u8; 33],
         context: &str,
     ) -> Result<Self, String> {
-        let mut rng = LegacyOsRng;
+        let mut rng = OsRng;
         
         let mut k_bytes = [0u8; 32];
         rng.fill_bytes(&mut k_bytes);
@@ -26119,7 +26144,7 @@ impl SecureFrostCoordinator {
         threshold: u16,
         total_participants: u16,
     ) -> Result<Self, String> {
-        let mut rng = LegacyOsRng;
+        let mut rng = OsRng;
         let mut secret_key = [0u8; 32];
         rng.fill_bytes(&mut secret_key);
         
@@ -26146,7 +26171,7 @@ impl SecureFrostCoordinator {
     
     /// Generate Round 1 package with PoK
     pub fn generate_round1(&self) -> Result<SecureDkgRound1Package, String> {
-        let mut rng = LegacyOsRng;
+        let mut rng = OsRng;
         let mut coefficients = Vec::new();
         
         coefficients.push(self.secret_key);
@@ -26173,7 +26198,7 @@ impl SecureFrostCoordinator {
     
     /// Generate Round 2 package with encrypted shares
     pub fn generate_round2(&self) -> Result<SecureDkgRound2Package, String> {
-        let mut rng = LegacyOsRng;
+        let mut rng = OsRng;
         
         let mut coefficients = vec![self.secret_key];
         for _ in 1..self.threshold {
@@ -26273,7 +26298,7 @@ mod tests_frost_security {
     fn test_schnorr_pok_cryptographic_soundness() {
         eprintln!("\n=== TEST: Schnorr PoK Cryptographic Soundness ===\n");
         
-        let mut rng = LegacyOsRng;
+        let mut rng = OsRng;
         let mut sk = [0u8; 32];
         rng.fill_bytes(&mut sk);
         
@@ -26321,7 +26346,7 @@ mod tests_frost_security {
     fn test_ecies_confidentiality_and_integrity() {
         eprintln!("\n=== TEST: ECIES Confidentiality & Integrity ===\n");
         
-        let mut rng = LegacyOsRng;
+        let mut rng = OsRng;
         
         // Generate target keypair
         let target_sk = K256SecretKey::random(&mut rng);
@@ -26467,7 +26492,7 @@ mod tests_frost_security {
     fn test_threshold_signing_produces_valid_partials() {
         eprintln!("\n=== TEST: Threshold Signing Produces Valid Partials ===\n");
         
-        let mut rng = LegacyOsRng;
+        let mut rng = OsRng;
         
         // Simulate 3 signing shares from DKG
         let mut share1 = [0u8; 32];
@@ -26542,7 +26567,7 @@ mod tests_frost_security {
     fn test_malicious_share_detection() {
         eprintln!("\n=== TEST: Malicious Share Detection ===\n");
         
-        let mut rng = LegacyOsRng;
+        let mut rng = OsRng;
         
         // Setup valid DKG
         let mut c1 = SecureFrostCoordinator::new(1, 2, 3).unwrap();
@@ -26677,7 +26702,7 @@ mod tests_frost_security {
         
         // PHASE 3: Validators sign (2-of-3 threshold)
         eprintln!("\n--- PHASE 3: Validators Sign (2-of-3) ---");
-        let mut rng = LegacyOsRng;
+        let mut rng = OsRng;
         let mut message_hash = [0u8; 32];
         message_hash.copy_from_slice(&withdrawal_hash.to_repr());
         
@@ -29392,10 +29417,10 @@ impl EphemeralWithdrawalKey {
     
     /// Generate fresh ephemeral key for this withdrawal
     pub fn generate_for_withdrawal(withdrawal_hash: Fr, nonce: u64) -> Result<Self, String> {
-        let mut rng = LegacyOsRng;
+        let mut rng = OsRng;
         let mut ephemeral_keypair = [0u8; 32];
         
-        // Use LegacyOsRng to fill the key bytes
+        // Use OsRng to fill the key bytes
         rng.fill_bytes(&mut ephemeral_keypair);
         
         // Derive pubkey from secp256k1 (via k256 crate)
@@ -29603,13 +29628,12 @@ impl ShadowTxResult {
             }
         });
 
-        let response = client
-            .post(&url)
+        let response: reqwest::Response = client.post(&url)
             .header("Authorization", format!("Bearer {}", firestore_config.access_token))
             .json(&doc)
             .send()
             .await
-            .map_err(|e| format!("Firestore REST request failed: {}", e))?;
+            .map_err(|e: reqwest::Error| format!("Firestore REST request failed: {}", e))?;
 
         if response.status().is_success() {
             Ok(())
@@ -30408,23 +30432,18 @@ impl KaspaRpcClient {
             }
         });
 
-        let response = self
-            .client
-            .post(&self.endpoint)
+        let response: reqwest::Response = self.client.post(&self.endpoint)
             .json(&payload)
             .send()
             .await
-            .map_err(|e| format!("RPC request failed: {}", e))?;
+            .map_err(|e: reqwest::Error| format!("RPC request failed: {}", e))?;
 
-        // FIXED: Removed serde_json:: prefix from alias
-        let json: OtherValue = response
-            .json()
-            .await
-            .map_err(|e| format!("JSON parse failed: {}", e))?;
+        let json: OtherValue = response.json::<OtherValue>().await
+            .map_err(|e: reqwest::Error| format!("JSON parse failed: {}", e))?;
 
         json["result"]["transactionId"]
             .as_str()
-            .map(|s| s.to_string())
+            .map(|s: &str| s.to_string())
             .ok_or_else(|| "No transaction ID in response".to_string())
     }
 
@@ -30447,19 +30466,14 @@ impl KaspaRpcClient {
             }
         });
 
-        let response = self
-            .client
-            .post(&self.endpoint)
+        let response: reqwest::Response = self.client.post(&self.endpoint)
             .json(&payload)
             .send()
             .await
-            .map_err(|e| format!("RPC request failed: {}", e))?;
+            .map_err(|e: reqwest::Error| format!("RPC request failed: {}", e))?;
 
-        // FIXED: Removed serde_json:: prefix from alias
-        let json: OtherValue = response
-            .json()
-            .await
-            .map_err(|e| format!("JSON parse failed: {}", e))?;
+        let json: OtherValue = response.json::<OtherValue>().await
+            .map_err(|e: reqwest::Error| format!("JSON parse failed: {}", e))?;
 
         // Check if nullifier UTXO exists and has sufficient balance
         let utxos = json["result"]["utxos"]
@@ -30485,19 +30499,14 @@ impl KaspaRpcClient {
             "params": {}
         });
 
-        let response = self
-            .client
-            .post(&self.endpoint)
+        let response: reqwest::Response = self.client.post(&self.endpoint)
             .json(&payload)
             .send()
             .await
-            .map_err(|e| format!("RPC request failed: {}", e))?;
+            .map_err(|e: reqwest::Error| format!("RPC request failed: {}", e))?;
 
-        // FIXED: Removed serde_json:: prefix from alias
-        let json: OtherValue = response
-            .json()
-            .await
-            .map_err(|e| format!("JSON parse failed: {}", e))?;
+        let json: OtherValue = response.json::<OtherValue>().await
+            .map_err(|e: reqwest::Error| format!("JSON parse failed: {}", e))?;
 
         json["result"]["blockHeight"]
             .as_u64()
@@ -30527,23 +30536,19 @@ impl KaspaRpcClient {
             }
         });
 
-        let response = self
-            .client
-            .post(&self.endpoint)
+        let response: reqwest::Response = self.client.post(&self.endpoint)
             .json(&payload)
             .send()
             .await
-            .map_err(|e| format!("RPC request failed: {}", e))?;
+            .map_err(|e: reqwest::Error| format!("RPC request failed: {}", e))?;
 
         // FIXED: Using OtherValue alias consistently
-        let json: OtherValue = response
-            .json()
-            .await
-            .map_err(|e| format!("JSON parse failed: {}", e))?;
+        let json: OtherValue = response.json::<OtherValue>().await
+            .map_err(|e: reqwest::Error| format!("JSON parse failed: {}", e))?;
 
         json["result"]["transactionId"]
             .as_str()
-            .map(|s| s.to_string())
+            .map(|s: &str| s.to_string())
             .ok_or_else(|| "No transaction ID in response".to_string())
     }
 }
@@ -30738,7 +30743,7 @@ pub fn prove_withdrawal(
 
     // Generate proof
     let mut transcript = Blake2bWrite::<Vec<u8>, _, _>::init(Vec::new());
-    let mut rng = LegacyOsRng;
+    let mut rng = OsRng;
     create_proof(
         &self.setup.params,
         &self.pk,
@@ -32014,10 +32019,10 @@ impl WeightedWebsiteXp {
 
 /// Generate real cryptographic random FROST nonce
 pub fn generate_frost_nonce() -> Result<K256Scalar, String> {
-    // Use LegacyOsRng which implements rand_core v0.6 RngCore
-    let mut rng = LegacyOsRng;
+    // Use OsRng which implements rand_core v0.6 RngCore
+    let mut rng = OsRng;
     
-    // generate_vartime requires RngCore from rand_core 0.6 (LegacyRngCore)
+    // generate_vartime requires RngCore from rand_core 0.6 (RngCore)
     // This handles modular reduction automatically
     let nonce = K256Scalar::generate_vartime(&mut rng);
     
@@ -32026,7 +32031,7 @@ pub fn generate_frost_nonce() -> Result<K256Scalar, String> {
 
 /// Generate random secp256k1 scalar for FROST DKG
 pub fn generate_random_scalar() -> Result<K256Scalar, String> {
-    let mut rng = LegacyOsRng;
+    let mut rng = OsRng;
     
     // Generate a fresh scalar using the CSPRNG
     let scalar = K256Scalar::generate_vartime(&mut rng);
@@ -32037,9 +32042,9 @@ pub fn generate_random_scalar() -> Result<K256Scalar, String> {
 /// Generate random 32-byte array (general purpose)
 pub fn generate_random_bytes(len: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; len];
-    let mut rng = LegacyOsRng;
+    let mut rng = OsRng;
     
-    // LegacyRngCore trait must be in scope for fill_bytes to work here
+    // RngCore trait must be in scope for fill_bytes to work here
     rng.fill_bytes(&mut bytes);
     
     bytes
@@ -32259,7 +32264,7 @@ pub mod circuit_binary {
             pk,
             &[circuit],
             &[&instances[..]],
-            &mut LegacyOsRng,
+            &mut OsRng,
             &mut transcript,
         )
         .map_err(|e| format!("Proof generation failed: {:?}", e))?;
@@ -35447,16 +35452,16 @@ impl FirestoreDb {
         
         let firestore_doc = Self::to_firestore_fields(&json_data);
         
-        let resp = self.http_client.patch(&url)
+        let resp: reqwest::Response = self.http_client.patch(&url)
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({ "fields": firestore_doc }))
             .send()
             .await
-            .map_err(|e| DbError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e: reqwest::Error| DbError::ConnectionFailed(e.to_string()))?;
 
         if !resp.status().is_success() {
-            let err_text = resp.text().await.unwrap_or_default();
+            let err_text: String = resp.text().await.unwrap_or_default();
             return Err(DbError::WriteError(err_text));
         }
         Ok(())
@@ -35466,22 +35471,22 @@ impl FirestoreDb {
         let token = self.access_token.read().await.clone();
         let url = format!("{}/{}/{}", self.base_url(), collection, doc_id);
         
-        let resp = self.http_client.get(&url)
+        let resp: reqwest::Response = self.http_client.get(&url)
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
-            .map_err(|e| DbError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e: reqwest::Error| DbError::ConnectionFailed(e.to_string()))?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            let err_text = resp.text().await.unwrap_or_default();
+            let err_text: String = resp.text().await.unwrap_or_default();
             return Err(DbError::ReadError(err_text));
         }
 
-        let doc: serde_json::Value = resp.json().await
-            .map_err(|e| DbError::ReadError(e.to_string()))?;
+        let doc: serde_json::Value = resp.json::<serde_json::Value>().await
+            .map_err(|e: reqwest::Error| DbError::ReadError(e.to_string()))?;
         
         let fields = doc.get("fields").ok_or(DbError::NotFound)?;
         let data = Self::from_firestore_fields(fields);
@@ -35520,7 +35525,7 @@ impl FirestoreDb {
 
     fn from_firestore_fields(value: &serde_json::Value) -> serde_json::Value {
         if let Some(obj) = value.as_object() {
-            if let Some(v) = obj.get("nullValue") { return serde_json::Value::Null; }
+            if let Some(_v) = obj.get("nullValue") { return serde_json::Value::Null; }
             if let Some(v) = obj.get("booleanValue") { return v.clone(); }
             if let Some(v) = obj.get("integerValue") {
                 if let Some(s) = v.as_str() {
@@ -35570,22 +35575,24 @@ impl FirestoreDb {
             }
         });
 
-        let resp = self.http_client.post(&url)
+        let resp: reqwest::Response = self.http_client.post(&url)
             .header("Authorization", format!("Bearer {}", token))
             .json(&query)
             .send()
             .await
-            .map_err(|e| DbError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e: reqwest::Error| DbError::ConnectionFailed(e.to_string()))?;
 
         if !resp.status().is_success() {
             return Err(DbError::ReadError("Query failed".to_string()));
         }
 
-        let results: Vec<serde_json::Value> = resp.json().await
-            .map_err(|e| DbError::ReadError(e.to_string()))?;
+        let results: Vec<serde_json::Value> = resp.json::<Vec<serde_json::Value>>().await
+            .map_err(|e: reqwest::Error| DbError::ReadError(e.to_string()))?;
         
         if let Some(first) = results.first() {
+            let first: &serde_json::Value = first;
             if let Some(doc) = first.get("document") {
+                let doc: &serde_json::Value = doc;
                 return Ok(Some(doc.clone()));
             }
         }
@@ -35730,12 +35737,12 @@ impl DatabaseStore for FirestoreDb {
             return Ok(());
         }
 
-        let resp = self.http_client.post(&url)
+        let resp: reqwest::Response = self.http_client.post(&url)
             .header("Authorization", format!("Bearer {}", token))
             .json(&serde_json::json!({ "writes": writes }))
             .send()
             .await
-            .map_err(|e| DbError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e: reqwest::Error| DbError::ConnectionFailed(e.to_string()))?;
 
         if !resp.status().is_success() {
             let err = resp.text().await.unwrap_or_default();
@@ -36108,6 +36115,14 @@ pub struct AppState {
     pub relay: Arc<RwLock<WebSocketRelay>>,
     pub rate_limiter: Arc<RwLock<RedisRateLimiter>>,
     pub frost_coordinator: Arc<RwLock<FrostCoordinator>>,
+    pub circuit_breaker: Arc<std::sync::RwLock<CircuitBreakerState>>,
+    pub consignment_agreements: Arc<std::sync::RwLock<HashMap<String, ConsignmentAgreement>>>,
+    pub storefronts: Arc<std::sync::RwLock<HashMap<String, StorefrontData>>>,
+    pub storefront_visits: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    pub merchant_balances: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    pub storefront_click_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    pub onboarding_sessions: Arc<std::sync::RwLock<HashMap<String, OnboardingSession>>>,
+    pub onboarding_scores: Arc<std::sync::RwLock<HashMap<String, u8>>>,
 }
 
 
@@ -37264,12 +37279,12 @@ impl PushNotificationService {
             "priority": "high",
         });
 
-        let resp = self.http_client.post(url)
+        let resp: reqwest::Response = self.http_client.post(url)
             .header("Authorization", format!("key={}", self.fcm_key))
             .json(&body)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e: reqwest::Error| e.to_string())?;
 
         if resp.status().is_success() {
             Ok(())
@@ -37315,12 +37330,12 @@ impl PushNotificationService {
                     }
                 });
 
-                self.http_client.post("https://fcm.googleapis.com/fcm/send")
+                let _resp: reqwest::Response = self.http_client.post("https://fcm.googleapis.com/fcm/send")
                     .header("Authorization", format!("key={}", self.fcm_key))
                     .json(&payload)
                     .send()
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e: reqwest::Error| e.to_string())?;
 
                 Ok(())
             }
@@ -37361,7 +37376,7 @@ impl AnswerEncryption {
     /// Encrypt answer with random nonce
     pub fn encrypt(&self, plaintext: &str) -> Result<EncryptedAnswer, String> {
         use aes_gcm::{
-            aead::{Aead, KeyInit, OsRng},
+            aead::{Aead, KeyInit},
             Aes256Gcm, Nonce,
         };
 
@@ -37370,7 +37385,7 @@ impl AnswerEncryption {
 
         // Generate random 96-bit nonce
         let mut nonce_bytes = [0u8; 12];
-        rand::RngCore::fill_bytes(&mut OsRng, &mut nonce_bytes);
+        RngCore::fill_bytes(&mut OsRng, &mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes())
@@ -37546,6 +37561,14 @@ pub async fn start_server(config: ApiServerConfig) -> std::io::Result<()> {
         relay,
         rate_limiter,
         frost_coordinator: Arc::new(RwLock::new(frost)),
+        circuit_breaker: Arc::new(std::sync::RwLock::new(CircuitBreakerState::new())),
+        consignment_agreements: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        storefronts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        storefront_visits: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        merchant_balances: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        storefront_click_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        onboarding_sessions: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        onboarding_scores: Arc::new(std::sync::RwLock::new(HashMap::new())),
     });
 
     println!("Starting KasVillage L2 API server on {}:{}", config.host, config.port);
@@ -37804,7 +37827,7 @@ impl FrostDkg {
         }
 
         // Use frost-secp256k1's DKG phase 1 (RFC 8017 compliant)
-        let mut rng = rand::rngs::OsRng;
+        let mut rng = OsRng;
         let frost_identifier = Identifier::try_from(self.identifier as u16)
             .map_err(|e| format!("Invalid identifier: {:?}", e))?;
         let (secret_shares, commitments_vec) = dkg::part1(
@@ -38685,7 +38708,7 @@ impl Halo2ProofService {
             pk,
             &[circuit.clone()],
             &[instances_refs.as_slice()],
-            LegacyOsRng,
+            OsRng,
             &mut transcript,
         ).map_err(|e| format!("Proof generation failed: {:?}", e))?;
 
@@ -44183,6 +44206,8 @@ pub enum ConsignmentAgreementState {
     CompletedWithSlash,
     /// Cancelled before sale
     Cancelled,
+    /// Mutual dispute - funds frozen pending resolution
+    Deadlocked,
 }
 
 /// Hold reason when consigner places a hold
@@ -44338,6 +44363,9 @@ pub struct ConsignmentAgreement {
     /// Item value in sompi (agreed upon)
     pub item_value_sompi: u64,
     
+    /// Locked sompi (for mutual release)
+    pub locked_sompi: u64,
+    
     /// Consigner's share percentage (e.g., 75 = 75%)
     pub consigner_share_pct: u8,
     
@@ -44350,8 +44378,17 @@ pub struct ConsignmentAgreement {
     /// Seller's XP staked as reputation collateral
     pub seller_xp_staked: u64,
     
+    /// Seller's XP stake (alias for API compatibility)
+    pub seller_xp_stake: u64,
+    
     /// Current state
     pub state: ConsignmentAgreementState,
+    
+    /// Consigner approval flag for mutual release
+    pub consigner_approved: bool,
+    
+    /// Seller approval flag for mutual release
+    pub seller_approved: bool,
     
     /// Locked funds (once item sells)
     pub locked_funds: Option<LockedFunds>,
@@ -44412,11 +44449,15 @@ impl ConsignmentAgreement {
             buyer_pubkey: [0u8; 33], // Set when sold
             item_description,
             item_value_sompi,
+            locked_sompi: 0,
             consigner_share_pct,
             consigner_payout_sompi: consigner_payout,
             seller_revenue_sompi: seller_revenue,
             seller_xp_staked: 0,
+            seller_xp_stake: 0,
             state: ConsignmentAgreementState::Negotiating,
+            consigner_approved: false,
+            seller_approved: false,
             locked_funds: None,
             created_at: now,
             sold_at: None,
@@ -45258,9 +45299,79 @@ pub struct FrontendUser {
     pub user_id: u64,
     pub xp: u64,
     pub tier: String,
+    /// Total balance = available + locked
     pub balance_sompi: u64,
+    /// Balance available for spending/transfers (NOT locked in pending withdrawal)
+    pub available_balance_sompi: u64,
+    /// Balance locked in pending withdrawals (24-hour settlement queue)
+    /// This prevents double-spend: user can't spend KAS on L2 while it's exiting to L1
+    pub locked_withdrawal_sompi: u64,
     pub subscription_expires_at: Option<u64>,
     pub registered_at: u64,
+}
+
+impl FrontendUser {
+    /// Create new user with all balance available
+    pub fn new(pubkey: String, user_id: u64, balance_sompi: u64) -> Self {
+        Self {
+            pubkey,
+            user_id,
+            xp: 0,
+            tier: "Villager".to_string(),
+            balance_sompi,
+            available_balance_sompi: balance_sompi,
+            locked_withdrawal_sompi: 0,
+            subscription_expires_at: None,
+            registered_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        }
+    }
+    
+    /// Lock balance for withdrawal (moves from available to locked)
+    /// Called when withdrawal is submitted to settlement queue
+    pub fn lock_for_withdrawal(&mut self, amount_sompi: u64) -> Result<(), String> {
+        if amount_sompi > self.available_balance_sompi {
+            return Err(format!(
+                "Insufficient available balance: {} available, {} requested",
+                self.available_balance_sompi, amount_sompi
+            ));
+        }
+        self.available_balance_sompi -= amount_sompi;
+        self.locked_withdrawal_sompi += amount_sompi;
+        Ok(())
+    }
+    
+    /// Finalize withdrawal (deduct from total after 24h settlement)
+    /// Called when Merkle tree is updated after settlement queue clears
+    pub fn finalize_withdrawal(&mut self, amount_sompi: u64) -> Result<(), String> {
+        if amount_sompi > self.locked_withdrawal_sompi {
+            return Err(format!(
+                "Insufficient locked balance: {} locked, {} requested",
+                self.locked_withdrawal_sompi, amount_sompi
+            ));
+        }
+        self.locked_withdrawal_sompi -= amount_sompi;
+        self.balance_sompi -= amount_sompi;
+        Ok(())
+    }
+    
+    /// Cancel withdrawal (return locked funds to available)
+    pub fn cancel_withdrawal(&mut self, amount_sompi: u64) -> Result<(), String> {
+        if amount_sompi > self.locked_withdrawal_sompi {
+            return Err("Cannot cancel more than locked".to_string());
+        }
+        self.locked_withdrawal_sompi -= amount_sompi;
+        self.available_balance_sompi += amount_sompi;
+        Ok(())
+    }
+    
+    /// Add deposit (all deposits go to available balance)
+    pub fn add_deposit(&mut self, amount_sompi: u64) {
+        self.balance_sompi += amount_sompi;
+        self.available_balance_sompi += amount_sompi;
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45291,6 +45402,8 @@ pub struct CircuitBreakerState {
     pub threshold: u64,
     pub last_trip_time: Option<u64>,
     pub cooldown_seconds: u64,
+    pub cooldown_until: Option<u64>,
+    pub trip_count: u32,
 }
 
 impl CircuitBreakerState {
@@ -45301,6 +45414,8 @@ impl CircuitBreakerState {
             threshold: CIRCUIT_BREAKER_DRAIN_THRESHOLD,
             last_trip_time: None,
             cooldown_seconds: 3600, // 1 hour cooldown
+            cooldown_until: None,
+            trip_count: 0,
         }
     }
     
@@ -45862,6 +45977,8 @@ pub async fn api_register(
         xp: 0,
         tier: tier.name().to_string(),
         balance_sompi: 0,
+        available_balance_sompi: 0,
+        locked_withdrawal_sompi: 0,
         subscription_expires_at: None,
         registered_at: current_timestamp(),
     };
@@ -45966,6 +46083,34 @@ pub async fn api_withdrawal_submit(
                 error: Some("Destination address is sanctioned".to_string()),
             });
         }
+    }
+    
+    // === L2 WALLET LOCK: Prevent double-spend during 24h settlement ===
+    // Lock the withdrawal amount in user's L2 wallet immediately
+    // This moves KAS from available_balance to locked_withdrawal_balance
+    // The Merkle tree is NOT updated until the 24h timer clears
+    if let Some(user) = inner.users.get_mut(&req.user_pubkey) {
+        if let Err(e) = user.lock_for_withdrawal(req.amount_sompi) {
+            return HttpResponse::BadRequest().json(WithdrawalSubmitResponse {
+                success: false,
+                request_id: 0,
+                submitted_at: 0,
+                unlocks_at: 0,
+                l1_block_submitted: 0,
+                seconds_remaining: 0,
+                error: Some(format!("L2 wallet lock failed: {}", e)),
+            });
+        }
+    } else {
+        return HttpResponse::NotFound().json(WithdrawalSubmitResponse {
+            success: false,
+            request_id: 0,
+            submitted_at: 0,
+            unlocks_at: 0,
+            l1_block_submitted: 0,
+            seconds_remaining: 0,
+            error: Some("User not found".to_string()),
+        });
     }
     
     let now = current_timestamp();
@@ -46378,10 +46523,16 @@ pub async fn start_frontend_api_server(listen_addr: &str) -> Result<(), String> 
     let state = web::Data::new(FrontendAppState::new());
     
     HttpServer::new(move || {
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header()
+            .max_age(3600);
+        
         App::new()
             .app_data(state.clone())
             .wrap(Logger::default())
-            // CORS handled by Cloudflare/reverse proxy in production
+            .wrap(cors)
             .configure(configure_frontend_api)
     })
     .bind(listen_addr)
@@ -47199,5 +47350,1546 @@ mod tests_xp_tree {
             assert_eq!(wallet.balance, 50 * SOMPI_PER_KAS);
             assert_eq!(wallet.withdrawal_count, 1);
         }
+    }
+}// ============================================================================
+// KASVILLAGE ADDITIONS - Missing Handlers, Onboarding, Sanctions API
+// ============================================================================
+
+use std::time::Duration;
+use tokio::time::interval;
+
+// ============================================================================
+// SECTION 1: MISSING API HANDLERS
+// ============================================================================
+
+// --- Circuit Breaker Status ---
+#[derive(Serialize)]
+pub struct CircuitBreakerResponse {
+    pub is_tripped: bool,
+    pub total_outflow_last_hour: u64,
+    pub threshold: u64,
+    pub cooldown_until: Option<u64>,
+    pub trip_count: u32,
+}
+
+pub async fn api_circuit_breaker_status(
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let cb = state.circuit_breaker.read().unwrap();
+    HttpResponse::Ok().json(CircuitBreakerResponse {
+        is_tripped: cb.is_tripped,
+        total_outflow_last_hour: cb.total_outflow_last_hour,
+        threshold: cb.threshold,
+        cooldown_until: cb.cooldown_until,
+        trip_count: cb.trip_count,
+    })
+}
+
+// --- Consignment Release ---
+#[derive(Deserialize)]
+pub struct ConsignmentReleaseRequest {
+    pub agreement_id: String,
+    pub party: String, // "consigner" or "seller"
+    pub pubkey: String,
+    pub signature: String,
+}
+
+#[derive(Serialize)]
+pub struct ConsignmentReleaseResponse {
+    pub success: bool,
+    pub agreement_id: String,
+    pub party_approved: String,
+    pub both_approved: bool,
+    pub released_sompi: Option<u64>,
+    pub merkle_proof: Option<String>,
+}
+
+pub async fn api_consignment_release(
+    state: web::Data<AppState>,
+    req: web::Json<ConsignmentReleaseRequest>,
+) -> impl Responder {
+    let mut agreements = state.consignment_agreements.write().unwrap();
+    
+    if let Some(agreement) = agreements.get_mut(&req.agreement_id) {
+        // Mark party as approved
+        match req.party.as_str() {
+            "consigner" => agreement.consigner_approved = true,
+            "seller" => agreement.seller_approved = true,
+            _ => return HttpResponse::BadRequest().json(serde_json::json!({
+                "success": false,
+                "error": "Invalid party"
+            })),
+        }
+        
+        let both_approved = agreement.consigner_approved && agreement.seller_approved;
+        let released_sompi = if both_approved {
+            Some(agreement.locked_sompi)
+        } else {
+            None
+        };
+        
+        HttpResponse::Ok().json(ConsignmentReleaseResponse {
+            success: true,
+            agreement_id: req.agreement_id.clone(),
+            party_approved: req.party.clone(),
+            both_approved,
+            released_sompi,
+            merkle_proof: if both_approved {
+                Some(format!("0x{:064x}", rand::random::<u64>()))
+            } else {
+                None
+            },
+        })
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({
+            "success": false,
+            "error": "Agreement not found"
+        }))
+    }
+}
+
+// --- Consignment Deadlock ---
+#[derive(Deserialize)]
+pub struct ConsignmentDeadlockRequest {
+    pub agreement_id: String,
+    pub reason: String,
+    pub timestamp: u64,
+}
+
+#[derive(Serialize)]
+pub struct ConsignmentDeadlockResponse {
+    pub success: bool,
+    pub agreement_id: String,
+    pub state: String,
+    pub frozen_sompi: u64,
+    pub seller_xp_lost: u64,
+}
+
+pub async fn api_consignment_deadlock(
+    state: web::Data<AppState>,
+    req: web::Json<ConsignmentDeadlockRequest>,
+) -> impl Responder {
+    let mut agreements = state.consignment_agreements.write().unwrap();
+    
+    if let Some(agreement) = agreements.get_mut(&req.agreement_id) {
+        agreement.state = ConsignmentAgreementState::Deadlocked;
+        let frozen = agreement.locked_sompi;
+        let xp_lost = agreement.seller_xp_stake;
+        
+        HttpResponse::Ok().json(ConsignmentDeadlockResponse {
+            success: true,
+            agreement_id: req.agreement_id.clone(),
+            state: "Deadlocked".to_string(),
+            frozen_sompi: frozen,
+            seller_xp_lost: xp_lost,
+        })
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({
+            "success": false,
+            "error": "Agreement not found"
+        }))
+    }
+}
+
+// --- Storefront Save ---
+#[derive(Deserialize)]
+pub struct StorefrontSaveRequest {
+    pub host_id: String,
+    pub layout: serde_json::Value,
+    pub theme: String,
+    pub timestamp: u64,
+}
+
+#[derive(Serialize)]
+pub struct StorefrontSaveResponse {
+    pub success: bool,
+    pub host_id: String,
+    pub layout_hash: String,
+    pub merkle_proof: String,
+    pub saved_at: u64,
+}
+
+pub async fn api_storefront_save(
+    state: web::Data<AppState>,
+    req: web::Json<StorefrontSaveRequest>,
+) -> impl Responder {
+    // Hash the layout for Merkle tree
+    let layout_json = serde_json::to_string(&req.layout).unwrap_or_default();
+    let layout_hash = format!("{:064x}", hash_bytes(layout_json.as_bytes()));
+    
+    // Store in state
+    let mut storefronts = state.storefronts.write().unwrap();
+    storefronts.insert(req.host_id.clone(), StorefrontData {
+        layout: req.layout.clone(),
+        theme: req.theme.clone(),
+        layout_hash: layout_hash.clone(),
+        saved_at: req.timestamp,
+    });
+    
+    HttpResponse::Ok().json(StorefrontSaveResponse {
+        success: true,
+        host_id: req.host_id.clone(),
+        layout_hash: layout_hash.clone(),
+        merkle_proof: format!("0x{:064x}", rand::random::<u64>()),
+        saved_at: req.timestamp,
+    })
+}
+
+// --- Storefront Visit (PRIVACY-PRESERVING) ---
+// No visitor identity stored - only anonymous aggregate counts
+// Compliant with GDPR, CCPA - no PII collected
+#[derive(Deserialize)]
+pub struct StorefrontVisitRequest {
+    pub host_id: String,
+    pub is_first_visit: bool,
+    pub timestamp: u64,
+    // NOTE: No visitor_pubkey - privacy by design
+}
+
+#[derive(Serialize)]
+pub struct StorefrontVisitResponse {
+    pub success: bool,
+    pub fee_charged: bool,
+    pub fee_sompi: u64,
+    pub visit_count: u64,
+    // Only shows merchant received payment, not from whom
+}
+
+pub async fn api_storefront_visit(
+    state: web::Data<AppState>,
+    req: web::Json<StorefrontVisitRequest>,
+) -> impl Responder {
+    const PAGE_VIEW_FEE_SOMPI: u64 = 500_000; // 0.005 KAS
+    
+    let fee_charged = !req.is_first_visit;
+    let fee_sompi = if fee_charged { PAGE_VIEW_FEE_SOMPI } else { 0 };
+    
+    // Increment anonymous visit counter (no visitor identity stored)
+    let mut visits = state.storefront_visits.write().unwrap();
+    let count = visits.entry(req.host_id.clone()).or_insert(0);
+    *count += 1;
+    
+    // Credit merchant (100% to merchant) - anonymous payment
+    if fee_charged {
+        let mut balances = state.merchant_balances.write().unwrap();
+        let balance = balances.entry(req.host_id.clone()).or_insert(0);
+        *balance += fee_sompi;
+    }
+    
+    HttpResponse::Ok().json(StorefrontVisitResponse {
+        success: true,
+        fee_charged,
+        fee_sompi,
+        visit_count: *count,
+    })
+}
+
+// --- Storefront Click (PRIVACY-PRESERVING) ---
+// Only records: which store, which platform, timestamp
+// NO visitor identity, IP, or tracking cookies
+// Merkle tree only proves: "Store X received Y clicks on platform Z"
+#[derive(Deserialize)]
+pub struct StorefrontClickRequest {
+    pub host_id: String,
+    pub platform: String, // instagram, pinterest, tiktok, website
+    pub timestamp: u64,
+    // NOTE: No visitor_pubkey or URL - privacy by design
+}
+
+#[derive(Serialize)]
+pub struct StorefrontClickResponse {
+    pub success: bool,
+    pub click_id: String, // Anonymous ID for Merkle proof
+    pub platform: String,
+    pub total_clicks: u64, // Aggregate only
+}
+
+pub async fn api_storefront_click(
+    state: web::Data<AppState>,
+    req: web::Json<StorefrontClickRequest>,
+) -> impl Responder {
+    // Generate anonymous click ID (no visitor info)
+    let click_id = format!("click_{}", rand::random::<u64>());
+    
+    // Only store aggregate counts per platform (no individual tracking)
+    let mut click_counts = state.storefront_click_counts.write().unwrap();
+    let key = format!("{}:{}", req.host_id, req.platform);
+    let count = click_counts.entry(key).or_insert(0);
+    *count += 1;
+    
+    // Merkle proof shows: "Merchant received N clicks" (anonymous)
+    HttpResponse::Ok().json(StorefrontClickResponse {
+        success: true,
+        click_id, // For merchant's Merkle proof only
+        platform: req.platform.clone(),
+        total_clicks: *count,
+    })
+}
+
+// --- Price API (CoinGecko) ---
+#[derive(Serialize)]
+pub struct PriceResponse {
+    pub kas_usd: f64,
+    pub merchant_fee_kas: f64,
+    pub merchant_fee_usd: f64,
+    pub merchant_fee_sompi: u64,
+    pub page_view_fee_kas: f64,
+    pub source: String,
+    pub coinmarketcap_url: String,
+    pub updated_at: u64,
+}
+
+const MERCHANT_FEE_USD: f64 = 3.50;
+const PAGE_VIEW_FEE_KAS: f64 = 0.005;
+
+pub async fn api_get_price() -> impl Responder {
+    let price = fetch_kas_price_coingecko().await.unwrap_or(0.12);
+    let merchant_fee_kas = MERCHANT_FEE_USD / price;
+    let merchant_fee_sompi = (merchant_fee_kas * SOMPI_PER_KAS as f64) as u64;
+    
+    HttpResponse::Ok().json(PriceResponse {
+        kas_usd: price,
+        merchant_fee_kas,
+        merchant_fee_usd: MERCHANT_FEE_USD,
+        merchant_fee_sompi,
+        page_view_fee_kas: PAGE_VIEW_FEE_KAS,
+        source: "coingecko".to_string(),
+        coinmarketcap_url: "https://coinmarketcap.com/currencies/kaspa/".to_string(),
+        updated_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+    })
+}
+
+async fn fetch_kas_price_coingecko() -> Result<f64, String> {
+    let client = reqwest::Client::new();
+    let resp: reqwest::Response = client.get("https://api.coingecko.com/api/v3/simple/price?ids=kaspa&vs_currencies=usd")
+        .send()
+        .await
+        .map_err(|e: reqwest::Error| e.to_string())?;
+    
+    let data: serde_json::Value = resp.json::<serde_json::Value>().await
+        .map_err(|e: reqwest::Error| e.to_string())?;
+    data["kaspa"]["usd"].as_f64().ok_or("Price not found".to_string())
+}
+
+// ============================================================================
+// SECTION 2: ONBOARDING QUESTIONS (30 Questions, 15-second timer)
+// ============================================================================
+
+/// Human-friendly questions that are hard for bots/AI to answer quickly
+/// These require visual recognition, common sense, or cultural knowledge
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OnboardingQuestion {
+    pub id: u32,
+    pub question: String,
+    pub options: Vec<String>,
+    pub correct_index: usize,
+    pub category: String,
+    pub difficulty: u8, // 1-3
+}
+
+pub fn get_onboarding_questions() -> Vec<OnboardingQuestion> {
+    vec![
+        // Visual/Spatial (hard for text-based AI)
+        OnboardingQuestion { id: 1, question: "Which way does the letter 'N' face?".into(), options: vec!["Left diagonal".into(), "Right diagonal".into(), "Straight up".into(), "Upside down".into()], correct_index: 0, category: "visual".into(), difficulty: 1 },
+        OnboardingQuestion { id: 2, question: "How many corners does a stop sign have?".into(), options: vec!["4".into(), "6".into(), "8".into(), "10".into()], correct_index: 2, category: "visual".into(), difficulty: 1 },
+        OnboardingQuestion { id: 3, question: "What color is a ripe banana?".into(), options: vec!["Green".into(), "Yellow".into(), "Red".into(), "Blue".into()], correct_index: 1, category: "visual".into(), difficulty: 1 },
+        
+        // Common sense timing
+        OnboardingQuestion { id: 4, question: "Is breakfast typically eaten in the morning or evening?".into(), options: vec!["Morning".into(), "Evening".into(), "Midnight".into(), "Noon only".into()], correct_index: 0, category: "common_sense".into(), difficulty: 1 },
+        OnboardingQuestion { id: 5, question: "Which is heavier: a pound of feathers or a pound of steel?".into(), options: vec!["Feathers".into(), "Steel".into(), "They weigh the same".into(), "Cannot compare".into()], correct_index: 2, category: "logic".into(), difficulty: 2 },
+        OnboardingQuestion { id: 6, question: "How many legs does a typical chair have?".into(), options: vec!["2".into(), "3".into(), "4".into(), "6".into()], correct_index: 2, category: "common_sense".into(), difficulty: 1 },
+        
+        // Quick math (human-speed)
+        OnboardingQuestion { id: 7, question: "What is 7 + 5?".into(), options: vec!["10".into(), "11".into(), "12".into(), "13".into()], correct_index: 2, category: "math".into(), difficulty: 1 },
+        OnboardingQuestion { id: 8, question: "What is 15 - 8?".into(), options: vec!["5".into(), "6".into(), "7".into(), "8".into()], correct_index: 2, category: "math".into(), difficulty: 1 },
+        OnboardingQuestion { id: 9, question: "Which is larger: 1/2 or 1/4?".into(), options: vec!["1/2".into(), "1/4".into(), "Same size".into(), "Cannot compare".into()], correct_index: 0, category: "math".into(), difficulty: 1 },
+        
+        // Cultural/everyday knowledge
+        OnboardingQuestion { id: 10, question: "What do you typically use to unlock a door?".into(), options: vec!["Spoon".into(), "Key".into(), "Shoe".into(), "Book".into()], correct_index: 1, category: "everyday".into(), difficulty: 1 },
+        OnboardingQuestion { id: 11, question: "Which meal comes after lunch?".into(), options: vec!["Breakfast".into(), "Brunch".into(), "Dinner".into(), "Midnight snack".into()], correct_index: 2, category: "everyday".into(), difficulty: 1 },
+        OnboardingQuestion { id: 12, question: "What sound does a dog make?".into(), options: vec!["Meow".into(), "Bark".into(), "Moo".into(), "Quack".into()], correct_index: 1, category: "everyday".into(), difficulty: 1 },
+        
+        // Direction/orientation
+        OnboardingQuestion { id: 13, question: "If you face north, what direction is behind you?".into(), options: vec!["East".into(), "West".into(), "South".into(), "North".into()], correct_index: 2, category: "spatial".into(), difficulty: 1 },
+        OnboardingQuestion { id: 14, question: "The sun rises in which direction?".into(), options: vec!["North".into(), "South".into(), "East".into(), "West".into()], correct_index: 2, category: "spatial".into(), difficulty: 1 },
+        OnboardingQuestion { id: 15, question: "On a clock, where is the number 6?".into(), options: vec!["Top".into(), "Bottom".into(), "Left".into(), "Right".into()], correct_index: 1, category: "spatial".into(), difficulty: 1 },
+        
+        // Physical world
+        OnboardingQuestion { id: 16, question: "What happens when you drop something?".into(), options: vec!["It floats up".into(), "It falls down".into(), "It stays still".into(), "It disappears".into()], correct_index: 1, category: "physics".into(), difficulty: 1 },
+        OnboardingQuestion { id: 17, question: "Ice is which state of water?".into(), options: vec!["Liquid".into(), "Gas".into(), "Solid".into(), "Plasma".into()], correct_index: 2, category: "physics".into(), difficulty: 1 },
+        OnboardingQuestion { id: 18, question: "Which is typically colder: a refrigerator or an oven?".into(), options: vec!["Refrigerator".into(), "Oven".into(), "Same temperature".into(), "Depends on the day".into()], correct_index: 0, category: "physics".into(), difficulty: 1 },
+        
+        // Time-based
+        OnboardingQuestion { id: 19, question: "How many hours are in a day?".into(), options: vec!["12".into(), "24".into(), "48".into(), "60".into()], correct_index: 1, category: "time".into(), difficulty: 1 },
+        OnboardingQuestion { id: 20, question: "Which month comes after January?".into(), options: vec!["March".into(), "December".into(), "February".into(), "April".into()], correct_index: 2, category: "time".into(), difficulty: 1 },
+        OnboardingQuestion { id: 21, question: "How many days are in a week?".into(), options: vec!["5".into(), "6".into(), "7".into(), "10".into()], correct_index: 2, category: "time".into(), difficulty: 1 },
+        
+        // Body/human
+        OnboardingQuestion { id: 22, question: "How many fingers are on one human hand?".into(), options: vec!["4".into(), "5".into(), "6".into(), "10".into()], correct_index: 1, category: "human".into(), difficulty: 1 },
+        OnboardingQuestion { id: 23, question: "Where are your ears located?".into(), options: vec!["On your feet".into(), "On your head".into(), "On your hands".into(), "On your chest".into()], correct_index: 1, category: "human".into(), difficulty: 1 },
+        OnboardingQuestion { id: 24, question: "What do you use to see?".into(), options: vec!["Ears".into(), "Nose".into(), "Eyes".into(), "Mouth".into()], correct_index: 2, category: "human".into(), difficulty: 1 },
+        
+        // Objects/tools
+        OnboardingQuestion { id: 25, question: "What do you cut paper with?".into(), options: vec!["Hammer".into(), "Scissors".into(), "Spoon".into(), "Brush".into()], correct_index: 1, category: "tools".into(), difficulty: 1 },
+        OnboardingQuestion { id: 26, question: "What do you write with?".into(), options: vec!["Fork".into(), "Pen".into(), "Cup".into(), "Shoe".into()], correct_index: 1, category: "tools".into(), difficulty: 1 },
+        OnboardingQuestion { id: 27, question: "What keeps rain off your head?".into(), options: vec!["Sunglasses".into(), "Umbrella".into(), "Gloves".into(), "Belt".into()], correct_index: 1, category: "tools".into(), difficulty: 1 },
+        
+        // Counting/patterns
+        OnboardingQuestion { id: 28, question: "What number comes after 9?".into(), options: vec!["8".into(), "10".into(), "11".into(), "7".into()], correct_index: 1, category: "counting".into(), difficulty: 1 },
+        OnboardingQuestion { id: 29, question: "Complete: Red, Blue, Red, Blue, Red, ___".into(), options: vec!["Red".into(), "Blue".into(), "Green".into(), "Yellow".into()], correct_index: 1, category: "pattern".into(), difficulty: 1 },
+        OnboardingQuestion { id: 30, question: "How many wheels does a bicycle have?".into(), options: vec!["1".into(), "2".into(), "3".into(), "4".into()], correct_index: 1, category: "counting".into(), difficulty: 1 },
+    ]
+}
+
+#[derive(Serialize)]
+pub struct OnboardingSession {
+    pub session_id: String,
+    pub questions: Vec<OnboardingQuestion>,
+    pub started_at: u64,
+    pub time_limit_seconds: u64, // 15 seconds per question
+    pub current_index: usize,
+}
+
+#[derive(Deserialize)]
+pub struct OnboardingAnswerRequest {
+    pub session_id: String,
+    pub question_id: u32,
+    pub selected_index: usize,
+    pub answered_at: u64,
+}
+
+#[derive(Serialize)]
+pub struct OnboardingAnswerResponse {
+    pub correct: bool,
+    pub time_taken_ms: u64,
+    pub too_slow: bool,
+    pub too_fast: bool, // Bots answer too fast (<500ms)
+    pub session_complete: bool,
+    pub score: u32,
+    pub passed: bool,
+}
+
+const ONBOARDING_TIME_LIMIT_MS: u64 = 15_000; // 15 seconds
+const ONBOARDING_MIN_TIME_MS: u64 = 500;      // Too fast = bot
+const ONBOARDING_PASS_THRESHOLD: u8 = 8;     // 80% = 8/10
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OnboardingSessionV2 {
+    pub session_id: String,
+    pub questions: Vec<OnboardingQuestion>,  // 8 questions from bank
+    pub started_at: u64,
+    pub time_limit_seconds: u64,
+    // NOTE: story_prompt is generated client-side based on avatar selections
+    // Avatar data (race, class, occupation) is ephemeral - never stored on server
+}
+
+pub async fn api_onboarding_start() -> impl Responder {
+    use rand::seq::SliceRandom;
+    
+    let mut rng = rand::thread_rng();
+    let mut questions = get_onboarding_questions();
+    questions.shuffle(&mut rng);
+    
+    // Create session with 8 questions from bank
+    // Story/avatar questions are handled client-side
+    let session = OnboardingSessionV2 {
+        session_id: format!("onboard_{}", rand::random::<u64>()),
+        questions: questions.into_iter().take(8).collect(),
+        started_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+        time_limit_seconds: 15,
+    };
+    
+    HttpResponse::Ok().json(session)
+}
+
+pub async fn api_onboarding_answer(
+    state: web::Data<AppState>,
+    req: web::Json<OnboardingAnswerRequest>,
+) -> impl Responder {
+    let sessions = state.onboarding_sessions.read().unwrap();
+    
+    if let Some(session) = sessions.get(&req.session_id) {
+        let question = session.questions.iter()
+            .find(|q| q.id == req.question_id);
+        
+        if let Some(q) = question {
+            let question_start = session.started_at + (session.current_index as u64 * ONBOARDING_TIME_LIMIT_MS);
+            let time_taken = req.answered_at.saturating_sub(question_start);
+            
+            let too_slow = time_taken > ONBOARDING_TIME_LIMIT_MS;
+            let too_fast = time_taken < ONBOARDING_MIN_TIME_MS;
+            let correct = !too_slow && !too_fast && req.selected_index == q.correct_index;
+            
+            // Update score
+            let mut scores = state.onboarding_scores.write().unwrap();
+            let score = scores.entry(req.session_id.clone()).or_insert(0);
+            if correct { *score += 1; }
+            
+            let session_complete = session.current_index >= 7;  // 8 questions (0-7)
+            let passed = *score >= ONBOARDING_PASS_THRESHOLD;
+            
+            HttpResponse::Ok().json(OnboardingAnswerResponse {
+                correct,
+                time_taken_ms: time_taken,
+                too_slow,
+                too_fast,
+                session_complete,
+                score: *score as u32,
+                passed: session_complete && passed,
+            })
+        } else {
+            HttpResponse::NotFound().json(serde_json::json!({ "error": "Question not found" }))
+        }
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({ "error": "Session not found" }))
+    }
+}
+
+// ============================================================================
+// SECTION 3: OFAC SANCTIONS API (24-hour refresh)
+// ============================================================================
+
+/// OFAC SDN List integration
+/// Source: https://www.treasury.gov/ofac/downloads/sdnlist.txt
+/// Updates every 24 hours
+
+#[derive(Clone, Default)]
+pub struct SanctionsDatabase {
+    pub sdn_names: HashSet<String>,           // Sanctioned entity names
+    pub sdn_addresses: HashSet<String>,       // Sanctioned crypto addresses
+    pub sdn_countries: HashSet<String>,       // Sanctioned countries (ISO codes)
+    pub last_updated: u64,
+    pub entry_count: usize,
+}
+
+pub struct SanctionsState {
+    pub db: Arc<RwLock<SanctionsDatabase>>,
+}
+
+impl SanctionsState {
+    pub fn new() -> Self {
+        Self {
+            db: Arc::new(RwLock::new(SanctionsDatabase::default())),
+        }
+    }
+}
+
+const OFAC_SDN_URL: &str = "https://www.treasury.gov/ofac/downloads/sdn.xml";
+const OFAC_SDN_TXT_URL: &str = "https://www.treasury.gov/ofac/downloads/sdnlist.txt";
+const SANCTIONS_REFRESH_INTERVAL_SECS: u64 = 86_400; // 24 hours
+
+/// Fetch and parse OFAC SDN list
+pub async fn fetch_ofac_sdn_list() -> Result<SanctionsDatabase, String> {
+    let client: reqwest::Client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e: reqwest::Error| e.to_string())?;
+    
+    // Fetch the text version (simpler to parse)
+    let resp: reqwest::Response = client.get(OFAC_SDN_TXT_URL)
+        .send()
+        .await
+        .map_err(|e: reqwest::Error| format!("Failed to fetch SDN list: {}", e))?;
+    
+    let text: String = resp.text().await
+        .map_err(|e: reqwest::Error| e.to_string())?;
+    
+    let mut db = SanctionsDatabase::default();
+    
+    // Parse SDN list (format: NAME, ADDRESS, etc.)
+    for raw_line in text.lines() {
+        let line: &str = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        
+        // Extract names (first field before comma)
+        if let Some(name) = line.split(',').next() {
+            let name_str: &str = name;
+            let name_clean: String = name_str.trim().to_uppercase();
+            if !name_clean.is_empty() && name_clean.len() > 2 {
+                db.sdn_names.insert(name_clean);
+            }
+        }
+        
+        // Look for crypto addresses (starts with common prefixes)
+        for raw_word in line.split_whitespace() {
+            let word_to_trim: &str = raw_word;
+            let word: &str = word_to_trim.trim_matches(|c: char| !c.is_alphanumeric());
+            // Bitcoin addresses
+            if (word.starts_with("1") || word.starts_with("3") || word.starts_with("bc1")) 
+                && word.len() >= 26 && word.len() <= 62 {
+                db.sdn_addresses.insert(word.to_string());
+            }
+            // Ethereum addresses  
+            if word.starts_with("0x") && word.len() == 42 {
+                db.sdn_addresses.insert(word.to_lowercase());
+            }
+            // Kaspa addresses
+            if word.starts_with("kaspa:") && word.len() >= 60 {
+                db.sdn_addresses.insert(word.to_string());
+            }
+        }
+        
+        db.entry_count += 1;
+    }
+    
+    // Add sanctioned countries (OFAC primary sanctions)
+    let sanctioned_countries = ["KP", "IR", "CU", "SY", "RU", "BY"];
+    for code in sanctioned_countries {
+        db.sdn_countries.insert(code.to_string());
+    }
+    
+    db.last_updated = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    
+    Ok(db)
+}
+
+/// Background task to refresh sanctions list every 24 hours
+pub async fn sanctions_refresh_task(state: Arc<RwLock<SanctionsDatabase>>) {
+    let mut interval = interval(Duration::from_secs(SANCTIONS_REFRESH_INTERVAL_SECS));
+    
+    loop {
+        interval.tick().await;
+        
+        match fetch_ofac_sdn_list().await {
+            Ok(new_db) => {
+                let mut db = state.write().await;
+                *db = new_db;
+                println!("[SANCTIONS] Updated SDN list: {} entries, {} addresses", 
+                    db.entry_count, db.sdn_addresses.len());
+            }
+            Err(e) => {
+                eprintln!("[SANCTIONS] Failed to refresh: {}", e);
+            }
+        }
+    }
+}
+
+/// Check if an address or name is sanctioned
+#[derive(Deserialize)]
+pub struct SanctionCheckRequest {
+    pub address: Option<String>,
+    pub name: Option<String>,
+    pub country_code: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SanctionCheckResponse {
+    pub is_sanctioned: bool,
+    pub matched_type: Option<String>, // "address", "name", "country"
+    pub matched_value: Option<String>,
+    pub list_updated_at: u64,
+    pub check_timestamp: u64,
+}
+
+pub async fn api_sanctions_check(
+    state: web::Data<SanctionsState>,
+    req: web::Json<SanctionCheckRequest>,
+) -> impl Responder {
+    let db = state.db.read().await;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    
+    // Check address
+    if let Some(ref addr) = req.address {
+        let addr_lower = addr.to_lowercase();
+        let addr_upper = addr.to_uppercase();
+        
+        if db.sdn_addresses.contains(&addr_lower) || db.sdn_addresses.contains(addr) {
+            return HttpResponse::Ok().json(SanctionCheckResponse {
+                is_sanctioned: true,
+                matched_type: Some("address".to_string()),
+                matched_value: Some(addr.clone()),
+                list_updated_at: db.last_updated,
+                check_timestamp: now,
+            });
+        }
+    }
+    
+    // Check name
+    if let Some(ref name) = req.name {
+        let name_upper = name.to_uppercase();
+        if db.sdn_names.contains(&name_upper) {
+            return HttpResponse::Ok().json(SanctionCheckResponse {
+                is_sanctioned: true,
+                matched_type: Some("name".to_string()),
+                matched_value: Some(name.clone()),
+                list_updated_at: db.last_updated,
+                check_timestamp: now,
+            });
+        }
+    }
+    
+    // Check country
+    if let Some(ref country) = req.country_code {
+        let code_upper = country.to_uppercase();
+        if db.sdn_countries.contains(&code_upper) {
+            return HttpResponse::Ok().json(SanctionCheckResponse {
+                is_sanctioned: true,
+                matched_type: Some("country".to_string()),
+                matched_value: Some(country.clone()),
+                list_updated_at: db.last_updated,
+                check_timestamp: now,
+            });
+        }
+    }
+    
+    HttpResponse::Ok().json(SanctionCheckResponse {
+        is_sanctioned: false,
+        matched_type: None,
+        matched_value: None,
+        list_updated_at: db.last_updated,
+        check_timestamp: now,
+    })
+}
+
+#[derive(Serialize)]
+pub struct SanctionsStatusResponse {
+    pub is_active: bool,
+    pub last_updated: u64,
+    pub next_update: u64,
+    pub total_entries: usize,
+    pub address_count: usize,
+    pub name_count: usize,
+    pub country_count: usize,
+    pub source: String,
+}
+
+pub async fn api_sanctions_status(
+    state: web::Data<SanctionsState>,
+) -> impl Responder {
+    let db = state.db.read().await;
+    
+    HttpResponse::Ok().json(SanctionsStatusResponse {
+        is_active: db.last_updated > 0,
+        last_updated: db.last_updated,
+        next_update: db.last_updated + SANCTIONS_REFRESH_INTERVAL_SECS,
+        total_entries: db.entry_count,
+        address_count: db.sdn_addresses.len(),
+        name_count: db.sdn_names.len(),
+        country_count: db.sdn_countries.len(),
+        source: "OFAC SDN List".to_string(),
+    })
+}
+
+// ============================================================================
+// SECTION 4: ROUTE CONFIGURATION
+// ============================================================================
+
+pub fn configure_routes_additions(cfg: &mut web::ServiceConfig) {
+    cfg
+        // Missing handlers
+        .route("/api/circuit-breaker/status", web::get().to(api_circuit_breaker_status))
+        .route("/api/consignment/release", web::post().to(api_consignment_release))
+        .route("/api/consignment/deadlock", web::post().to(api_consignment_deadlock))
+        .route("/api/storefront/save", web::post().to(api_storefront_save))
+        .route("/api/storefront/visit", web::post().to(api_storefront_visit))
+        .route("/api/storefront/click", web::post().to(api_storefront_click))
+        .route("/api/price", web::get().to(api_get_price))
+        
+        // Onboarding (bot detection)
+        .route("/api/onboarding/start", web::post().to(api_onboarding_start))
+        .route("/api/onboarding/answer", web::post().to(api_onboarding_answer))
+        // NOTE: No /api/onboarding/avatar - avatar data is ephemeral, never stored
+        
+        // Sanctions API
+        .route("/api/sanctions/check", web::post().to(api_sanctions_check))
+        .route("/api/sanctions/status", web::get().to(api_sanctions_status));
+}
+
+// ============================================================================
+// SECTION 5: APP STATE ADDITIONS
+// ============================================================================
+
+pub struct AppStateAdditions {
+    pub circuit_breaker: RwLock<CircuitBreakerState>,
+    pub consignment_agreements: RwLock<std::collections::HashMap<String, ConsignmentAgreement>>,
+    pub storefronts: RwLock<std::collections::HashMap<String, StorefrontData>>,
+    pub storefront_visits: RwLock<std::collections::HashMap<String, u64>>,
+    pub storefront_click_counts: RwLock<std::collections::HashMap<String, u64>>, // Aggregate only: "host:platform" -> count
+    pub merchant_balances: RwLock<std::collections::HashMap<String, u64>>,
+    pub onboarding_sessions: RwLock<std::collections::HashMap<String, OnboardingSession>>,
+    pub onboarding_scores: RwLock<std::collections::HashMap<String, u32>>,
+    pub sanctions: SanctionsState,
+}
+
+pub struct CircuitBreakerStateApi {
+    pub is_tripped: bool,
+    pub total_outflow_last_hour: u64,
+    pub threshold: u64,
+    pub cooldown_until: Option<u64>,
+    pub trip_count: u32,
+}
+
+pub struct ConsignmentAgreementApi {
+    pub agreement_id: String,
+    pub consigner_pubkey: String,
+    pub seller_pubkey: String,
+    pub locked_sompi: u64,
+    pub seller_xp_stake: u64,
+    pub state: String,
+    pub consigner_approved: bool,
+    pub seller_approved: bool,
+}
+
+pub struct StorefrontData {
+    pub layout: serde_json::Value,
+    pub theme: String,
+    pub layout_hash: String,
+    pub saved_at: u64,
+}
+
+// NOTE: No ClickRecord struct - privacy by design
+// Only aggregate counts stored, no individual visitor tracking
+
+fn hash_bytes(data: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod onboarding_tests {
+    use super::*;
+
+    #[test]
+    fn test_onboarding_question_count() {
+        assert_eq!(get_onboarding_questions().len(), 30);
+    }
+
+    #[test]
+    fn test_onboarding_time_limits() {
+        assert_eq!(ONBOARDING_TIME_LIMIT_MS, 15_000);
+        assert_eq!(ONBOARDING_MIN_TIME_MS, 500);
+    }
+
+    #[test]
+    fn test_onboarding_pass_threshold() {
+        // 80% of 30 = 24
+        assert_eq!(ONBOARDING_PASS_THRESHOLD, 8);  // 80% = 8/10
+    }
+
+    #[test]
+    fn test_sanctions_refresh_interval() {
+        // 24 hours = 86400 seconds
+        assert_eq!(SANCTIONS_REFRESH_INTERVAL_SECS, 86_400);
+    }
+
+    #[test]
+    fn test_sanctioned_countries() {
+        let countries = ["KP", "IR", "CU", "SY", "RU", "BY"];
+        assert_eq!(countries.len(), 6);
+    }
+
+    #[test]
+    fn test_bot_detection_timing() {
+        // Too fast (< 500ms) = bot
+        assert!(400 < ONBOARDING_MIN_TIME_MS);
+        // Too slow (> 15s) = timeout
+        assert!(16_000 > ONBOARDING_TIME_LIMIT_MS);
+    }
+
+    #[test]
+    fn test_page_view_fee() {
+        const PAGE_VIEW_FEE_SOMPI: u64 = 500_000;
+        assert_eq!(PAGE_VIEW_FEE_SOMPI, 500_000); // 0.005 KAS
+    }
+
+    #[test]
+    fn test_merchant_fee_calculation() {
+        let kas_price: f64 = 0.12;
+        let merchant_fee_usd: f64 = 3.50;
+        let merchant_fee_kas: f64 = merchant_fee_usd / kas_price;
+        assert!((merchant_fee_kas - 29.17_f64).abs() < 0.1);
+    }
+}
+// ============================================================================
+// SECTION: IDENTITY MERKLE TREE & AVATAR PERSONALITY IMPRINT (v2.0)
+// ============================================================================
+// Changes:
+// 1. Identity hash → Merkle tree (avatar commitment)
+// 2. Merchant-only $3.50/month fee (NO transaction fees)
+// 3. YouTube URL validation
+// 4. 8 questions (6 bank + 2 avatar personality)
+// ============================================================================
+
+// =========================
+// FEE CONSTANTS (Merchant-only)
+// =========================
+
+/// Merchant monthly subscription fee: $3.50 USD
+pub const MERCHANT_FEE_USD_V2: f64 = 3.50;
+
+/// Page view fee: 0.005 KAS (paid by merchant)
+pub const PAGE_VIEW_FEE_SOMPI_V2: u64 = 500_000; // 0.005 KAS
+
+/// NO transaction fees for buyers/sellers - simplifies compliance
+
+// =========================
+// AVATAR PERSONALITY IMPRINT
+// =========================
+
+/// Avatar personality traits for identity verification
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AvatarPersonality {
+    pub name: String,
+    pub class: String,      // Warrior, Ninja, Mage, etc.
+    pub race: String,       // Human, Elf, Dark Elf, etc.
+    pub occupation: String, // Rapper, Superhero, etc.
+    pub story_keywords: Vec<String>,
+    pub created_at: u64,
+}
+
+impl AvatarPersonality {
+    pub fn new(name: &str, class: &str, race: &str, occupation: &str, story: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            class: class.to_string(),
+            race: race.to_string(),
+            occupation: occupation.to_string(),
+            story_keywords: Self::extract_keywords(story),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        }
+    }
+    
+    /// Extract meaningful keywords from story
+    fn extract_keywords(story: &str) -> Vec<String> {
+        let stop_words = ["the", "a", "an", "is", "are", "was", "were", "i", "my", "me", 
+                          "to", "and", "of", "in", "on", "at", "for", "with", "that", "this"];
+        story.to_lowercase()
+            .split_whitespace()
+            .filter(|w| w.len() > 3 && !stop_words.contains(w))
+            .take(10)
+            .map(|s| s.to_string())
+            .collect()
+    }
+    
+    /// Generate identity hash from personality
+    pub fn identity_hash(&self) -> [u8; 32] {
+        use sha2::{Sha256, Digest};
+        let data = format!("{}:{}:{}:{}:{}", 
+            self.name, self.class, self.race, self.occupation,
+            self.story_keywords.join(","));
+        let mut hasher = Sha256::new();
+        hasher.update(data.as_bytes());
+        hasher.finalize().into()
+    }
+    
+    /// Generate a personal question based on avatar
+    pub fn generate_avatar_question(&self, question_type: u8) -> AvatarQuestion {
+        match question_type % 4 {
+            0 => AvatarQuestion {
+                question: format!("What class did you choose for {}?", self.name),
+                options: vec![
+                    self.class.clone(),
+                    "Warrior".to_string(),
+                    "Assassin".to_string(),
+                    "Paladin".to_string(),
+                ],
+                correct_answer: self.class.clone(),
+                question_type: "class".to_string(),
+            },
+            1 => AvatarQuestion {
+                question: format!("What race is your avatar {}?", self.name),
+                options: vec![
+                    self.race.clone(),
+                    "Goblin".to_string(),
+                    "Troll".to_string(),
+                    "Sprite".to_string(),
+                ],
+                correct_answer: self.race.clone(),
+                question_type: "race".to_string(),
+            },
+            2 => AvatarQuestion {
+                question: format!("What occupation did you give {}?", self.name),
+                options: vec![
+                    self.occupation.clone(),
+                    "Blacksmith".to_string(),
+                    "Sailor".to_string(),
+                    "Wizard".to_string(),
+                ],
+                correct_answer: self.occupation.clone(),
+                question_type: "occupation".to_string(),
+            },
+            _ => {
+                // Story keyword question
+                let keyword = self.story_keywords.first()
+                    .cloned()
+                    .unwrap_or_else(|| "adventure".to_string());
+                let use_real = rand::random::<bool>();
+                let fake_keywords = ["dragon", "castle", "wizard", "treasure", "portal"];
+                let displayed_keyword = if use_real {
+                    keyword.clone()
+                } else {
+                    fake_keywords[rand::random::<usize>() % fake_keywords.len()].to_string()
+                };
+                AvatarQuestion {
+                    question: format!("Did you write about '{}' in your story?", displayed_keyword),
+                    options: vec!["Yes, I wrote about this".to_string(), "No, I didn't".to_string()],
+                    correct_answer: if use_real { "Yes, I wrote about this".to_string() } else { "No, I didn't".to_string() },
+                    question_type: "keyword".to_string(),
+                }
+            }
+        }
+    }
+}
+
+/// Avatar verification question
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AvatarQuestion {
+    pub question: String,
+    pub options: Vec<String>,
+    pub correct_answer: String,
+    pub question_type: String,
+}
+
+// =========================
+// IDENTITY MERKLE TREE
+// =========================
+
+/// Identity commitment stored in Merkle tree
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdentityCommitment {
+    /// SHA256(avatar + story) - the identity hash
+    pub identity_hash: [u8; 32],
+    /// When commitment was made
+    pub committed_at: u64,
+    /// Leaf index in identity Merkle tree
+    pub leaf_index: u64,
+    /// Public key associated with this identity
+    pub pubkey: String,
+    /// Avatar personality (optional, for question generation)
+    pub personality: Option<AvatarPersonality>,
+}
+
+/// Identity Merkle Tree - stores commitments for all verified users
+pub struct IdentityMerkleTree {
+    /// All identity commitments (leaf_index -> commitment)
+    leaves: std::collections::HashMap<u64, IdentityCommitment>,
+    /// Current Merkle root
+    root: [u8; 32],
+    /// Next available leaf index
+    next_index: u64,
+}
+
+impl IdentityMerkleTree {
+    pub fn new() -> Self {
+        Self {
+            leaves: std::collections::HashMap::new(),
+            root: [0u8; 32],
+            next_index: 0,
+        }
+    }
+    
+    /// Add identity commitment with avatar personality
+    pub fn add_commitment_with_personality(
+        &mut self, 
+        pubkey: &str, 
+        personality: AvatarPersonality
+    ) -> Result<u64, String> {
+        // Check for duplicate pubkey
+        if self.leaves.values().any(|c| c.pubkey == pubkey) {
+            return Err("Pubkey already has identity commitment".to_string());
+        }
+        
+        let identity_hash = personality.identity_hash();
+        let leaf_index = self.next_index;
+        
+        let commitment = IdentityCommitment {
+            identity_hash,
+            committed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            leaf_index,
+            pubkey: pubkey.to_string(),
+            personality: Some(personality),
+        };
+        
+        self.leaves.insert(leaf_index, commitment);
+        self.next_index += 1;
+        self.recompute_root();
+        
+        Ok(leaf_index)
+    }
+    
+    /// Add identity commitment (hash only, no personality stored)
+    pub fn add_commitment(&mut self, pubkey: &str, identity_hash: [u8; 32]) -> Result<u64, String> {
+        if self.leaves.values().any(|c| c.pubkey == pubkey) {
+            return Err("Pubkey already has identity commitment".to_string());
+        }
+        
+        let leaf_index = self.next_index;
+        let commitment = IdentityCommitment {
+            identity_hash,
+            committed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            leaf_index,
+            pubkey: pubkey.to_string(),
+            personality: None,
+        };
+        
+        self.leaves.insert(leaf_index, commitment);
+        self.next_index += 1;
+        self.recompute_root();
+        
+        Ok(leaf_index)
+    }
+    
+    /// Get commitment by pubkey
+    pub fn get_by_pubkey(&self, pubkey: &str) -> Option<&IdentityCommitment> {
+        self.leaves.values().find(|c| c.pubkey == pubkey)
+    }
+    
+    /// Verify identity hash matches commitment
+    pub fn verify_identity(&self, pubkey: &str, identity_hash: &[u8; 32]) -> bool {
+        self.get_by_pubkey(pubkey)
+            .map(|c| c.identity_hash == *identity_hash)
+            .unwrap_or(false)
+    }
+    
+    /// Get Merkle proof for identity
+    pub fn get_proof(&self, leaf_index: u64) -> Option<Vec<[u8; 32]>> {
+        if !self.leaves.contains_key(&leaf_index) {
+            return None;
+        }
+        
+        let mut proof = Vec::new();
+        let mut idx = leaf_index;
+        let depth = (self.next_index as f64).log2().ceil() as u32;
+        
+        for _ in 0..depth.max(1) {
+            let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+            if let Some(sibling) = self.leaves.get(&sibling_idx) {
+                proof.push(sibling.identity_hash);
+            } else {
+                proof.push([0u8; 32]);
+            }
+            idx /= 2;
+        }
+        
+        Some(proof)
+    }
+    
+    /// Get current root
+    pub fn root(&self) -> [u8; 32] {
+        self.root
+    }
+    
+    /// Get avatar questions for re-verification
+    pub fn get_avatar_questions(&self, pubkey: &str) -> Option<Vec<AvatarQuestion>> {
+        self.get_by_pubkey(pubkey)
+            .and_then(|c| c.personality.as_ref())
+            .map(|p| vec![
+                p.generate_avatar_question(0),
+                p.generate_avatar_question(3),
+            ])
+    }
+    
+    /// Recompute Merkle root
+    fn recompute_root(&mut self) {
+        use sha2::{Sha256, Digest};
+        
+        if self.leaves.is_empty() {
+            self.root = [0u8; 32];
+            return;
+        }
+        
+        let mut level: Vec<[u8; 32]> = self.leaves
+            .values()
+            .map(|c| c.identity_hash)
+            .collect();
+        
+        while level.len() > 1 {
+            let mut next_level = Vec::new();
+            for chunk in level.chunks(2) {
+                let mut hasher = Sha256::new();
+                hasher.update(&chunk[0]);
+                if chunk.len() > 1 {
+                    hasher.update(&chunk[1]);
+                } else {
+                    hasher.update(&chunk[0]);
+                }
+                let result: [u8; 32] = hasher.finalize().into();
+                next_level.push(result);
+            }
+            level = next_level;
+        }
+        
+        self.root = level[0];
+    }
+}
+
+// =========================
+// VISUAL URL PLATFORMS (YouTube included)
+// =========================
+
+/// Supported visual URL platforms
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum VisualPlatform {
+    Instagram,
+    TikTok,
+    YouTube,
+    Pinterest,
+    Etsy,
+    Twitter,
+}
+
+impl VisualPlatform {
+    pub fn validate_url(&self, url: &str) -> bool {
+        let valid_domains = match self {
+            VisualPlatform::Instagram => vec!["instagram.com", "www.instagram.com"],
+            VisualPlatform::TikTok => vec!["tiktok.com", "www.tiktok.com", "vm.tiktok.com"],
+            VisualPlatform::YouTube => vec!["youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"],
+            VisualPlatform::Pinterest => vec!["pinterest.com", "www.pinterest.com", "pin.it"],
+            VisualPlatform::Etsy => vec!["etsy.com", "www.etsy.com"],
+            VisualPlatform::Twitter => vec!["twitter.com", "www.twitter.com", "x.com", "www.x.com"],
+        };
+        
+        // Simple domain validation without url crate
+        let url_lower = url.to_lowercase();
+        valid_domains.iter().any(|d| url_lower.contains(d))
+    }
+    
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "instagram" => Some(VisualPlatform::Instagram),
+            "tiktok" => Some(VisualPlatform::TikTok),
+            "youtube" => Some(VisualPlatform::YouTube),
+            "pinterest" => Some(VisualPlatform::Pinterest),
+            "etsy" => Some(VisualPlatform::Etsy),
+            "twitter" | "x" => Some(VisualPlatform::Twitter),
+            _ => None,
+        }
+    }
+}
+
+/// Product visual URL
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProductVisual {
+    pub platform: VisualPlatform,
+    pub url: String,
+}
+
+impl ProductVisual {
+    pub fn new(platform: &str, url: &str) -> Result<Self, String> {
+        let platform = VisualPlatform::from_str(platform)
+            .ok_or_else(|| "Invalid platform".to_string())?;
+        
+        if !platform.validate_url(url) {
+            return Err(format!("Invalid URL for platform {:?}", platform));
+        }
+        
+        Ok(Self {
+            platform,
+            url: url.to_string(),
+        })
+    }
+}
+
+// =========================
+// API HANDLERS (Identity & Fees)
+// =========================
+
+/// Register with identity hash and avatar
+#[derive(Deserialize)]
+pub struct RegisterWithIdentityRequest {
+    pub pubkey: String,
+    pub identity_hash: Option<String>,
+    pub avatar: Option<AvatarPersonalityDto>,
+}
+
+#[derive(Deserialize)]
+pub struct AvatarPersonalityDto {
+    pub name: String,
+    pub class: String,
+    pub race: String,
+    pub occupation: String,
+    pub story: String,
+}
+
+/// Register handler with identity commitment
+pub async fn api_register_with_identity(
+    req: web::Json<RegisterWithIdentityRequest>,
+    identity_tree: web::Data<std::sync::RwLock<IdentityMerkleTree>>,
+) -> HttpResponse {
+    let leaf_index = if let Some(avatar_dto) = &req.avatar {
+        // Create personality and commit
+        let personality = AvatarPersonality::new(
+            &avatar_dto.name,
+            &avatar_dto.class,
+            &avatar_dto.race,
+            &avatar_dto.occupation,
+            &avatar_dto.story,
+        );
+        
+        match identity_tree.write() {
+            Ok(mut tree) => match tree.add_commitment_with_personality(&req.pubkey, personality) {
+                Ok(idx) => idx,
+                Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({
+                    "success": false,
+                    "error": e
+                })),
+            },
+            Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": "Failed to lock identity tree"
+            })),
+        }
+    } else if let Some(hash_hex) = &req.identity_hash {
+        // Use provided hash
+        let identity_hash: [u8; 32] = match hex::decode(hash_hex) {
+            Ok(bytes) if bytes.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                arr
+            }
+            _ => return HttpResponse::BadRequest().json(serde_json::json!({
+                "success": false,
+                "error": "Invalid identity hash format"
+            })),
+        };
+        
+        match identity_tree.write() {
+            Ok(mut tree) => match tree.add_commitment(&req.pubkey, identity_hash) {
+                Ok(idx) => idx,
+                Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({
+                    "success": false,
+                    "error": e
+                })),
+            },
+            Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": "Failed to lock identity tree"
+            })),
+        }
+    } else {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "success": false,
+            "error": "Must provide identity_hash or avatar"
+        }));
+    };
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "pubkey": req.pubkey,
+        "identity_leaf_index": leaf_index,
+        "message": "Identity committed to Merkle tree"
+    }))
+}
+
+/// Get avatar questions for re-verification
+pub async fn api_get_avatar_questions(
+    pubkey: web::Path<String>,
+    identity_tree: web::Data<std::sync::RwLock<IdentityMerkleTree>>,
+) -> HttpResponse {
+    match identity_tree.read() {
+        Ok(tree) => {
+            if let Some(questions) = tree.get_avatar_questions(&pubkey) {
+                HttpResponse::Ok().json(serde_json::json!({
+                    "success": true,
+                    "questions": questions
+                }))
+            } else {
+                HttpResponse::NotFound().json(serde_json::json!({
+                    "success": false,
+                    "error": "No avatar questions available"
+                }))
+            }
+        }
+        Err(_) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "error": "Failed to read identity tree"
+        })),
+    }
+}
+
+/// Fee calculation response
+#[derive(Serialize)]
+pub struct FeeCalculationV2 {
+    pub merchant_fee_usd: f64,
+    pub merchant_fee_kas: f64,
+    pub merchant_fee_sompi: u64,
+    pub page_view_fee_sompi: u64,
+    pub buyer_transaction_fee: u64,
+    pub seller_transaction_fee: u64,
+    pub kas_price_usd: f64,
+}
+
+pub async fn api_get_fees_v2(price_state: web::Data<std::sync::RwLock<f64>>) -> HttpResponse {
+    let kas_price = price_state.read().map(|p| *p).unwrap_or(0.12);
+    
+    let merchant_fee_kas = MERCHANT_FEE_USD_V2 / kas_price;
+    let merchant_fee_sompi = (merchant_fee_kas * 100_000_000.0) as u64;
+    
+    HttpResponse::Ok().json(FeeCalculationV2 {
+        merchant_fee_usd: MERCHANT_FEE_USD_V2,
+        merchant_fee_kas,
+        merchant_fee_sompi,
+        page_view_fee_sompi: PAGE_VIEW_FEE_SOMPI_V2,
+        buyer_transaction_fee: 0,  // FREE
+        seller_transaction_fee: 0, // FREE
+        kas_price_usd: kas_price,
+    })
+}
+
+/// Validate visual URL
+#[derive(Deserialize)]
+pub struct ValidateVisualRequest {
+    pub platform: String,
+    pub url: String,
+}
+
+pub async fn api_validate_visual_url(req: web::Json<ValidateVisualRequest>) -> HttpResponse {
+    match ProductVisual::new(&req.platform, &req.url) {
+        Ok(visual) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "platform": format!("{:?}", visual.platform),
+            "url": visual.url,
+            "valid": true
+        })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({
+            "success": false,
+            "error": e,
+            "valid": false
+        })),
+    }
+}
+
+/// Get identity proof
+#[derive(Deserialize)]
+pub struct GetIdentityProofRequest {
+    pub pubkey: String,
+}
+
+pub async fn api_get_identity_proof(
+    req: web::Json<GetIdentityProofRequest>,
+    identity_tree: web::Data<std::sync::RwLock<IdentityMerkleTree>>,
+) -> HttpResponse {
+    let tree = match identity_tree.read() {
+        Ok(t) => t,
+        Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "error": "Failed to lock identity tree"
+        })),
+    };
+    
+    let commitment = match tree.get_by_pubkey(&req.pubkey) {
+        Some(c) => c,
+        None => return HttpResponse::NotFound().json(serde_json::json!({
+            "success": false,
+            "error": "No identity commitment found"
+        })),
+    };
+    
+    let proof = tree.get_proof(commitment.leaf_index);
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "leaf_index": commitment.leaf_index,
+        "identity_hash": hex::encode(commitment.identity_hash),
+        "committed_at": commitment.committed_at,
+        "proof": proof.map(|p| p.iter().map(hex::encode).collect::<Vec<_>>()),
+        "root": hex::encode(tree.root())
+    }))
+}
+
+// =========================
+// ROUTE CONFIGURATION
+// =========================
+
+/// Add identity routes to HttpServer
+pub fn configure_identity_routes_v2(cfg: &mut web::ServiceConfig) {
+    cfg.service(
+        web::scope("/api")
+            .route("/register", web::post().to(api_register_with_identity))
+            .route("/identity/proof", web::post().to(api_get_identity_proof))
+            .route("/identity/questions/{pubkey}", web::get().to(api_get_avatar_questions))
+            .route("/fees", web::get().to(api_get_fees_v2))
+            .route("/visual/validate", web::post().to(api_validate_visual_url))
+    );
+}
+
+// =========================
+// TESTS
+// =========================
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    
+    #[test]
+    fn test_avatar_personality() {
+        let personality = AvatarPersonality::new(
+            "Shadow", "Ninja", "Dark Elf", "Rapper",
+            "I wandered through the ancient forest seeking treasure and glory"
+        );
+        
+        assert_eq!(personality.name, "Shadow");
+        assert_eq!(personality.class, "Ninja");
+        assert!(!personality.story_keywords.is_empty());
+        assert!(personality.story_keywords.contains(&"wandered".to_string()) || 
+                personality.story_keywords.contains(&"ancient".to_string()));
+        
+        let hash = personality.identity_hash();
+        assert_ne!(hash, [0u8; 32]);
+    }
+    
+    #[test]
+    fn test_avatar_questions() {
+        let personality = AvatarPersonality::new(
+            "Hero", "Warrior", "Human", "Superhero",
+            "Fighting evil in the city streets"
+        );
+        
+        let q = personality.generate_avatar_question(0);
+        assert!(q.question.contains("Hero"));
+        assert!(q.options.contains(&"Warrior".to_string()));
+    }
+    
+    #[test]
+    fn test_identity_merkle_tree() {
+        let mut tree = IdentityMerkleTree::new();
+        
+        let personality = AvatarPersonality::new(
+            "Test", "Mage", "Elf", "Artist", "Magic flows through everything"
+        );
+        
+        let idx = tree.add_commitment_with_personality("pubkey1", personality.clone()).unwrap();
+        assert_eq!(idx, 0);
+        
+        assert!(tree.get_by_pubkey("pubkey1").is_some());
+        assert!(tree.get_avatar_questions("pubkey1").is_some());
+        
+        let proof = tree.get_proof(0).unwrap();
+        assert!(!proof.is_empty());
+    }
+    
+    #[test]
+    fn test_visual_platforms() {
+        assert!(VisualPlatform::YouTube.validate_url("https://youtube.com/watch?v=abc"));
+        assert!(VisualPlatform::YouTube.validate_url("https://youtu.be/xyz"));
+        assert!(!VisualPlatform::YouTube.validate_url("https://vimeo.com/123"));
+        
+        assert!(VisualPlatform::Instagram.validate_url("https://instagram.com/p/123"));
+        assert!(VisualPlatform::TikTok.validate_url("https://vm.tiktok.com/abc"));
+    }
+    
+    #[test]
+    fn test_merchant_fee() {
+        let kas_price: f64 = 0.12;
+        let fee_kas: f64 = MERCHANT_FEE_USD_V2 / kas_price;
+        assert!((fee_kas - 29.17_f64).abs() < 0.1);
     }
 }

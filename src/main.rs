@@ -121,18 +121,18 @@ use pasta_curves::EqAffine;
 // which is compatible with halo2, k256, and other crypto crates
 use rand::rngs::OsRng;
 use rand::RngCore;
-use rand::CryptoRng;
+// use rand::CryptoRng;  // unused
 use base64::Engine;
 use hex;
 use serde_json;
 use serde_json::json;
 
 // ============================================================================
-// FIRESTORE + REDIS IMPORTS (for Firestore integration)
+// FIRESTORE + CACHE IMPORTS (using local REST implementation)
 // ============================================================================
-use firestore::FirestoreDb;
-use redis::{Commands, Connection};
-use chrono::{DateTime, Utc};
+// Note: Using local FirestoreDb REST implementation, not external crate
+use chrono::Utc;
+use std::collections::HashMap as StdHashMap;
 use tokio::sync::{RwLock, mpsc, broadcast};
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::{
@@ -32482,46 +32482,211 @@ pub mod circuit_binary {
 // ```
 
 // ============================================================================
-// FIRESTORE CACHE IMPLEMENTATION
+// FIRESTORE CACHE IMPLEMENTATION (In-Memory + Local FirestoreDb REST API)
 // ============================================================================
 
+/// Cache entry with expiration
+struct CacheEntry {
+    data: String,
+    expires_at: u64,
+}
+
+/// In-memory cache with TTL support
+pub struct InMemoryCache {
+    cache: std::sync::RwLock<StdHashMap<String, CacheEntry>>,
+}
+
+impl InMemoryCache {
+    pub fn new() -> Self {
+        Self {
+            cache: std::sync::RwLock::new(StdHashMap::new()),
+        }
+    }
+    
+    pub fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
+        let cache = self.cache.read().ok()?;
+        let entry = cache.get(key)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if now > entry.expires_at {
+            return None;
+        }
+        serde_json::from_str(&entry.data).ok()
+    }
+    
+    pub fn set<T: serde::Serialize>(&self, key: &str, value: &T, ttl_secs: u64) {
+        if let Ok(json) = serde_json::to_string(value) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let entry = CacheEntry {
+                data: json,
+                expires_at: now + ttl_secs,
+            };
+            if let Ok(mut cache) = self.cache.write() {
+                cache.insert(key.to_string(), entry);
+            }
+        }
+    }
+    
+    #[allow(dead_code)]
+    pub fn invalidate(&self, key: &str) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.remove(key);
+        }
+    }
+    
+    /// Clean up expired entries (call periodically)
+    #[allow(dead_code)]
+    pub fn cleanup(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if let Ok(mut cache) = self.cache.write() {
+            cache.retain(|_, v| v.expires_at > now);
+        }
+    }
+}
+
+/// Firestore cache combining in-memory cache with REST API
 pub struct FirestoreCache {
-    db: FirestoreDb,
-    redis: redis::Client,
+    pub db: FirestoreFrontendDb,
+    cache: InMemoryCache,
+}
+
+/// Frontend-specific Firestore DB (uses REST API)
+pub struct FirestoreFrontendDb {
+    project_id: String,
+    http_client: reqwest::Client,
+    access_token: Arc<RwLock<String>>,
+}
+
+impl FirestoreFrontendDb {
+    pub fn new(project_id: &str) -> Self {
+        Self {
+            project_id: project_id.to_string(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            access_token: Arc::new(RwLock::new(String::new())),
+        }
+    }
+    
+    pub async fn set_access_token(&self, token: &str) {
+        let mut guard = self.access_token.write().await;
+        *guard = token.to_string();
+    }
+    
+    fn base_url(&self) -> String {
+        format!(
+            "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents",
+            self.project_id
+        )
+    }
+    
+    /// Run a structured query against Firestore
+    pub async fn run_query(&self, query: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+        let token = self.access_token.read().await.clone();
+        let url = format!(
+            "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents:runQuery",
+            self.project_id
+        );
+        
+        let resp = self.http_client.post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&query)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+        
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            return Err(format!("Query failed: {}", err));
+        }
+        
+        let results: Vec<serde_json::Value> = resp.json().await
+            .map_err(|e| format!("Parse failed: {}", e))?;
+        
+        // Extract documents from results
+        let docs: Vec<serde_json::Value> = results.iter()
+            .filter_map(|r| r.get("document").cloned())
+            .map(|doc| Self::parse_firestore_doc(&doc))
+            .collect();
+        
+        Ok(docs)
+    }
+    
+    /// Parse Firestore document fields to regular JSON
+    fn parse_firestore_doc(doc: &serde_json::Value) -> serde_json::Value {
+        if let Some(fields) = doc.get("fields") {
+            Self::from_firestore_fields(fields)
+        } else {
+            doc.clone()
+        }
+    }
+    
+    fn from_firestore_fields(value: &serde_json::Value) -> serde_json::Value {
+        if let Some(obj) = value.as_object() {
+            if obj.contains_key("nullValue") { return serde_json::Value::Null; }
+            if let Some(v) = obj.get("booleanValue") { return v.clone(); }
+            if let Some(v) = obj.get("integerValue") {
+                if let Some(s) = v.as_str() {
+                    if let Ok(i) = s.parse::<i64>() {
+                        return serde_json::json!(i);
+                    }
+                }
+                return v.clone();
+            }
+            if let Some(v) = obj.get("doubleValue") { return v.clone(); }
+            if let Some(v) = obj.get("stringValue") { return v.clone(); }
+            if let Some(arr) = obj.get("arrayValue") {
+                if let Some(values) = arr.get("values").and_then(|v| v.as_array()) {
+                    return serde_json::Value::Array(values.iter().map(Self::from_firestore_fields).collect());
+                }
+                return serde_json::Value::Array(vec![]);
+            }
+            if let Some(map) = obj.get("mapValue") {
+                if let Some(fields) = map.get("fields").and_then(|f| f.as_object()) {
+                    let result: serde_json::Map<String, serde_json::Value> = fields.iter()
+                        .map(|(k, v)| (k.clone(), Self::from_firestore_fields(v)))
+                        .collect();
+                    return serde_json::Value::Object(result);
+                }
+            }
+            // Direct object fields
+            let result: serde_json::Map<String, serde_json::Value> = obj.iter()
+                .map(|(k, v)| (k.clone(), Self::from_firestore_fields(v)))
+                .collect();
+            return serde_json::Value::Object(result);
+        }
+        value.clone()
+    }
 }
 
 impl FirestoreCache {
-    pub async fn new(project_id: &str, redis_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let db = FirestoreDb::new(project_id).await?;
-        let redis = redis::Client::open(redis_url)?;
-        redis.get_connection()?.ping()?;
-        
-        Ok(FirestoreCache { db, redis })
-    }
-    
-    fn get_cache<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
-        if let Ok(mut conn) = self.redis.get_connection() {
-            if let Ok(data) = conn.get::<_, String>(key) {
-                if let Ok(obj) = serde_json::from_str::<T>(&data) {
-                    return Some(obj);
-                }
-            }
-        }
-        None
-    }
-    
-    fn set_cache<T: serde::Serialize>(&self, key: &str, value: &T, ttl_secs: usize) {
-        if let Ok(mut conn) = self.redis.get_connection() {
-            if let Ok(json) = serde_json::to_string(value) {
-                let _: Result<(), _> = conn.set_ex(key, json, ttl_secs);
-            }
+    pub fn new(project_id: &str) -> Self {
+        Self {
+            db: FirestoreFrontendDb::new(project_id),
+            cache: InMemoryCache::new(),
         }
     }
     
-    fn invalidate_cache(&self, key: &str) {
-        if let Ok(mut conn) = self.redis.get_connection() {
-            let _: Result<(), _> = conn.del(key);
-        }
+    pub fn get_cache<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
+        self.cache.get(key)
+    }
+    
+    pub fn set_cache<T: serde::Serialize>(&self, key: &str, value: &T, ttl_secs: u64) {
+        self.cache.set(key, value, ttl_secs);
+    }
+    
+    #[allow(dead_code)]
+    pub fn invalidate_cache(&self, key: &str) {
+        self.cache.invalidate(key);
     }
 }
 
@@ -32595,30 +32760,45 @@ pub struct CouponFrontend {
 }
 
 // ============================================================================
-// FIRESTORE QUERY FUNCTIONS
+// FIRESTORE QUERY FUNCTIONS (Using REST API Structured Queries)
 // ============================================================================
 
 async fn query_host_node(
     firestore_cache: &FirestoreCache,
     pubkey: &str,
 ) -> Result<Option<HostNodeFrontend>, String> {
-    let docs = firestore_cache.db
-        .fluent()
-        .select()
-        .from("host_nodes")
-        .where_(|q| {
-            q.and(
-                q.field("owner_pubkey").eq(pubkey),
-                q.field("status").eq("active")
-            )
-        })
-        .limit(1)
-        .query()
-        .await
-        .map_err(|e| format!("Firestore error: {}", e))?;
+    let query = serde_json::json!({
+        "structuredQuery": {
+            "from": [{ "collectionId": "host_nodes" }],
+            "where": {
+                "compositeFilter": {
+                    "op": "AND",
+                    "filters": [
+                        {
+                            "fieldFilter": {
+                                "field": { "fieldPath": "owner_pubkey" },
+                                "op": "EQUAL",
+                                "value": { "stringValue": pubkey }
+                            }
+                        },
+                        {
+                            "fieldFilter": {
+                                "field": { "fieldPath": "status" },
+                                "op": "EQUAL",
+                                "value": { "stringValue": "active" }
+                            }
+                        }
+                    ]
+                }
+            },
+            "limit": 1
+        }
+    });
+    
+    let docs = firestore_cache.db.run_query(query).await?;
     
     if let Some(doc) = docs.first() {
-        let host = serde_json::from_value::<HostNodeFrontend>(doc.document.clone())
+        let host = serde_json::from_value::<HostNodeFrontend>(doc.clone())
             .map_err(|e| format!("Parse error: {}", e))?;
         return Ok(Some(host));
     }
@@ -32630,18 +32810,24 @@ async fn query_host_items(
     firestore_cache: &FirestoreCache,
     host_id: u64,
 ) -> Result<Vec<HostNodeItemFrontend>, String> {
-    let docs = firestore_cache.db
-        .fluent()
-        .select()
-        .from("host_items")
-        .where_(|q| q.field("host_id").eq(host_id as i64))
-        .query()
-        .await
-        .map_err(|e| format!("Firestore error: {}", e))?;
+    let query = serde_json::json!({
+        "structuredQuery": {
+            "from": [{ "collectionId": "host_items" }],
+            "where": {
+                "fieldFilter": {
+                    "field": { "fieldPath": "host_id" },
+                    "op": "EQUAL",
+                    "value": { "integerValue": host_id.to_string() }
+                }
+            }
+        }
+    });
+    
+    let docs = firestore_cache.db.run_query(query).await?;
     
     let items = docs
         .iter()
-        .filter_map(|doc| serde_json::from_value::<HostNodeItemFrontend>(doc.document.clone()).ok())
+        .filter_map(|doc| serde_json::from_value::<HostNodeItemFrontend>(doc.clone()).ok())
         .collect();
     
     Ok(items)
@@ -32650,18 +32836,24 @@ async fn query_host_items(
 async fn query_all_host_nodes(
     firestore_cache: &FirestoreCache,
 ) -> Result<Vec<HostNodeFrontend>, String> {
-    let docs = firestore_cache.db
-        .fluent()
-        .select()
-        .from("host_nodes")
-        .where_(|q| q.field("status").eq("active"))
-        .query()
-        .await
-        .map_err(|e| format!("Firestore error: {}", e))?;
+    let query = serde_json::json!({
+        "structuredQuery": {
+            "from": [{ "collectionId": "host_nodes" }],
+            "where": {
+                "fieldFilter": {
+                    "field": { "fieldPath": "status" },
+                    "op": "EQUAL",
+                    "value": { "stringValue": "active" }
+                }
+            }
+        }
+    });
+    
+    let docs = firestore_cache.db.run_query(query).await?;
     
     let hosts = docs
         .iter()
-        .filter_map(|doc| serde_json::from_value::<HostNodeFrontend>(doc.document.clone()).ok())
+        .filter_map(|doc| serde_json::from_value::<HostNodeFrontend>(doc.clone()).ok())
         .collect();
     
     Ok(hosts)
@@ -32670,23 +32862,26 @@ async fn query_all_host_nodes(
 async fn query_dapps(
     firestore_cache: &FirestoreCache,
 ) -> Result<Vec<DAppMarketplaceItemFrontend>, String> {
-    let docs = firestore_cache.db
-        .fluent()
-        .select()
-        .from("dapps")
-        .where_(|q| {
-            q.and(
-                q.field("board").not_eq("REJECTED"),
-                q.field("status").eq("active")
-            )
-        })
-        .query()
-        .await
-        .map_err(|e| format!("Firestore error: {}", e))?;
+    // Note: Firestore doesn't support != in composite filters well, so we filter client-side
+    let query = serde_json::json!({
+        "structuredQuery": {
+            "from": [{ "collectionId": "dapps" }],
+            "where": {
+                "fieldFilter": {
+                    "field": { "fieldPath": "status" },
+                    "op": "EQUAL",
+                    "value": { "stringValue": "active" }
+                }
+            }
+        }
+    });
     
-    let dapps = docs
+    let docs = firestore_cache.db.run_query(query).await?;
+    
+    let dapps: Vec<DAppMarketplaceItemFrontend> = docs
         .iter()
-        .filter_map(|doc| serde_json::from_value::<DAppMarketplaceItemFrontend>(doc.document.clone()).ok())
+        .filter_map(|doc| serde_json::from_value::<DAppMarketplaceItemFrontend>(doc.clone()).ok())
+        .filter(|d| d.board != "REJECTED")
         .collect();
     
     Ok(dapps)
@@ -32697,44 +32892,41 @@ async fn query_coupons(
 ) -> Result<Vec<CouponFrontend>, String> {
     let now = Utc::now().timestamp_millis();
     
-    let docs = firestore_cache.db
-        .fluent()
-        .select()
-        .from("coupons")
-        .where_(|q| {
-            q.and(
-                q.field("status").eq("active"),
-                q.field("expires_at").greater_than(now)
-            )
-        })
-        .query()
-        .await
-        .map_err(|e| format!("Firestore error: {}", e))?;
-    
-    let mut coupons = Vec::new();
-    
-    for doc in docs {
-        if let Ok(mut coupon) = serde_json::from_value::<CouponFrontend>(doc.document.clone()) {
-            if let Ok(host_docs) = firestore_cache.db
-                .fluent()
-                .select()
-                .from("host_nodes")
-                .where_(|q| q.field("host_id").eq(coupon.host_id as i64))
-                .limit(1)
-                .query()
-                .await
-            {
-                if let Some(host_doc) = host_docs.first() {
-                    if let Ok(host) = serde_json::from_value::<HostNodeFrontend>(host_doc.document.clone()) {
-                        coupon.host_name = host.name;
-                    }
+    let query = serde_json::json!({
+        "structuredQuery": {
+            "from": [{ "collectionId": "coupons" }],
+            "where": {
+                "compositeFilter": {
+                    "op": "AND",
+                    "filters": [
+                        {
+                            "fieldFilter": {
+                                "field": { "fieldPath": "status" },
+                                "op": "EQUAL",
+                                "value": { "stringValue": "active" }
+                            }
+                        },
+                        {
+                            "fieldFilter": {
+                                "field": { "fieldPath": "expires_at" },
+                                "op": "GREATER_THAN",
+                                "value": { "integerValue": now.to_string() }
+                            }
+                        }
+                    ]
                 }
             }
-            
-            coupons.push(coupon);
         }
-    }
+    });
     
+    let docs = firestore_cache.db.run_query(query).await?;
+    
+    let coupons: Vec<CouponFrontend> = docs
+        .iter()
+        .filter_map(|doc| serde_json::from_value::<CouponFrontend>(doc.clone()).ok())
+        .collect();
+    
+    // Note: host_name lookup skipped for performance - frontend can fetch separately
     Ok(coupons)
 }
 
@@ -32742,20 +32934,24 @@ async fn query_storefront(
     firestore_cache: &FirestoreCache,
     pubkey: &str,
 ) -> Result<Option<serde_json::Value>, String> {
-    let docs = firestore_cache.db
-        .fluent()
-        .select()
-        .from("storefront_layouts")
-        .where_(|q| q.field("owner_pubkey").eq(pubkey))
-        .limit(1)
-        .query()
-        .await
-        .map_err(|e| format!("Firestore error: {}", e))?;
+    let query = serde_json::json!({
+        "structuredQuery": {
+            "from": [{ "collectionId": "storefront_layouts" }],
+            "where": {
+                "fieldFilter": {
+                    "field": { "fieldPath": "owner_pubkey" },
+                    "op": "EQUAL",
+                    "value": { "stringValue": pubkey }
+                }
+            },
+            "limit": 1
+        }
+    });
+    
+    let docs = firestore_cache.db.run_query(query).await?;
     
     if let Some(doc) = docs.first() {
-        let layout = serde_json::from_value(doc.document.clone())
-            .map_err(|e| format!("Parse error: {}", e))?;
-        return Ok(Some(layout));
+        return Ok(Some(doc.clone()));
     }
     
     Ok(None)
@@ -32777,9 +32973,9 @@ pub async fn api_get_host_node_firestore(
             .json(json!({"success": true, "data": cached}));
     }
     
-    match query_host_node(&state.firestore_cache, &pubkey).await {
+    match query_host_node(&*state.firestore_cache, &pubkey).await {
         Ok(Some(mut host)) => {
-            if let Ok(items) = query_host_items(&state.firestore_cache, host.host_id).await {
+            if let Ok(items) = query_host_items(&*state.firestore_cache, host.host_id).await {
                 host.items = items;
             }
             
@@ -32808,10 +33004,10 @@ pub async fn api_get_host_nodes_firestore(
             .json(json!({"success": true, "data": cached, "count": cached.len()}));
     }
     
-    match query_all_host_nodes(&state.firestore_cache).await {
+    match query_all_host_nodes(&*state.firestore_cache).await {
         Ok(mut hosts) => {
             for host in &mut hosts {
-                if let Ok(items) = query_host_items(&state.firestore_cache, host.host_id).await {
+                if let Ok(items) = query_host_items(&*state.firestore_cache, host.host_id).await {
                     host.items = items;
                 }
             }
@@ -32841,7 +33037,7 @@ pub async fn api_get_dapps_firestore(
             .json(json!({"success": true, "data": cached, "count": cached.len()}));
     }
     
-    match query_dapps(&state.firestore_cache).await {
+    match query_dapps(&*state.firestore_cache).await {
         Ok(dapps) => {
             let count = dapps.len();
             state.firestore_cache.set_cache(cache_key, &dapps, 1800);
@@ -32868,7 +33064,7 @@ pub async fn api_get_coupons_firestore(
             .json(json!({"success": true, "data": cached, "count": cached.len()}));
     }
     
-    match query_coupons(&state.firestore_cache).await {
+    match query_coupons(&*state.firestore_cache).await {
         Ok(coupons) => {
             let count = coupons.len();
             state.firestore_cache.set_cache(cache_key, &coupons, 600);
@@ -32896,7 +33092,7 @@ pub async fn api_get_storefront_firestore(
             .json(json!({"success": true, "data": cached}));
     }
     
-    match query_storefront(&state.firestore_cache, &pubkey).await {
+    match query_storefront(&*state.firestore_cache, &pubkey).await {
         Ok(Some(layout)) => {
             state.firestore_cache.set_cache(&cache_key, &layout, 1800);
             
@@ -36602,6 +36798,7 @@ pub struct AppState {
     pub storefront_click_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     pub onboarding_sessions: Arc<std::sync::RwLock<HashMap<String, OnboardingSession>>>,
     pub onboarding_scores: Arc<std::sync::RwLock<HashMap<String, u8>>>,
+    pub firestore_cache: Arc<FirestoreCache>,
 }
 
 
@@ -48758,77 +48955,6 @@ pub async fn api_sanctions_status(
     })
 }
 
-// ============================================================================
-// SECTION 3B: FRONTEND STOREFRONT API ENDPOINTS
-// ============================================================================
-
-/// Frontend Host Node structure for storefront
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HostNodeFrontend {
-    pub host_id: u64,
-    pub owner_pubkey: String,
-    pub name: String,
-    pub description: String,
-    pub owner_tier: String,
-    pub theme: String,
-    pub items: Vec<HostNodeItemFrontend>,
-    pub xp: u64,
-    pub reliability: f64,
-    pub apartment: String,
-    pub created_at: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HostNodeItemFrontend {
-    pub id: u64,
-    pub name: String,
-    pub price: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub visuals: Option<ProductVisualFrontend>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProductVisualFrontend {
-    pub platform: String,
-    pub url: String,
-}
-
-/// Frontend DApp Marketplace structure
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DAppMarketplaceItemFrontend {
-    pub id: u64,
-    pub name: String,
-    pub category: String,
-    pub board: String,
-    pub trustScore: u64,
-    pub stakeKas: f64,
-    pub owner: String,
-    pub ownerPubkey: String,
-    pub description: String,
-    pub availableForSwap: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub askingPrice: Option<f64>,
-    pub monthlyThroughput: f64,
-    pub activeUsers: u64,
-    pub url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sourceCodeUrl: Option<String>,
-    pub isOpenSource: bool,
-}
-
-/// Frontend Coupon structure
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CouponFrontend {
-    pub coupon_id: u64,
-    pub host_id: u64,
-    pub code: String,
-    pub coupon_type: String,
-    pub value: f64,
-    pub title: String,
-    pub item_name: String,
-    pub link: String,
-    pub host_name: String,
-}
 
 /// GET /api/host-node/:pubkey - Get user's host node (storefront)
 pub async fn api_get_host_node(

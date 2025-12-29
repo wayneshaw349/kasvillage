@@ -1,6 +1,6 @@
 # Stage 1: Build
 FROM rust:latest AS builder
-RUN rustup default nightly
+RUN rustup default nightly 
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \

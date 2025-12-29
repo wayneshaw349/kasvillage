@@ -67,10 +67,6 @@ group = "0.13"
 subtle = "2.5"
 neptune = "10.0.0"
 
-# --- Firestore & Redis (NEW - Firestore Integration) ---
-firestore = "0.1"
-redis = { version = "0.23", features = ["aio", "connection-manager"] }
-google-authz = "0.1"
 
 # Explicitly alias rand_core 0.6 for Halo2 compatibility
 rand_core_legacy = { package = "rand_core", version = "0.6.4" }

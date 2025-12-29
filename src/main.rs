@@ -38231,6 +38231,10 @@ pub async fn start_server(config: ApiServerConfig) -> std::io::Result<()> {
     let rate_limiter = Arc::new(RwLock::new(RedisRateLimiter::new(false)));
     let frost = FrostCoordinator::new(FrostConfig::new(2, 3).expect("valid config"));
 
+    let firestore_project_id = std::env::var("FIRESTORE_PROJECT_ID")
+        .unwrap_or_else(|_| "kasvillage-prod".to_string());
+    let firestore_cache = Arc::new(FirestoreCache::new(&firestore_project_id));
+    
     let app_state = web::Data::new(AppState {
         db,
         l1_client,
@@ -38245,6 +38249,7 @@ pub async fn start_server(config: ApiServerConfig) -> std::io::Result<()> {
         storefront_click_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
         onboarding_sessions: Arc::new(std::sync::RwLock::new(HashMap::new())),
         onboarding_scores: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        firestore_cache,
     });
 
     println!("Starting KasVillage L2 API server on {}:{}", config.host, config.port);

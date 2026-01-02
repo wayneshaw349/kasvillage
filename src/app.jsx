@@ -23,7 +23,7 @@ function cn(...inputs) {
 // Akash Network Backend
 const API_BASE = typeof window !== 'undefined' && window.KASVILLAGE_API_URL 
   ? window.KASVILLAGE_API_URL 
-  : 'https://c8uf0cb611f2f298ok6hn9itm4.ingress.d3akash.cloud';
+  : 'http://c8uf0cb611f2f298ok6hn9itm4.ingress.d3akash.cloud';
 
 // CoinGecko API (free, no key needed) for live KAS price
 const COINGECKO_API = 'https://api.coingecko.com/api/v3';
@@ -1019,18 +1019,6 @@ const api = {
         layout_hash: layoutHash,
         stored_at: Date.now()
       };
-    }
-  },
-
-  getStorefrontLayout: async (hostId) => {
-    try {
-      const res = await fetch(`${API_BASE}/api/storefront/${hostId}`);
-      if (!res.ok) return null;
-      const data = await res.json();
-      return { layout: data.layout, merkle_proof: data.merkle_proof };
-    } catch (e) {
-      console.warn('Failed to fetch storefront from API:', e);
-      return null;
     }
   },
   
@@ -4025,17 +4013,8 @@ const HostNodeBuilder = ({ hostNode, userXp, openDApp, openHost }) => {
       if (result.success) {
         setLastSaved(new Date());
         
-        // Save to localStorage for StorefrontViewer to access (local fallback)
+        // Save to localStorage for StorefrontViewer to access
         localStorage.setItem(`storefront_${hostNode.host_id}`, JSON.stringify(layout));
-        
-        // CRITICAL: Also save to hostNodes in GlobalContext for cross-user visibility
-        if (globalContext?.setHostNodes) {
-          globalContext.setHostNodes(prev => prev.map(h => 
-            h.host_id === hostNode.host_id 
-              ? { ...h, storefrontLayout: layout, website: layout.externalUrl || h.website }
-              : h
-          ));
-        }
         
         // --- 4. CREATE DEPLOYMENT NOTIFICATION ---
         const deploymentCoupon = {
@@ -4972,41 +4951,17 @@ const StorefrontSectionPreview = ({ section, theme }) => {
 // STOREFRONT VIEWER (Display Published Storefront from Mailbox)
 // ============================================================================
 function StorefrontViewer({ hostName, hostId, onClose }) {
-  const { hostNodes = [] } = useContext(GlobalContext);
   const [storefront, setStorefront] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // Load storefront layout - priority: GlobalContext > localStorage > API
+    // Load storefront layout from localStorage
     const loadStorefront = async () => {
       try {
-        // 1. First check GlobalContext (synced across users)
-        const hostNode = hostNodes.find(h => h.host_id === hostId);
-        if (hostNode?.storefrontLayout) {
-          setStorefront(hostNode.storefrontLayout);
-          setLoading(false);
-          return;
-        }
-        
-        // 2. Fallback to localStorage (local user only)
         const stored = localStorage.getItem(`storefront_${hostId}`);
         if (stored) {
           const data = JSON.parse(stored);
           setStorefront(data);
-          setLoading(false);
-          return;
-        }
-        
-        // 3. Try fetching from API (backend persistence)
-        try {
-          const apiResult = await api.getStorefrontLayout(hostId);
-          if (apiResult?.layout) {
-            setStorefront(apiResult.layout);
-            // Cache to localStorage for future
-            localStorage.setItem(`storefront_${hostId}`, JSON.stringify(apiResult.layout));
-          }
-        } catch (apiErr) {
-          console.warn('API fetch failed:', apiErr);
         }
       } catch (e) {
         console.error('Failed to load storefront:', e);
@@ -5015,7 +4970,7 @@ function StorefrontViewer({ hostName, hostId, onClose }) {
     };
     
     loadStorefront();
-  }, [hostId, hostNodes]);
+  }, [hostId]);
 
   if (!hostId) return null;
 
@@ -8310,77 +8265,69 @@ const WalletOverview = ({
 
 // ============================================================================
 // MAILBOX / VILLAGE COMPONENT (The "Village" Tab)
-// With Bridge Logic to Storefront Customization, Academic Profile, DApp Creation
 // ============================================================================
-const MailboxTabContent = ({ 
-  openHost, 
-  onOpenDAppMarketplace, 
-  openStorefront, 
-  openAcademic, 
-  openDAppDetail,
-  navigateToBuilder,      // Navigate to builder tab for storefront customization
-  openAcademicCreate,     // Open academic profile creation modal
-  openDAppCreate          // Open DApp creation (QualityGate)
-}) => {
-  const { user, hostNodes = [], dapps = [], coupons = [] } = useContext(GlobalContext);
+const MailboxTabContent = ({ openHost, onOpenDAppMarketplace, openStorefront, openAcademic, openDAppDetail }) => {
+  const { hostNodes = [], dapps = [], coupons = [] } = useContext(GlobalContext);
   
   const [couponSearch, setCouponSearch] = useState("");
   const [academicSearch, setAcademicSearch] = useState("");
   const [dappSearch, setDappSearch] = useState("");
-  const [searchingSection, setSearchingSection] = useState(null);
-  
-  // User's own host/storefront for "Customize" bridge
-  const userHostNode = hostNodes?.find(h => h.owner_apartment === user?.apartment || h.owner_tier === user?.tier);
-  const userHostId = userHostNode?.host_id;
+  const [searchingSection, setSearchingSection] = useState(null); // Track which section is searching
 
-  // Filter Logic for Coupons
+  // Filter Logic for Coupons (from builder)
   const filteredCoupons = coupons.filter(coupon => 
     coupon.item_name?.toLowerCase().includes(couponSearch.toLowerCase()) || 
     coupon.title?.toLowerCase().includes(couponSearch.toLowerCase()) ||
     coupon.code?.toLowerCase().includes(couponSearch.toLowerCase()) ||
-    coupon.description?.toLowerCase().includes(couponSearch.toLowerCase()) ||
-    coupon.host_name?.toLowerCase().includes(couponSearch.toLowerCase())
+    coupon.description?.toLowerCase().includes(couponSearch.toLowerCase())
   ).sort((a, b) => {
+    // Get host XP for both coupons
     const hostA = hostNodes.find(h => h.host_id === a.host_id);
     const hostB = hostNodes.find(h => h.host_id === b.host_id);
     const xpA = hostA?.xp || 0;
     const xpB = hostB?.xp || 0;
+    
+    // 1. PRIMARY: Biggest Kaspa discount (highest first)
     const discountA = (a.discountedKaspa || a.value || 0);
     const discountB = (b.discountedKaspa || b.value || 0);
-    if (discountB !== discountA) return discountB - discountA;
-    if (xpB !== xpA) return xpB - xpA;
-    return (a.dollarPrice || 0) - (b.dollarPrice || 0);
+    if (discountB !== discountA) {
+      return discountB - discountA; // Bigger discount first
+    }
+    
+    // 2. SECONDARY: Highest XP (highest first)
+    if (xpB !== xpA) {
+      return xpB - xpA; // Higher XP first
+    }
+    
+    // 3. TERTIARY: Lowest price (lowest first)
+    const priceA = (a.dollarPrice || 0);
+    const priceB = (b.dollarPrice || 0);
+    return priceA - priceB; // Lower price first
   });
   
-  // Academic services data (mock - replace with API)
-  const [academicProfiles] = useState([
-    { id: 'ap1', title: "L2 Consensus Audit", type: "Auditing", author: "Dr. A. Sharma", cost: 500, apt: "101", flat_rate: true, website: null, owner_apt: "101" },
-    { id: 'ap2', title: "Intro to Kaspa", type: "Tutoring", author: "Prof. K", cost: 50, apt: "304", flat_rate: false, website: "https://example.com/kaspa-course", owner_apt: "304" },
-    { id: 'ap3', title: "Smart Contract Review", type: "Code Review", author: "Dev Mike", cost: 200, apt: "220", flat_rate: true, website: null, owner_apt: "220" }
-  ]);
+  // Mock Academic Data (In prod this comes from API)
+  const academicResults = [
+    { title: "L2 Consensus Audit", type: "Auditing", author: "Dr. A. Sharma", cost: 500, apt: "101", flat_rate: true },
+    { title: "Intro to Kaspa", type: "Tutoring", author: "Prof. K", cost: 50, apt: "304", flat_rate: false }
+  ];
   
-  const filteredAcademicResults = academicProfiles.filter(item => {
-    const query = academicSearch.toLowerCase();
-    return query === "" || 
-           item.title?.toLowerCase().includes(query) || 
-           item.type?.toLowerCase().includes(query) ||
-           item.author?.toLowerCase().includes(query);
+  const filteredAcademicResults = academicResults.filter(item => {
+      const query = academicSearch.toLowerCase();
+      return query === "" || 
+             item.title?.toLowerCase().includes(query) || 
+             item.type?.toLowerCase().includes(query) ||
+             item.author?.toLowerCase().includes(query);
   });
 
   const filteredDApps = dapps.filter(d => {
-    if (d.board === "REJECTED") return false;
-    const query = dappSearch.toLowerCase();
-    return query === "" ||
-           d.name?.toLowerCase().includes(query) ||
-           d.category?.toLowerCase().includes(query) ||
-           d.description?.toLowerCase().includes(query);
+      if (d.board === "REJECTED") return false;
+      const query = dappSearch.toLowerCase();
+      return query === "" ||
+             d.name?.toLowerCase().includes(query) ||
+             d.category?.toLowerCase().includes(query);
   });
 
-  // Check if user owns a profile/dapp
-  const userOwnsAcademicProfile = academicProfiles.some(p => p.owner_apt === String(user?.apartment));
-  const userOwnsDApp = dapps.some(d => d.owner_apt === String(user?.apartment) || d.ownerPubkey === user?.pubkey);
-
-  // Search handlers
+  // Search handlers with loading state
   const handleDAppSearch = () => {
     setSearchingSection("dapps");
     setTimeout(() => setSearchingSection(null), 300);
@@ -8422,26 +8369,6 @@ const MailboxTabContent = ({
             <strong>⚠️ Compliance Notice:</strong> Prohibited content apps are restricted and auto-rejected.
          </div>
 
-         {/* CREATE YOUR DAPP CTA */}
-         {!userOwnsDApp && openDAppCreate && (
-           <motion.div 
-             whileTap={{ scale: 0.98 }}
-             onClick={openDAppCreate}
-             className="p-4 bg-gradient-to-r from-purple-100 to-blue-100 border-2 border-dashed border-purple-300 rounded-xl cursor-pointer hover:shadow-md transition-all"
-           >
-             <div className="flex items-center gap-3">
-               <div className="w-12 h-12 bg-purple-200 rounded-xl flex items-center justify-center">
-                 <Plus className="text-purple-700" size={24} />
-               </div>
-               <div className="flex-1">
-                 <p className="font-bold text-purple-900">Create Your DApp</p>
-                 <p className="text-xs text-purple-700">Publish games, tools, or protocols to the village</p>
-               </div>
-               <ArrowRight className="text-purple-600" size={20} />
-             </div>
-           </motion.div>
-         )}
-
          <div className="flex gap-2">
             <input 
                type="text" 
@@ -8450,9 +8377,7 @@ const MailboxTabContent = ({
                onChange={(e) => setDappSearch(e.target.value)} 
                className="w-full p-3 rounded-xl border border-purple-200 bg-white outline-none focus:ring-2 focus:ring-purple-500 text-sm font-bold" 
             />
-            <button onClick={handleDAppSearch} className="w-12 h-12 p-0 bg-purple-600 rounded-xl hover:bg-purple-500 flex items-center justify-center transition-colors">
-              {searchingSection === "dapps" ? <RefreshCw size={20} className="animate-spin text-white" /> : <Search size={20} className="text-white" />}
-            </button>
+            <button onClick={handleDAppSearch} className="w-12 h-12 p-0 bg-purple-600 rounded-xl hover:bg-purple-500 flex items-center justify-center transition-colors">{searchingSection === "dapps" ? <RefreshCw size={20} className="animate-spin text-white" /> : <Search size={20} className="text-white" />}</button>
          </div>
 
          {dappSearch && (
@@ -8462,6 +8387,11 @@ const MailboxTabContent = ({
                <motion.div 
                   key={dapp.id} 
                   whileTap={{ scale: 0.98 }} 
+                  onClick={() => {
+                    if (openDAppDetail) {
+                      openDAppDetail(dapp);
+                    }
+                  }}
                   className={cn(
                      "p-3 rounded-xl border cursor-pointer transition-all hover:shadow-md",
                      dapp.availableForSwap 
@@ -8479,25 +8409,7 @@ const MailboxTabContent = ({
                      {dapp.availableForSwap && <span className="text-[9px] font-bold text-green-600">SWAP</span>}
                   </div>
                   <div className="font-bold text-sm text-stone-900 truncate">{dapp.name}</div>
-                  <div className="text-[10px] text-stone-500 mb-2">{dapp.category}</div>
-                  
-                  {/* ACTION BUTTONS */}
-                  <div className="flex gap-1">
-                    <button 
-                      onClick={(e) => { e.stopPropagation(); openDAppDetail && openDAppDetail(dapp); }}
-                      className="flex-1 py-1.5 text-[10px] font-bold bg-purple-100 text-purple-700 rounded-lg hover:bg-purple-200 transition"
-                    >
-                      Details
-                    </button>
-                    {dapp.url && (
-                      <button 
-                        onClick={(e) => { e.stopPropagation(); window.open(dapp.url, '_blank'); }}
-                        className="px-2 py-1.5 text-[10px] font-bold bg-blue-100 text-blue-700 rounded-lg hover:bg-blue-200 transition flex items-center gap-1"
-                      >
-                        <ExternalLink size={10} /> Visit
-                      </button>
-                    )}
-                  </div>
+                  <div className="text-[10px] text-stone-500">{dapp.category}</div>
                </motion.div>
                 ))
               ) : (
@@ -8507,43 +8419,12 @@ const MailboxTabContent = ({
          )}
       </div>
 
-      {/* 2. VILLAGE MARKET (STOREFRONTS/COUPONS) */}
+      {/* 2. VILLAGE MARKET (COUPONS) */}
       <div className="px-6 space-y-3 pt-6 border-t-2 border-dashed border-orange-200">
-         <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-               <Store className="text-orange-600" size={20} />
-               <span className="font-black text-lg text-amber-900">Storefront Deals</span>
-            </div>
-            {navigateToBuilder && (
-              <button 
-                onClick={navigateToBuilder}
-                className="text-xs font-bold text-orange-600 hover:text-orange-800 flex items-center gap-1"
-              >
-                My Storefront <Settings size={14}/>
-              </button>
-            )}
+         <div className="flex items-center gap-2">
+            <Store className="text-orange-600" size={20} />
+            <span className="font-black text-lg text-amber-900">Storefront Deals</span>
          </div>
-         
-         {/* CREATE/CUSTOMIZE STOREFRONT CTA */}
-         {navigateToBuilder && (
-           <motion.div 
-             whileTap={{ scale: 0.98 }}
-             onClick={navigateToBuilder}
-             className="p-4 bg-gradient-to-r from-orange-100 to-amber-100 border-2 border-dashed border-orange-300 rounded-xl cursor-pointer hover:shadow-md transition-all"
-           >
-             <div className="flex items-center gap-3">
-               <div className="w-12 h-12 bg-orange-200 rounded-xl flex items-center justify-center">
-                 {userHostNode ? <Edit3 className="text-orange-700" size={24} /> : <Plus className="text-orange-700" size={24} />}
-               </div>
-               <div className="flex-1">
-                 <p className="font-bold text-orange-900">{userHostNode ? 'Customize Your Storefront' : 'Create Your Storefront'}</p>
-                 <p className="text-xs text-orange-700">{userHostNode ? 'Edit layout, branding, and deals' : 'Set up shop and publish deals'}</p>
-               </div>
-               <ArrowRight className="text-orange-600" size={20} />
-             </div>
-           </motion.div>
-         )}
-
          <div className="flex gap-2">
             <input 
                type="text" 
@@ -8552,9 +8433,7 @@ const MailboxTabContent = ({
                onChange={(e) => setCouponSearch(e.target.value)} 
                className="w-full p-3 rounded-xl border border-orange-200 bg-white outline-none focus:ring-2 focus:ring-orange-500 text-sm font-bold" 
             />
-            <button onClick={handleCouponSearch} className="w-12 h-12 p-0 bg-orange-600 rounded-xl hover:bg-orange-500 flex items-center justify-center transition-colors">
-              {searchingSection === "coupons" ? <RefreshCw size={20} className="animate-spin text-white" /> : <Search size={20} className="text-white" />}
-            </button>
+            <button onClick={handleCouponSearch} className="w-12 h-12 p-0 bg-orange-600 rounded-xl hover:bg-orange-500 flex items-center justify-center transition-colors">{searchingSection === "coupons" ? <RefreshCw size={20} className="animate-spin text-white" /> : <Search size={20} className="text-white" />}</button>
          </div>
 
          <div className="space-y-3">
@@ -8564,54 +8443,32 @@ const MailboxTabContent = ({
                   filteredCoupons.map((coupon, idx) => { 
                       const hostData = hostNodes.find(s => s.host_id === coupon.host_id); 
                       const hostName = coupon.host_name || hostData?.name || "Unnamed Store";
-                      const isOwnStorefront = coupon.host_id === userHostId;
-                      const storefrontWebsite = hostData?.website || hostData?.externalUrl;
-                      
                       return (
                         <motion.div key={idx} whileTap={{ scale: 0.99 }} className="flex bg-white border border-yellow-300 rounded-xl p-4 relative shadow-sm">
                           <div className="flex-1">
-                            <div className="text-xs text-amber-700 uppercase tracking-wide flex items-center gap-2">
-                              {hostName}
-                              {isOwnStorefront && <span className="text-[8px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded">YOUR STORE</span>}
-                            </div>
+                            <div className="text-xs text-amber-700 uppercase tracking-wide">{hostName}</div>
                             <div className="font-bold text-lg text-red-800">{coupon.description || coupon.title}</div>
                             <div className="text-[10px] text-stone-500 mt-1">Code: {coupon.code}</div>
                           </div>
-                          <div className="w-28 flex flex-col items-end justify-center gap-1">
-                            {/* PRIMARY: Visit Storefront or Customize */}
-                            {isOwnStorefront ? (
-                              <Button 
-                                variant="secondary" 
-                                className="h-8 px-3 text-xs bg-green-100 text-green-700 hover:bg-green-200" 
-                                onClick={() => navigateToBuilder && navigateToBuilder()}
-                              >
-                                <Settings size={12} className="mr-1" /> Customize
-                              </Button>
-                            ) : (
-                              <Button 
-                                variant="secondary" 
-                                className="h-8 px-3 text-xs" 
-                                onClick={() => {
-                                  if (openStorefront) {
-                                    openStorefront({ hostId: coupon.host_id, hostName: coupon.host_name });
-                                  } else {
-                                    openHost(hostData || { host_id: coupon.host_id, name: hostName });
-                                  }
-                                }}
-                              >
-                                View Store
-                              </Button>
-                            )}
-                            
-                            {/* SECONDARY: External Website Link */}
-                            {storefrontWebsite && !isOwnStorefront && (
-                              <button 
-                                onClick={() => window.open(storefrontWebsite, '_blank')}
-                                className="h-7 px-2 text-[10px] font-bold bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 flex items-center gap-1"
-                              >
-                                <ExternalLink size={10} /> Website
-                              </button>
-                            )}
+                          <div className="w-24 flex items-center justify-center">
+                            <Button 
+                              variant="secondary" 
+                              className="h-8 px-2 text-xs" 
+                              onClick={() => {
+                                // Open storefront viewer modal
+                                if (openStorefront) {
+                                  openStorefront({
+                                    hostId: coupon.host_id,
+                                    hostName: coupon.host_name
+                                  });
+                                } else {
+                                  // Fallback to openHost if openStorefront not provided
+                                  openHost(hostData || { host_id: coupon.host_id, name: hostName });
+                                }
+                              }}
+                            >
+                              Visit
+                            </Button>
                           </div>
                         </motion.div>
                       );
@@ -8624,42 +8481,12 @@ const MailboxTabContent = ({
          </div>
       </div>
       
-      {/* 3. ACADEMIC / SCHOOL SERVICES */}
+      {/* 3. ACADEMIC / SCHOOL */}
       <div className="px-6 space-y-3 pt-6 border-t-2 border-dashed border-indigo-200">
-         <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-               <FileText className="text-indigo-600" size={20} />
-               <span className="font-black text-lg text-indigo-900">School & Services</span>
-            </div>
-            {openAcademicCreate && (
-              <button 
-                onClick={openAcademicCreate}
-                className="text-xs font-bold text-indigo-600 hover:text-indigo-800 flex items-center gap-1"
-              >
-                My Profile <User size={14}/>
-              </button>
-            )}
+         <div className="flex items-center gap-2">
+            <FileText className="text-indigo-600" size={20} />
+            <span className="font-black text-lg text-indigo-900">School & Services</span>
          </div>
-         
-         {/* CREATE ACADEMIC PROFILE CTA */}
-         {!userOwnsAcademicProfile && openAcademicCreate && (
-           <motion.div 
-             whileTap={{ scale: 0.98 }}
-             onClick={openAcademicCreate}
-             className="p-4 bg-gradient-to-r from-indigo-100 to-purple-100 border-2 border-dashed border-indigo-300 rounded-xl cursor-pointer hover:shadow-md transition-all"
-           >
-             <div className="flex items-center gap-3">
-               <div className="w-12 h-12 bg-indigo-200 rounded-xl flex items-center justify-center">
-                 <Plus className="text-indigo-700" size={24} />
-               </div>
-               <div className="flex-1">
-                 <p className="font-bold text-indigo-900">Create Academic Profile</p>
-                 <p className="text-xs text-indigo-700">Offer tutoring, auditing, or research services</p>
-               </div>
-               <ArrowRight className="text-indigo-600" size={20} />
-             </div>
-           </motion.div>
-         )}
          
          <div className="flex gap-2">
             <input 
@@ -8669,62 +8496,39 @@ const MailboxTabContent = ({
                onChange={(e) => setAcademicSearch(e.target.value)} 
                className="w-full p-3 rounded-xl border border-indigo-200 bg-white outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-bold" 
             />
-            <button onClick={handleAcademicSearch} className="w-12 h-12 p-0 bg-indigo-600 rounded-xl hover:bg-indigo-500 flex items-center justify-center transition-colors">
-              {searchingSection === "academic" ? <RefreshCw size={20} className="animate-spin text-white" /> : <Search size={20} className="text-white" />}
-            </button>
+            <button onClick={handleAcademicSearch} className="w-12 h-12 p-0 bg-indigo-600 rounded-xl hover:bg-indigo-500 flex items-center justify-center transition-colors">{searchingSection === "academic" ? <RefreshCw size={20} className="animate-spin text-white" /> : <Search size={20} className="text-white" />}</button>
          </div>
 
          {academicSearch && (
            <div className="space-y-3">
                {filteredAcademicResults.length > 0 ? (
-                 filteredAcademicResults.map((item, index) => {
-                    const isOwnProfile = item.owner_apt === String(user?.apartment);
-                    
-                    return (
-                      <motion.div key={index} className="flex bg-white border border-indigo-300 rounded-xl p-4 relative shadow-sm items-center">
-                         <div className="flex-1">
-                            <div className="text-xs text-indigo-700 uppercase tracking-wide flex items-center gap-2">
-                                {item.type} | Apt {item.apt}
-                                {isOwnProfile && <span className="text-[8px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded">YOUR PROFILE</span>}
-                            </div>
-                            <div className="font-bold text-lg text-amber-900">{item.title}</div>
-                            <div className="text-xs text-stone-500 mt-1">Author: {item.author}</div>
-                         </div>
-                         <div className="w-32 text-right space-y-1">
-                            <span className={cn("font-bold text-sm block", item.cost === 0 ? "text-green-700" : "text-red-800")}>
-                                {item.cost} KAS
-                            </span>
-                            
-                            {isOwnProfile ? (
-                              <Button 
-                                variant="outline" 
-                                className="h-8 py-1 text-xs bg-green-50 text-green-700 w-full"
-                                onClick={() => openAcademicCreate && openAcademicCreate()}
-                              >
-                                <Edit3 size={12} className="mr-1" /> Edit
-                              </Button>
-                            ) : (
-                              <Button 
-                                variant="outline" 
-                                className="h-8 py-1 text-xs bg-indigo-50 text-indigo-800 w-full"
-                                onClick={() => openAcademic && openAcademic(item)}
-                              >
-                                Contact
-                              </Button>
-                            )}
-                            
-                            {item.website && !isOwnProfile && (
-                              <button 
-                                onClick={() => window.open(item.website, '_blank')}
-                                className="h-6 w-full text-[10px] font-bold bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 flex items-center justify-center gap-1"
-                              >
-                                <ExternalLink size={10} /> Course Site
-                              </button>
-                            )}
-                         </div>
-                      </motion.div>
-                    );
-                 })
+                 filteredAcademicResults.map((item, index) => (
+                    <motion.div key={index} className="flex bg-white border border-indigo-300 rounded-xl p-4 relative shadow-sm items-center">
+                       <div className="flex-1">
+                          <div className="text-xs text-indigo-700 uppercase tracking-wide">
+                              {item.type} | Apt {item.apt}
+                          </div>
+                          <div className="font-bold text-lg text-amber-900">{item.title}</div>
+                          <div className="text-xs text-stone-500 mt-1">Author: {item.author}</div>
+                       </div>
+                       <div className="w-28 text-right">
+                          <span className={cn("font-bold text-sm block", item.cost === 0 ? "text-green-700" : "text-red-800")}>
+                              {item.cost} KAS
+                          </span>
+                          <Button 
+                            variant="outline" 
+                            className="h-8 py-1 text-xs mt-1 bg-indigo-50 text-indigo-800"
+                            onClick={() => {
+                              if (openAcademic) {
+                                openAcademic(item);
+                              }
+                            }}
+                          >
+                            Contact
+                          </Button>
+                       </div>
+                    </motion.div>
+                 ))
                ) : (
                  <p className="text-center text-indigo-600 italic text-sm py-4">No services found for "{academicSearch}"</p>
                )}
@@ -8927,18 +8731,7 @@ const Dashboard = () => {
             />
           )}
 
-          {activeTab === "mailbox" && (
-            <MailboxTabContent 
-              openHost={setActiveHost} 
-              onOpenDAppMarketplace={() => setShowDAppMarketplace(true)} 
-              openStorefront={setActiveStorefront} 
-              openAcademic={setActiveAcademic} 
-              openDAppDetail={setActiveDAppDetail}
-              navigateToBuilder={() => setActiveTab("builder")}
-              openAcademicCreate={() => setActiveDApp('academics')}
-              openDAppCreate={() => setShowQualityGate(true)}
-            />
-          )}
+          {activeTab === "mailbox" && <MailboxTabContent openHost={setActiveHost} onOpenDAppMarketplace={() => setShowDAppMarketplace(true)} openStorefront={setActiveStorefront} openAcademic={setActiveAcademic} openDAppDetail={setActiveDAppDetail} />}
           {activeTab === "builder" && <HostNodeBuilder hostNode={userHostNode} userXp={user.xp} openDApp={setActiveDApp} openHost={setActiveHost} />}
 
           {activeTab === "trade" && (

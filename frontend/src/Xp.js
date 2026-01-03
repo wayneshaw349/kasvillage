@@ -1,5 +1,5 @@
 /**
- * XP Reputation System
+ * XP Reputation System 
  * 
  * Frontend module that fetches XP proofs from kasvillage45 backend.
  * Poseidon hashing is done server-side (Rust) for trustless verification.

@@ -1,7 +1,7 @@
 # =======================================
 # Stage 1: Build the React App (Vite)
 # =======================================
-FROM node:18-alpine as builder
+FROM node:18-alpine as builder 
 
 WORKDIR /app
 

@@ -4,7 +4,7 @@
  */
 
 let secp = null;
-let sha256 = null;
+let sha256 = null; 
 
 // Lazy load noble libraries
 export async function initCrypto() {

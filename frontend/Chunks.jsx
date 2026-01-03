@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, lazy, Suspense } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { 
-  Wallet, Shield, ShieldCheck, AlertTriangle, User, Lock, Activity,
+  Wallet, Shield, ShieldCheck, AlertTriangle, User, Lock, Activity, 
   CheckCircle, ArrowRight, Clock, RefreshCw, X, Zap, TrendingUp,
   Users, Ban, Award, Star, AlertOctagon, Search, UserCheck, Eye
 } from 'lucide-react';

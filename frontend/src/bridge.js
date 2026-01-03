@@ -3,7 +3,7 @@
  * Handles 2-of-2 signing requests and balance sync
  */
 
-const pendingRequests = new Map();
+const pendingRequests = new Map(); 
 let requestId = 0;
 
 // L2 API endpoint

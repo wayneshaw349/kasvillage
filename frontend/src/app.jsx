@@ -2,7 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useRef } from "r
 import { motion, AnimatePresence } from "framer-motion";
 import { 
   Search, Wallet, QrCode, X, Zap, 
-  ShieldCheck, AlertTriangle, User, Lock, Activity,
+  ShieldCheck, AlertTriangle, User, Lock, Activity, 
   Store, Mail, Link, MapPin, CloudSun, CloudDrizzle, Sun, 
   Settings, Users, ShoppingBag, CheckCircle, ArrowRight, Code, Clock, Globe, ScanFace, Smartphone, FileText, Scale, HeartHandshake, ExternalLink,
   Server, Layout, Save, PlayCircle, Eye, EyeOff, CheckCircle2,

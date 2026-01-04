@@ -1167,7 +1167,9 @@ const KAS_TO_USD = (kas) => (kas * KAS_USD_RATE).toFixed(2);
 const AKASH_DONATION_TARGET_AKT = 20; 
 const CURRENT_DONATION_AKT = 15; 
 const FLUX_DONATION_TARGET = 50;
-const CURRENT_DONATION_FLUX = 12; 
+const CURRENT_DONATION_FLUX = 12;
+const AIRWEAVE_DONATION_TARGET = 100;
+const CURRENT_DONATION_AIRWEAVE = 0; 
 
 // --- STOREFRONT BUILDER SCHEMA ---
 
@@ -6214,7 +6216,8 @@ const MonthlyFeeCard = () => {
 
     const donationTargets = [
         { name: "Akash (Back-End Compute)", target: AKASH_DONATION_TARGET_AKT, current: CURRENT_DONATION_AKT, unit: "AKT", link: "https://akash.network/" },
-        { name: "Flux (Frontend CDN)", target: FLUX_DONATION_TARGET, current: CURRENT_DONATION_FLUX, unit: "FLUX", link: "https://runonflux.io/" },
+        { name: "Flux (Kaspa L1 Flux node rental UI)", target: FLUX_DONATION_TARGET, current: CURRENT_DONATION_FLUX, unit: "FLUX", link: "https://wallet.airweave.ch/" },
+        { name: "Airweave (Kaspa L1 history indexing)", target: AIRWEAVE_DONATION_TARGET, current: CURRENT_DONATION_AIRWEAVE, unit: "AWV", link: "https://wallet.airweave.ch/" },
     ];
 
     return (
@@ -6269,7 +6272,7 @@ const MonthlyFeeCard = () => {
                                  </div>
                                  <div className="w-full bg-amber-200 h-2 rounded-full overflow-hidden">
                                     <motion.div 
-                                       className={cn("h-full", target.unit === 'AKT' ? 'bg-blue-600' : target.unit === 'FLUX' ? 'bg-purple-600' : 'bg-orange-600')} 
+                                       className={cn("h-full", target.unit === 'AKT' ? 'bg-blue-600' : target.unit === 'FLUX' ? 'bg-purple-600' : target.unit === 'AWV' ? 'bg-cyan-600' : 'bg-orange-600')} 
                                        style={{ width: `${getProgress(target.current, target.target)}%` }}
                                        initial={{ width: 0 }}
                                        animate={{ width: `${getProgress(target.current, target.target)}%` }}
@@ -6277,7 +6280,7 @@ const MonthlyFeeCard = () => {
                                     />
                                  </div>
                                  <div className="mt-2 flex items-center justify-center text-xs text-blue-700 font-bold gap-1">
-                                    Get {target.unit} on {target.unit === 'AKT' ? 'Akash' : 'Flux'} <Link size={12}/>
+                                    Get {target.unit} on {target.unit === 'AKT' ? 'Akash' : target.unit === 'FLUX' ? 'Flux' : target.unit === 'AWV' ? 'Airweave' : 'Platform'} <Link size={12}/>
                                  </div>
                              </div>
                          </a>

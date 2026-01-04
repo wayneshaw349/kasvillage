@@ -80,7 +80,7 @@ use neptune::poseidon::PoseidonConstants;
 use neptune::Poseidon;
 use num_bigint::BigUint;
 use blake2::{Blake2b512, Digest as Blake2Digest};
-use sha2::{Sha256, Digest as Sha2Digest};
+use sha2::Sha256;
 use generic_array::typenum;
 use std::collections::HashMap;
 use pasta_curves::pallas::{Affine as PallasAffine, Point as PallasPoint, Base as Fq, Scalar as Fr};
@@ -121,7 +121,7 @@ use pasta_curves::EqAffine;
 // which is compatible with halo2, k256, and other crypto crates
 use rand::rngs::OsRng;
 use rand::RngCore;
-use rand::CryptoRng;
+use num_traits::One;
 use base64::Engine;
 use hex;
 use serde_json;
@@ -132,8 +132,8 @@ use serde_json::json;
 // ============================================================================
 // Note: Using custom FirestoreDb implementation (REST API) defined below,
 // not the firestore crate's version which requires async initialization
-use redis::{Commands, Connection};
-use chrono::{DateTime, Utc};
+use redis::Commands;
+use chrono::Utc;
 use tokio::sync::{RwLock, mpsc, broadcast};
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::{
@@ -153,7 +153,6 @@ use serde_big_array::BigArray;
 // ============================================================================
 use frost_secp256k1::{
     keys::dkg,
-    round2::SignatureShare as FrostSignatureShare,
     Identifier,
 };
 
@@ -24408,7 +24407,7 @@ async fn compliance_check_v2_handler(
 
 async fn sanction_screen_handler(
     network: web::Data<Arc<SanctionNetwork>>,
-    _pubkey: web::Path<String>,
+    pubkey: web::Path<String>,
 ) -> impl actix_web::Responder {
     let result = network.screen_pubkey(&pubkey).await;
     HttpResponse::Ok().json(result)
@@ -30110,7 +30109,6 @@ impl FrostSecretShare {
     /// Verify secret share against commitment vector
     /// Check: g^{s_i} == ∏_j (g^{a_j})^{i^j} = ∏_j C_j^{i^j}
     pub fn verify_share(&self) -> Result<(), String> {
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
         use k256::ProjectivePoint;
         
         // g^{s_i} - compute public key from secret share
@@ -32638,7 +32636,7 @@ async fn query_storefront(_pubkey: &str) -> Result<Option<serde_json::Value>, St
 // ============================================================================
 
 pub async fn api_get_host_node_firestore(
-    _pubkey: web::Path<String>,
+    pubkey: web::Path<String>,
     _state: web::Data<AppState>,
 ) -> impl Responder {
     match query_host_node(&pubkey).await {
@@ -32676,7 +32674,7 @@ pub async fn api_get_coupons_firestore(
 }
 
 pub async fn api_get_storefront_firestore(
-    _pubkey: web::Path<String>,
+    pubkey: web::Path<String>,
     _state: web::Data<AppState>,
 ) -> impl Responder {
     match query_storefront(&pubkey).await {
@@ -38653,7 +38651,6 @@ fn compute_lagrange_coefficient(
     signers: &[ParticipantId],
 ) -> [u8; 32] {
     use k256::Scalar as K256Scalar;
-    use ff::Field;
     
     // Validate input
     if !signers.contains(&identifier) {
@@ -42010,7 +42007,7 @@ pub struct LegitimacyVerificationCircuit {
 
 impl LegitimacyVerificationCircuit {
     fn percent_to_field(percent: u32) -> Fr {
-        let _one = Fr::one();
+        let one = Fr::one();
         let hundred = Fr::from(100);
         let tolerance = Fr::from(percent as u64);
         tolerance * hundred.invert().unwrap_or(Fr::one())
@@ -42109,7 +42106,7 @@ impl Circuit<Fr> for LegitimacyVerificationCircuit {
                     || Value::known(t_field),
                 )?;
 
-                let _one = Fr::one();
+                let one = Fr::one();
                 let tolerance_factor = Self::percent_to_field(self.reference.tolerance_percent);
                 let min_factor = one - tolerance_factor;
                 let max_factor = one + tolerance_factor;
@@ -45182,11 +45179,11 @@ pub async fn api_create_consignment(
 
 /// API endpoint: Get locked funds for seller
 pub async fn api_get_locked_funds(
-    seller__pubkey: web::Path<String>,
+    seller_pubkey: web::Path<String>,
 ) -> impl Responder {
     // In production, query database
     HttpResponse::Ok().json(json!({
-        "seller_pubkey": seller_pubkey.as_str(),
+        "seller_pubkey": seller_pubkey.into_inner(),
         "locked_funds": [],
         "total_locked_sompi": 0,
         "available_balance_sompi": 0,
@@ -46175,7 +46172,7 @@ pub struct BayesianStatsResponse {
 /// GET /api/user/stats/{pubkey} - Get user transaction & XP stats
 pub async fn api_user_stats(
     state: web::Data<FrontendAppState>,
-    _pubkey: web::Path<String>,
+    pubkey: web::Path<String>,
 ) -> impl Responder {
     let pubkey_str = pubkey.into_inner();
     
@@ -46287,7 +46284,7 @@ pub async fn api_completion_stats(
 /// GET /api/stats/bayesian/{pubkey} - Get Bayesian probability report for user
 pub async fn api_bayesian_stats(
     state: web::Data<FrontendAppState>,
-    _pubkey: web::Path<String>,
+    pubkey: web::Path<String>,
 ) -> impl Responder {
     let pubkey_str = pubkey.into_inner();
     
@@ -48488,7 +48485,7 @@ pub async fn api_sanctions_status(
 
 /// GET /api/host-node/:pubkey - Get user's host node (storefront)
 pub async fn api_get_host_node(
-    _pubkey: web::Path<String>,
+    pubkey: web::Path<String>,
     _state: web::Data<AppState>,
 ) -> impl Responder {
     // TODO: Implement database query
@@ -48568,7 +48565,7 @@ pub async fn api_get_coupons(
 
 /// GET /api/storefront/:pubkey - Get saved storefront layout
 pub async fn api_get_storefront(
-    _pubkey: web::Path<String>,
+    pubkey: web::Path<String>,
     _state: web::Data<AppState>,
 ) -> impl Responder {
     // TODO: Implement database query
@@ -49352,7 +49349,7 @@ pub async fn api_register_with_identity(
 
 /// Get avatar questions for re-verification
 pub async fn api_get_avatar_questions(
-    _pubkey: web::Path<String>,
+    pubkey: web::Path<String>,
     identity_tree: web::Data<std::sync::RwLock<IdentityMerkleTree>>,
 ) -> HttpResponse {
     match identity_tree.read() {

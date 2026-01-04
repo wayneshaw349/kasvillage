@@ -20,4 +20,7 @@ jobs:
           context: ./backend
           file: ./backend/Dockerfile
           push: true
-          tags: wayneshaw349/kasvillage-backend:v1,wayneshaw349/kasvillage-backend:latest
+          tags: |
+            wayneshaw349/kasvillage-backend:v2
+            wayneshaw349/kasvillage-backend:latest
+            wayneshaw349/kasvillage-backend:${{ github.sha }}

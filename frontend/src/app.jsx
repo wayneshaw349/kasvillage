@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { 
-  Search, Wallet, QrCode, X, Zap,  
+  Search, Wallet, QrCode, X, Zap, 
   ShieldCheck, AlertTriangle, User, Lock, Activity,
   Store, Mail, Link, MapPin, CloudSun, CloudDrizzle, Sun, 
   Settings, Users, ShoppingBag, CheckCircle, ArrowRight, Code, Clock, Globe, ScanFace, Smartphone, FileText, Scale, HeartHandshake, ExternalLink,
@@ -23,7 +23,7 @@ function cn(...inputs) {
 // Akash Network Backend
 const API_BASE = typeof window !== 'undefined' && window.KASVILLAGE_API_URL 
   ? window.KASVILLAGE_API_URL 
-  : 'https://pjslqjp0h5b7b168ug7bk2cbrg.ingress.d3akash.cloud';
+  : 'https://2gh81bjhh9df501kr92694nrbg.ingress.d3akash.cloud';
 
 // CoinGecko API (free, no key needed) for live KAS price
 const COINGECKO_API = 'https://api.coingecko.com/api/v3';
@@ -2098,7 +2098,7 @@ const createAvatarPersonalQuestions = (avatar) => {
 };
 // --- HUMAN VERIFICATION SCREEN ---
 const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedAvatarName = '' }) => {
-  const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
+  const [step, setStep] = useState(isReturningUser ? 'questions' : 'avatar');
   const [session, setSession] = useState(null);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [score, setScore] = useState(0);
@@ -2109,8 +2109,8 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
   const [questionStartTime, setQuestionStartTime] = useState(Date.now());
   const scoreRef = useRef(0);
   
-  const totalQuestions = isReturningUser ? 2 : 5;
-  const passThreshold = isReturningUser ? 1 : 3;
+  const totalQuestions = isReturningUser ? 2 : 8;
+  const passThreshold = isReturningUser ? 2 : 6;
   
   const [avatarPersonalQuestions, setAvatarPersonalQuestions] = useState([]);
   const [avatarPersonalAnswers, setAvatarPersonalAnswers] = useState({});
@@ -2160,8 +2160,6 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
   const [storyStartTime, setStoryStartTime] = useState(null);
   const [storyWriteTime, setStoryWriteTime] = useState(0);
   const [verifyQuestion, setVerifyQuestion] = useState(null);
-  const [sanctionStatus, setSanctionStatus] = useState('idle');
-  const [pendingResult, setPendingResult] = useState(null);
 
   const trackAvatarSelection = (field, value) => {
     const now = Date.now();
@@ -2588,13 +2586,21 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
     console.log('Did pass:', didPass);
     
     setPassed(didPass);
+    setStep('complete');
     
     if (didPass) {
       if (isReturningUser) {
         localStorage.setItem('kv_verified', 'true');
         localStorage.setItem('kv_verified_at', Date.now().toString());
-        setPendingResult({ isReturningUser: true, score: scoreRef.current });
-        setStep('wallet-check');
+        
+        console.log('Returning user - calling onComplete in 1.5s');
+        setTimeout(() => {
+          console.log('Calling onComplete for returning user');
+          onComplete({ 
+            isReturningUser: true,
+            score: scoreRef.current
+          });
+        }, 1500);
       } else {
         try {
           console.log('Generating identity hash...');
@@ -2608,37 +2614,31 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
           localStorage.setItem('kv_avatar_data', JSON.stringify(avatar));
           localStorage.setItem('kv_story_time', storyWriteTime.toString());
           
-          setPendingResult({ 
-            identityHash, 
-            avatar: { ...avatar, story },
-            score: scoreRef.current,
-            storyWriteTime
-          });
-          setStep('wallet-check');
+          console.log('New user - calling onComplete in 2s');
+          setTimeout(() => {
+            console.log('Calling onComplete for new user');
+            onComplete({ 
+              identityHash, 
+              avatar: { ...avatar, story },
+              score: scoreRef.current,
+              storyWriteTime
+            });
+          }, 2000);
         } catch (err) {
           console.error('Error generating identity hash:', err);
-          setPendingResult({ avatar: { ...avatar, story }, score: scoreRef.current });
-          setStep('wallet-check');
+          setTimeout(() => onComplete({ 
+            avatar: { ...avatar, story },
+            score: scoreRef.current
+          }), 2000);
         }
       }
     } else {
-      setStep('complete');
       console.log('Failed - calling onFail in 2s');
       setTimeout(() => onFail({ 
         reason: !notABot ? 'bot_detected' : 'low_score',
         score: scoreRef.current
       }), 2000);
     }
-  };
-
-  const runSanctionCheck = () => {
-    setSanctionStatus('scanning');
-    setTimeout(() => {
-      setSanctionStatus('cleared');
-      setTimeout(() => {
-        if (pendingResult) onComplete(pendingResult);
-      }, 1500);
-    }, 2500);
   };
 
   if (isLoading) {
@@ -2649,53 +2649,6 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
           <p className="text-xl font-bold">{isReturningUser ? 'Welcome Back!' : 'Entering the Village...'}</p>
           <p className="text-sm text-stone-400 mt-2">{isReturningUser ? 'Quick verification' : 'Preparing your apartment application'}</p>
         </div>
-      </div>
-    );
-  }
-
-  // Step 0: Welcome Screen (NEW USERS ONLY)
-  if (step === 'welcome') {
-    return (
-      <div className="fixed inset-0 bg-stone-900 flex items-center justify-center z-50 p-6">
-        <motion.div 
-          initial={{ scale: 0.9, opacity: 0 }} 
-          animate={{ scale: 1, opacity: 1 }} 
-          className="w-full max-w-md bg-white rounded-[2.5rem] p-8 shadow-2xl text-center"
-        >
-          <div className="w-20 h-20 bg-amber-500 rounded-full flex items-center justify-center mx-auto mb-6 shadow-xl">
-            <MapPin className="text-white" size={40} />
-          </div>
-          <h1 className="text-3xl font-black text-black mb-2">Welcome to KasVillage</h1>
-          <p className="text-stone-500 text-sm mb-6">Layer 2 Privacy Protocol on Kaspa</p>
-          
-          <div className="bg-stone-50 rounded-2xl p-6 text-left mb-6 border-2 border-stone-100">
-            <h3 className="font-black text-black text-sm mb-3 uppercase tracking-wide">Apartment Application</h3>
-            <ul className="space-y-2 text-sm text-stone-600">
-              <li className="flex items-start gap-2">
-                <CheckCircle2 size={16} className="text-green-500 mt-0.5 flex-shrink-0" />
-                <span>Create your avatar identity</span>
-              </li>
-              <li className="flex items-start gap-2">
-                <CheckCircle2 size={16} className="text-green-500 mt-0.5 flex-shrink-0" />
-                <span>Answer a few verification questions</span>
-              </li>
-              <li className="flex items-start gap-2">
-                <CheckCircle2 size={16} className="text-green-500 mt-0.5 flex-shrink-0" />
-                <span>Complete sanctions check</span>
-              </li>
-            </ul>
-            <p className="text-xs text-stone-400 mt-4 italic">
-              💡 You don't need to fill in all identity fields — just enough to form a unique identity.
-            </p>
-          </div>
-          
-          <button 
-            onClick={() => setStep('avatar')}
-            className="w-full bg-stone-900 text-white h-14 rounded-2xl font-bold shadow-xl hover:bg-stone-800 transition-all flex items-center justify-center gap-2"
-          >
-            Begin Application <ArrowRight size={20} />
-          </button>
-        </motion.div>
       </div>
     );
   }
@@ -3302,89 +3255,7 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
     );
   }
 
-  // Step 5: Wallet Check (Sanction Screening)
-  if (step === 'wallet-check') {
-    return (
-      <div className="fixed inset-0 bg-stone-900 flex items-center justify-center z-50 p-6">
-        <motion.div 
-          initial={{ scale: 0.9, opacity: 0 }} 
-          animate={{ scale: 1, opacity: 1 }} 
-          className="w-full max-w-md bg-white rounded-[2.5rem] p-8 shadow-2xl"
-        >
-          <div className="text-center space-y-2 mb-6">
-            <div className="w-20 h-20 bg-stone-900 rounded-full flex items-center justify-center mx-auto mb-4 shadow-xl border-4 border-white">
-              {sanctionStatus === 'cleared' ? (
-                <CheckCircle2 className="text-green-400" size={40} />
-              ) : (
-                <ShieldCheck className="text-white" size={40} />
-              )}
-            </div>
-            <h2 className="text-2xl font-black text-black">Sanction Check</h2>
-            <p className="text-[10px] text-stone-500 font-black uppercase tracking-[0.2em]">Layer 1 Ledger Sync</p>
-          </div>
-
-          <div className="bg-stone-50 rounded-3xl p-6 border-2 border-stone-100 space-y-4 mb-6">
-            <div className="flex justify-between items-center text-black font-black text-xs uppercase">
-              <span>Kaspa Node Relay</span>
-              <span className={sanctionStatus === 'cleared' ? "text-green-600" : "text-stone-400"}>
-                {sanctionStatus === 'cleared' ? "Cleared" : sanctionStatus === 'scanning' ? "Scanning..." : "Ready"}
-              </span>
-            </div>
-
-            {sanctionStatus === 'scanning' ? (
-              <div className="space-y-3">
-                <div className="h-2 w-full bg-stone-200 rounded-full overflow-hidden">
-                  <motion.div
-                    initial={{ width: 0 }}
-                    animate={{ width: "100%" }}
-                    transition={{ duration: 2.5 }}
-                    className="h-full bg-stone-900"
-                  />
-                </div>
-                <div className="flex gap-2 items-center text-[10px] font-black text-black animate-pulse">
-                  <Search size={12} /> SCANNING GLOBAL SANCTION LISTS
-                </div>
-              </div>
-            ) : sanctionStatus === 'cleared' ? (
-              <div className="p-3 bg-green-50 border-2 border-green-200 rounded-xl flex items-center gap-3">
-                <Zap className="text-green-600" size={16} />
-                <span className="text-xs font-black text-green-700 uppercase">Verification Passed • Signature Valid</span>
-              </div>
-            ) : (
-              <div className="text-[10px] text-stone-400 font-black uppercase leading-relaxed text-center">
-                Connecting to L1 ledger to confirm wallet compliance and signature integrity.
-              </div>
-            )}
-          </div>
-
-          {sanctionStatus === 'idle' && (
-            <button 
-              onClick={runSanctionCheck} 
-              className="w-full bg-stone-900 text-white h-16 flex items-center justify-center gap-3 rounded-2xl font-bold shadow-xl hover:bg-stone-800 transition-all"
-            >
-              <Wallet size={20} /> Sign L1 Payload
-            </button>
-          )}
-
-          {sanctionStatus === 'cleared' && (
-            <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
-              <button 
-                onClick={() => pendingResult && onComplete(pendingResult)}
-                className="w-full bg-green-600 hover:bg-green-700 text-white h-16 flex items-center justify-center gap-3 rounded-2xl font-bold shadow-xl transition-all"
-              >
-                Enter Village <ArrowRight size={20} />
-              </button>
-              <p className="text-center text-[10px] text-stone-400 mt-3">
-                Click to proceed if not redirected automatically.
-              </p>
-            </motion.div>
-          )}
-        </motion.div>
-      </div>
-    );
-  }
-
-  // Step 6: Complete (only for failures now)
+  // Step 5: Complete
   if (step === 'complete') {
     return (
       <div className="fixed inset-0 bg-stone-900 flex items-center justify-center z-50">
@@ -6343,7 +6214,7 @@ const MonthlyFeeCard = () => {
 
     const donationTargets = [
         { name: "Akash (Back-End Compute)", target: AKASH_DONATION_TARGET_AKT, current: CURRENT_DONATION_AKT, unit: "AKT", link: "https://akash.network/" },
-        { name: "Flux (Kaspa Node)", target: FLUX_DONATION_TARGET, current: CURRENT_DONATION_FLUX, unit: "FLUX", link: "https://runonflux.io/" },
+        { name: "Flux (Frontend CDN)", target: FLUX_DONATION_TARGET, current: CURRENT_DONATION_FLUX, unit: "FLUX", link: "https://runonflux.io/" },
     ];
 
     return (
@@ -8819,8 +8690,9 @@ const Dashboard = () => {
   };
 
   if (geoBlocked) return <GeoBlockScreen countryCode={userCountry} />;
-  if (showHumanVerification || !isAuthenticated) return <OnboardingScreen onComplete={handleHumanVerified} onFail={handleHumanVerificationFailed} isReturningUser={isReturningUser} storedAvatarName={avatarName} />;
+  if (showHumanVerification) return <OnboardingScreen onComplete={handleHumanVerified} onFail={handleHumanVerificationFailed} isReturningUser={isReturningUser} storedAvatarName={avatarName} />;
   if (showClickwrap) return <ClickwrapModal onSign={signClickwrap} onCancel={() => setShowClickwrap(false)} />;
+  if (!isAuthenticated) return <LoginScreen />;
 
   return (
     <div className="min-h-screen bg-amber-50 pb-28 font-sans text-amber-900">

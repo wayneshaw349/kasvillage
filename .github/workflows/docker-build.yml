@@ -2,7 +2,7 @@ name: Build and Push Backend
 on:
   push:
     branches: [ "main" ]
-    paths:
+    paths: 
       - 'backend/src/**'
       - 'backend/Cargo.toml'
       - 'backend/Dockerfile'

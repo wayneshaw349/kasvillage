@@ -19,11 +19,11 @@ import Countdown from "react-countdown";
 function cn(...inputs) {
   return twMerge(clsx(inputs));
 }
-
 // Akash Network Backend
 const API_BASE = typeof window !== 'undefined' && window.KASVILLAGE_API_URL 
   ? window.KASVILLAGE_API_URL 
-  : 'https://2gh81bjhh9df501kr92694nrbg.ingress.d3akash.cloud';
+  : 'https://proc9muli1dl9d335oos6k9d60.ingress.computeforge.com';
+
 
 // CoinGecko API (free, no key needed) for live KAS price
 const COINGECKO_API = 'https://api.coingecko.com/api/v3';

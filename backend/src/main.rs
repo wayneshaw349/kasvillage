@@ -277,6 +277,47 @@ mod serde_sig64 {
     }
 }
 
+/// Module for serializing/deserializing [u8; 32] (hashes, commitments)
+mod serde_u8_32 {
+    use serde::{Serializer, Deserializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Visitor;
+        
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = [u8; 32];
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("32 bytes")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<[u8; 32], E>
+            where
+                E: serde::de::Error,
+            {
+                if v.len() != 32 {
+                    return Err(E::custom(format!("expected 32 bytes, got {}", v.len())));
+                }
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(v);
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_bytes(Visitor)
+    }
+}
+
 /// Module for serializing/deserializing [u8; 34] (Kaspa addresses)
 mod serde_addr34 {
     use serde::{Serializer, Deserializer};
@@ -23327,16 +23368,120 @@ impl GlobalComplianceState {
     }
 }
 
+// ============================================================================
+// SANCTIONS LOADER: Treasury.gov OFAC + OpenSanctions.org crypto addresses
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub struct SanctionsSource {
+    pub source: String,          // "treasury_ofac" | "opensanctions"
+    pub identifier: String,      // Address, name, or entity ID
+    pub entity_type: String,
+    pub program: Option<String>,
+}
+
+pub struct ComplianceSanctionsLoader;
+
+impl ComplianceSanctionsLoader {
+    /// Load Treasury.gov OFAC SDN list
+    pub async fn load_treasury_ofac() -> Result<Vec<SanctionsSource>, Box<dyn std::error::Error>> {
+        let url = "https://www.treasury.gov/ofac/downloads/sdn.csv";
+        match reqwest::get(url).await {
+            Ok(response) => {
+                match response.text().await {
+                    Ok(text) => {
+                        let mut sources = Vec::new();
+                        for line in text.lines().skip(1) {
+                            let fields: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+                            if fields.len() >= 2 {
+                                sources.push(SanctionsSource {
+                                    source: "treasury_ofac".to_string(),
+                                    identifier: fields.get(0).unwrap_or(&"").to_string(),
+                                    entity_type: fields.get(1).unwrap_or(&"entity").to_string(),
+                                    program: fields.get(5).map(|s| s.to_string()),
+                                });
+                            }
+                        }
+                        Ok(sources)
+                    }
+                    Err(e) => Err(Box::new(e)),
+                }
+            }
+            Err(e) => Err(Box::new(e)),
+        }
+    }
+
+    /// Load OpenSanctions crypto addresses + entities
+    pub async fn load_opensanctions_csv() -> Result<Vec<SanctionsSource>, Box<dyn std::error::Error>> {
+        let url = "https://opensanctions.org/datasets/default/entities.csv";
+        match reqwest::get(url).await {
+            Ok(response) => {
+                match response.text().await {
+                    Ok(text) => {
+                        let mut sources = Vec::new();
+                        for line in text.lines().skip(1) {
+                            let fields: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+                            if fields.len() >= 3 {
+                                let entity_id = fields.get(0).unwrap_or(&"").to_string();
+                                let schema = fields.get(2).unwrap_or(&"").to_string();
+                                if schema.contains("crypto") || entity_id.contains("kaspa:") || entity_id.contains("0x") {
+                                    sources.push(SanctionsSource {
+                                        source: "opensanctions".to_string(),
+                                        identifier: entity_id,
+                                        entity_type: schema,
+                                        program: fields.get(1).map(|s| s.to_string()),
+                                    });
+                                }
+                            }
+                        }
+                        Ok(sources)
+                    }
+                    Err(e) => Err(Box::new(e)),
+                }
+            }
+            Err(e) => Err(Box::new(e)),
+        }
+    }
+
+    /// Combine Treasury OFAC + OpenSanctions into single list
+    pub async fn load_all_sanctions() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut all_sanctioned = Vec::new();
+        match Self::load_treasury_ofac().await {
+            Ok(treasury_list) => {
+                for source in treasury_list {
+                    all_sanctioned.push(source.identifier);
+                }
+                println!("✓ Loaded {} entities from Treasury.gov OFAC", all_sanctioned.len());
+            }
+            Err(e) => eprintln!("⚠ Failed to load Treasury OFAC: {}", e),
+        }
+        match Self::load_opensanctions_csv().await {
+            Ok(opensanctions_list) => {
+                let count_before = all_sanctioned.len();
+                for source in opensanctions_list {
+                    all_sanctioned.push(source.identifier);
+                }
+                println!("✓ Loaded {} crypto addresses from OpenSanctions", all_sanctioned.len() - count_before);
+            }
+            Err(e) => eprintln!("⚠ Failed to load OpenSanctions: {}", e),
+        }
+        all_sanctioned.sort();
+        all_sanctioned.dedup();
+        println!("✓ Total sanctioned entities/addresses: {}", all_sanctioned.len());
+        Ok(all_sanctioned)
+    }
+}
+
 /// Compliance gatekeeper for sanctions screening
 pub struct ComplianceGatekeeper {
     /// OFAC SDN list cache (address hash → blocked)
-    ofac_cache: HashMap<String, bool>,
-    /// Mock sanctioned addresses (dev mode)
-    sanctioned_list: Vec<String>,
+    pub ofac_cache: HashMap<String, bool>,
+    /// Sanctioned addresses from Treasury.gov + OpenSanctions
+    pub sanctioned_list: Vec<String>,
     /// Chainalysis API key (optional)
-    chainalysis_api_key: Option<String>,
+    pub chainalysis_api_key: Option<String>,
     /// Sumsub API key (optional)
-    sumsub_api_key: Option<String>,
+    pub sumsub_api_key: Option<String>,
 }
 
 impl ComplianceGatekeeper {
@@ -23351,6 +23496,17 @@ impl ComplianceGatekeeper {
             chainalysis_api_key: None,
             sumsub_api_key: None,
         }
+    }
+
+    /// Initialize with dual-source sanctions list (Treasury.gov + OpenSanctions)
+    pub async fn new_with_sanctions() -> Result<Self, Box<dyn std::error::Error>> {
+        let sanctioned_list = ComplianceSanctionsLoader::load_all_sanctions().await?;
+        Ok(Self {
+            ofac_cache: HashMap::new(),
+            sanctioned_list,
+            chainalysis_api_key: None,
+            sumsub_api_key: None,
+        })
     }
 
     pub fn with_chainalysis(mut self, api_key: String) -> Self {
@@ -30111,7 +30267,6 @@ impl FrostSecretShare {
     /// Verify secret share against commitment vector
     /// Check: g^{s_i} == ∏_j (g^{a_j})^{i^j} = ∏_j C_j^{i^j}
     pub fn verify_share(&self) -> Result<(), String> {
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
         use k256::ProjectivePoint;
         
         // g^{s_i} - compute public key from secret share
@@ -31191,7 +31346,7 @@ pub async fn handle_withdrawal_l2(
 #[derive(Serialize, Deserialize)]
 pub struct ProofRequest {
     pub proof_id: String,
-    #[serde(with = "serde_big_array::BigArray")]
+    #[serde(with = "BigArray")]
     pub pubkey: [u8; 33],
 }
 
@@ -32768,8 +32923,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result.print_report();
         std::process::exit(if result.success { 0 } else { 1 });
     }
-    
-    Ok(())
 }
 
 
@@ -36695,7 +36848,7 @@ use tokio::sync::RwLock;
 // WEBSOCKET ACTOR (Actix-web-actors)
 // ============================================================================
 
-use actix::{Actor, StreamHandler, Handler, Message, Addr, AsyncContext, ActorContext};
+use actix::{Actor, StreamHandler, Handler, Message, AsyncContext, ActorContext};
 use actix_web_actors::ws;
 
 /// WebSocket session actor
@@ -38706,7 +38859,6 @@ fn compute_lagrange_coefficient(
     signers: &[ParticipantId],
 ) -> [u8; 32] {
     use k256::Scalar as K256Scalar;
-    use ff::Field;
     
     // Validate input
     if !signers.contains(&identifier) {
@@ -46183,6 +46335,72 @@ impl FrontendAppState {
             frost_kaspa_address,
         }
     }
+
+    pub async fn new_with_sanctions() -> Self {
+        // Generate group keypair
+        let group_secret_bytes = [42u8; 32];
+        let group_signing_key = k256::ecdsa::SigningKey::from_slice(&group_secret_bytes)
+            .expect("Valid secp256k1 key");
+        let group_verifying_key = group_signing_key.verifying_key();
+        let group_pubkey_point = group_verifying_key.to_encoded_point(true);
+        
+        let mut group_pubkey = [0u8; 33];
+        group_pubkey.copy_from_slice(group_pubkey_point.as_bytes());
+        
+        // Create wallet and derive address
+        let frost_wallet = CommunalFrostWallet::new(group_pubkey);
+        let frost_kaspa_address = frost_wallet.kaspa_address()
+            .unwrap_or_else(|_| "kaspa1error".to_string());
+        
+        // Load real sanctions lists (Treasury + OpenSanctions)
+        let gatekeeper = match ComplianceGatekeeper::new_with_sanctions().await {
+            Ok(gk) => {
+                println!("✓ Compliance initialized with Treasury.gov + OpenSanctions");
+                gk
+            }
+            Err(e) => {
+                eprintln!("⚠ Failed to load sanctions lists, falling back to mock: {}", e);
+                ComplianceGatekeeper::new() // Fallback
+            }
+        };
+        
+        Self {
+            inner: RwLock::new(FrontendApiState::new()),
+            compliance: RwLock::new(GlobalComplianceState::new()),
+            gatekeeper: RwLock::new(gatekeeper),
+            xp_tree: RwLock::new(XpTreeState::new()),
+            frost_wallet: Arc::new(RwLock::new(frost_wallet)),
+            frost_group_pubkey: group_pubkey,
+            frost_kaspa_address,
+        }
+    }
+
+    /// Start background task to refresh sanctions list every 6 hours
+    pub fn start_sanctions_refresh_task(state: web::Data<FrontendAppState>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(21600)).await; // 6 hours
+                
+                match ComplianceSanctionsLoader::load_all_sanctions().await.map_err(|e| e.to_string()) {
+                    Ok(updated_list) => {
+                        let mut gk = state.gatekeeper.write().await;
+                        let old_count = gk.sanctioned_list.len();
+                        gk.sanctioned_list = updated_list;
+                        gk.ofac_cache.clear(); // Clear cache on refresh
+                        println!(
+                            "✓ Sanctions list refreshed: {} → {} entities (6h refresh)",
+                            old_count,
+                            gk.sanctioned_list.len()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("⚠ Failed to refresh sanctions list (6h task): {}", e);
+                        // Continue with stale list, retry in 6h
+                    }
+                }
+            }
+        });
+    }
 }
 
 // ============================================================================
@@ -46980,7 +47198,10 @@ pub fn configure_frontend_api(cfg: &mut web::ServiceConfig) {
 
 /// Start frontend API server
 pub async fn start_frontend_api_server(listen_addr: &str) -> Result<(), String> {
-    let state = web::Data::new(FrontendAppState::new());
+    let state = web::Data::new(FrontendAppState::new_with_sanctions().await);
+    
+    // Start background task to refresh sanctions list every 24 hours
+    FrontendAppState::start_sanctions_refresh_task(state.clone());
     
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -50861,18 +51082,18 @@ impl QRMerkleProof {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HybridSignature {
     // ECDSA component
-    #[serde(with = "serde_big_array::BigArray")]
+    #[serde(with = "BigArray")]
     pub ecdsa_r: [u8; 32],
-    #[serde(with = "serde_big_array::BigArray")]
+    #[serde(with = "BigArray")]
     pub ecdsa_s: [u8; 32],
     pub ecdsa_v: u8,
     
     // PQ component (Dilithium-style)
-    #[serde(with = "serde_big_array::BigArray")]
+    #[serde(with = "BigArray")]
     pub pq_commitment: [u8; 32],
-    #[serde(with = "serde_big_array::BigArray")]
+    #[serde(with = "BigArray")]
     pub pq_challenge: [u8; 32],
-    #[serde(with = "serde_big_array::BigArray")]
+    #[serde(with = "BigArray")]
     pub pq_response: [u8; 64],
     
     // Merkle binding

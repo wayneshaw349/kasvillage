@@ -254,7 +254,8 @@ const AVATAR_LORE_ORIGINS = [
 ];
 
 // Identity Hash: Avatar + Story → SHA256 → Merkle Tree
-const generateIdentityHash = async (avatar, story, storyWriteTime = 0) => {
+// --- FIX: Add personalAnswers to parameters ---
+const generateIdentityHash = async (avatar, story, personalAnswers, storyWriteTime = 0) => {
   try {
     const storyHash = await sha256Hash(story || '');
     const identityData = JSON.stringify({
@@ -275,17 +276,14 @@ const generateIdentityHash = async (avatar, story, storyWriteTime = 0) => {
       loreOrigin: avatar?.loreOrigin || '',
       storyHash,
       writeTimeRange: storyWriteTime < 15 ? 'fast' : storyWriteTime < 45 ? 'normal' : 'slow',
-      personalAnswers, // Add the 12 answers
-      
+      personalAnswers, // This now references the argument correctly
     });
     return await sha256Hash(identityData);
   } catch (err) {
     console.error('generateIdentityHash error:', err);
     return 'error-' + Date.now();
   }
-  
 };
-
 const sha256Hash = async (message) => {
   if (!message) message = '';
   const msgBuffer = new TextEncoder().encode(String(message));
@@ -1711,147 +1709,95 @@ const TradeFiSection = ({ onClose }) => {
 const GlobalContext = createContext();
 
 export const AppProvider = ({ children }) => {
+  // ---------------------------------------------------------
+  // 1. INITIALIZATION & STATE
+  // ---------------------------------------------------------
+  
+  // Check if we have saved avatar data (The definition of a Returning User)
+  const hasAvatarData = typeof window !== 'undefined' && localStorage.getItem('kv_avatar_data') !== null;
+  
+  // User Profile State
   const [user, setUser] = useState({ 
     pubkey: "02a...f4e", 
-    // Added verified L1 address for withdrawal autofill
     kaspaAddress: "kaspa:qr2w8sqj4vwpj8yz5fkly2tzafwkz8gn8k6m5xevpt", 
     apartment: "320", 
-    // L2 Wallet Lock: Split balance prevents double-spend during 24h settlement
-    balance: 2450.50,                    // Total balance (available + locked)
-    availableBalance: 2450.50,           // Balance available for spending/transfers
-    lockedWithdrawalBalance: 0,          // Balance locked in pending withdrawals (24h queue)
-    xp: 20000, 
-    tier: "Trust Anchor", 
-    reliability: 0.92, 
-    riskFactor: 0.35, 
-    kasPutUp: 5000, 
-    // Fees Earned -> Network Allocation
-    networkAllocation: 450.25,
-    isValidator: true,
-    validatorEpochProgress: 0.75,
-    validatorSlashingRate: 0.02,
+    balance: 2450.50, availableBalance: 2450.50, lockedWithdrawalBalance: 0,
+    xp: 20000, tier: "Trust Anchor", reliability: 0.92, riskFactor: 0.35, 
+    kasPutUp: 5000, networkAllocation: 450.25, isValidator: true,
+    validatorEpochProgress: 0.75, validatorSlashingRate: 0.02,
   });
+
+  // --- CRITICAL FIX: FORCE LOGIN ON RELOAD ---
+  // Always start as FALSE to force the Onboarding Screen to appear
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  
+  // Always start as TRUE to ensure the component renders
+  const [showHumanVerification, setShowHumanVerification] = useState(true);
+  
+  // Determine if they are returning based on local storage data
+  const [isReturningUser, setIsReturningUser] = useState(hasAvatarData);
+
+  // ---------------------------------------------------------
+  // 2. OTHER STATE (Standard)
+  // ---------------------------------------------------------
   const [paymentType, setPaymentType] = useState("Direct"); 
   const [cart, setCart] = useState({ item: null, coupon: null });
   const [systemHealth, setSystemHealth] = useState("Safe");
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [paidMonthlyFee, setPaidMonthlyFee] = useState(false); 
-  
   const [dappManifest, setDappManifest] = useState(null); 
-  
   const [securityStep, setSecurityStep] = useState(0); 
   const [needsChallenge, setNeedsChallenge] = useState(false); 
   const [showTransactionSigner, setShowTransactionSigner] = useState(false);
-
   const [pendingWithdrawals, setPendingWithdrawals] = useState([]);
   const [circuitBreakerStatus, setCircuitBreakerStatus] = useState({ is_tripped: false, total_outflow_last_hour: 0 });
   const [wsConnected, setWsConnected] = useState(false);
   const [activeConsignments, setActiveConsignments] = useState([]);
-  
-  // Clickwrap agreement state
   const [hasSignedClickwrap, setHasSignedClickwrap] = useState(false);
   const [showClickwrap, setShowClickwrap] = useState(false);
   const [geoBlocked, setGeoBlocked] = useState(false);
   const [userCountry, setUserCountry] = useState(null);
   
-  // Human verification (bot detection)
-  const [showHumanVerification, setShowHumanVerification] = useState(false);
-  const [isReturningUser, setIsReturningUser] = useState(false);
+  const [identityHash, setIdentityHash] = useState(() => typeof window !== 'undefined' ? localStorage.getItem('kv_identity_hash') : null);
+  const [avatarName, setAvatarName] = useState(() => typeof window !== 'undefined' ? localStorage.getItem('kv_avatar_name') || '' : '');
   
-  // Check for identity hash (determines new vs returning user)
-  const [identityHash, setIdentityHash] = useState(() => {
-    return localStorage.getItem('kv_identity_hash') || null;
-  });
-  const [avatarName, setAvatarName] = useState(() => {
-    return localStorage.getItem('kv_avatar_name') || '';
-  });
-  
-  // Human verified state - ONLY true if they have completed full onboarding with identity hash
-  const [humanVerified, setHumanVerified] = useState(() => {
-    // Clear old key if exists
-    if (localStorage.getItem('human_verified')) {
-      localStorage.removeItem('human_verified');
-    }
-    // Must have BOTH kv_verified AND kv_identity_hash to be considered verified
-    const hasVerified = localStorage.getItem('kv_verified') === 'true';
-    const hasIdentity = localStorage.getItem('kv_identity_hash') !== null;
-    return hasVerified && hasIdentity;
-  });
-  
-  // Verified L1 wallet from onboarding (sanctions-checked)
   const [verifiedL1Wallet, setVerifiedL1Wallet] = useState(() => {
+    if (typeof window === 'undefined') return null;
     const stored = localStorage.getItem('verified_l1_wallet');
     return stored ? JSON.parse(stored) : null;
   });
 
-  // STORE/COUPON DATA - Bridge between builder and mailbox
   const [hostNodes, setHostNodes] = useState([]);
   const [coupons, setCoupons] = useState([]);
   const [dapps, setDapps] = useState([]);
 
-  // Geo-blocking check on mount
+  // ---------------------------------------------------------
+  // 3. LOGIC & HANDLERS
+  // ---------------------------------------------------------
+
   useEffect(() => {
     const checkGeoBlock = async () => {
       try {
-        // In production: use IP geolocation API
-        // Mock: check localStorage or default to allowed
         const mockCountry = localStorage.getItem('mock_country') || 'US';
         setUserCountry(mockCountry);
-        if (BLOCKED_COUNTRIES.includes(mockCountry)) {
-          setGeoBlocked(true);
-        }
-      } catch (e) {
-        console.error('Geo check failed:', e);
-      }
+        if (BLOCKED_COUNTRIES.includes(mockCountry)) setGeoBlocked(true);
+      } catch (e) { console.error('Geo check failed:', e); }
     };
     checkGeoBlock();
   }, []);
-// Inside AppProvider...
-
- // Inside AppProvider component...
-
-  // ------------------------------------------------------------------
-  // 1. ADD THIS MISSING FUNCTION (This fixes the "Stuck" issue)
-  // ------------------------------------------------------------------
-  const proceedWithSecuritySteps = async () => {
-    console.log("🔐 Executing Security Handshake...");
-    
-    // Simulate connection steps
-    setSecurityStep(1);
-    await new Promise(r => setTimeout(r, 500));
-    setSecurityStep(2);
-    await new Promise(r => setTimeout(r, 500));
-    
-    // CRITICAL: This switches the view from LoginScreen to Dashboard
-    console.log("✅ Authenticated -> Switching to Dashboard");
-    setIsAuthenticated(true); 
-    setSecurityStep(0);
-  };
-
-  // ------------------------------------------------------------------
-  // 2. UPDATE THE LOGIN FUNCTION TO USE IT
-  // ------------------------------------------------------------------
-  // Inside AppProvider...
 
   const login = async () => {
     console.log("🚀 Logging in...");
-    
-    // 1. Force Authentication True immediately
-    // This ensures LoginScreen unmounts and Dashboard mounts
     setIsAuthenticated(true); 
-    
-    // 2. Reset security step for next time
     setSecurityStep(0);
-    
-    // 3. Optional: Trigger specific modals if needed (handled by Dashboard effects)
-    if (!hasSignedClickwrap) setShowClickwrap(true);
-    if (!humanVerified) setShowHumanVerification(true);
+    // Only show clickwrap if not signed yet
+    if (!localStorage.getItem('clickwrap_signature')) setShowClickwrap(true);
   };
+
   const handleHumanVerified = (result) => {
-    setHumanVerified(true);
+    // 1. Mark as verified in storage
     localStorage.setItem('kv_verified', 'true');
     
-    // Store identity hash if provided (new user)
+    // 2. Save identity if it's a new user
     if (result?.identityHash) {
       setIdentityHash(result.identityHash);
       localStorage.setItem('kv_identity_hash', result.identityHash);
@@ -1861,60 +1807,40 @@ export const AppProvider = ({ children }) => {
       localStorage.setItem('kv_avatar_name', result.avatar.name);
     }
     
+    // 3. Close Onboarding -> Open Dashboard
     setShowHumanVerification(false);
-    setIsReturningUser(false);
-    // Continue login
     login();
   };
   
   const handleHumanVerificationFailed = () => {
-    setShowHumanVerification(false);
-    alert('Human verification failed. Please try again.');
+    alert('Verification failed. Please try again.');
   };
   
-  // Reset verification (for testing/re-onboarding)
+  // DEBUG TOOL: Call this to reset everything and see the Knicks screen
   const resetVerification = () => {
-    localStorage.removeItem('kv_verified');
-    localStorage.removeItem('kv_identity_hash');
-    localStorage.removeItem('kv_avatar_name');
-    localStorage.removeItem('kv_verified_at');
-    localStorage.removeItem('human_verified');
-    setHumanVerified(false);
+    localStorage.clear(); 
     setIdentityHash(null);
     setAvatarName('');
     setIsReturningUser(false);
+    setIsAuthenticated(false);
+    setShowHumanVerification(true);
+    window.location.reload();
   };
   
-  // Handle clickwrap signature (now includes optional wallet from onboarding)
   const signClickwrap = (signatureData) => {
-    // In production: store signature on-chain
-    console.log('Clickwrap signed:', signatureData);
-    localStorage.setItem('clickwrap_signature', JSON.stringify({
-      ...signatureData,
-      timestamp: Date.now(),
-      pubkey: user.pubkey,
-    }));
-    
-    // Store verified wallet if provided
+    localStorage.setItem('clickwrap_signature', JSON.stringify({ ...signatureData, timestamp: Date.now(), pubkey: user.pubkey }));
     if (signatureData.verifiedWallet) {
       setVerifiedL1Wallet(signatureData.verifiedWallet);
-      // Update user's kaspaAddress with the verified address
-      setUser(prev => ({
-        ...prev,
-        kaspaAddress: signatureData.verifiedWallet.walletAddress,
-      }));
+      setUser(prev => ({ ...prev, kaspaAddress: signatureData.verifiedWallet.walletAddress }));
     }
-    
     setHasSignedClickwrap(true);
     setShowClickwrap(false);
-    // Continue login flow
     login();
   };
 
+  // Background Services
   useEffect(() => {
-    const interval = setInterval(() => {
-      api.getHealth().then(data => setSystemHealth(data.health_level));
-    }, 5000);
+    const interval = setInterval(() => api.getHealth().then(data => setSystemHealth(data.health_level)), 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -1929,62 +1855,19 @@ export const AppProvider = ({ children }) => {
   }, []);
 
   const submitWithdrawal = async (amount, destAddress) => {
-    if (circuitBreakerStatus.is_tripped) {
-      alert('Protocol halted: Circuit breaker active. Please try later.');
-      return null;
-    }
-    
-    // L2 Wallet Lock: Check available balance (not locked balance)
-    if (amount > user.availableBalance) {
-      alert(`Insufficient available balance. You have ${user.availableBalance.toLocaleString()} KAS available (${user.lockedWithdrawalBalance.toLocaleString()} KAS locked in pending withdrawals).`);
-      return null;
-    }
-    
+    if (circuitBreakerStatus.is_tripped) return alert('Protocol halted: Circuit breaker active.') || null;
+    if (amount > user.availableBalance) return alert(`Insufficient available balance.`) || null;
     const result = await api.submitWithdrawal(user.pubkey, amount, destAddress);
     if (result.success) {
-      // Lock the balance immediately (move from available to locked)
-      // This prevents double-spend during 24h settlement queue
-      setUser(prev => ({
-        ...prev,
-        availableBalance: prev.availableBalance - amount,
-        lockedWithdrawalBalance: prev.lockedWithdrawalBalance + amount,
-      }));
+      setUser(prev => ({ ...prev, availableBalance: prev.availableBalance - amount, lockedWithdrawalBalance: prev.lockedWithdrawalBalance + amount }));
       setPendingWithdrawals(prev => [...prev, result]);
     }
     return result;
   };
   
-  // Called when withdrawal is finalized (after 24h settlement)
-  const finalizeWithdrawal = (requestId, amount) => {
-    setUser(prev => ({
-      ...prev,
-      balance: prev.balance - amount,
-      lockedWithdrawalBalance: prev.lockedWithdrawalBalance - amount,
-    }));
-    setPendingWithdrawals(prev => prev.filter(w => w.request_id !== requestId));
-  };
-  
-  // Called when withdrawal is cancelled
-  const cancelWithdrawal = (requestId, amount) => {
-    setUser(prev => ({
-      ...prev,
-      availableBalance: prev.availableBalance + amount,
-      lockedWithdrawalBalance: prev.lockedWithdrawalBalance - amount,
-    }));
-    setPendingWithdrawals(prev => prev.filter(w => w.request_id !== requestId));
-  };
-
-  const createConsignment = async (itemDescription, itemValueKas, consignerSharePct) => {
-    const result = await api.createConsignment(
-      user.pubkey, 
-      '03...consigner', 
-      itemDescription,
-      itemValueKas,
-      consignerSharePct
-    );
-    if (result.success) {
-      setActiveConsignments(prev => [...prev, result]);
-    }
+  const createConsignment = async (desc, val, share) => {
+    const result = await api.createConsignment(user.pubkey, '03...consigner', desc, val, share);
+    if (result.success) setActiveConsignments(prev => [...prev, result]);
     return result;
   };
 
@@ -1995,22 +1878,20 @@ export const AppProvider = ({ children }) => {
       paidMonthlyFee, setPaidMonthlyFee, dappManifest, setDappManifest,
       pendingWithdrawals, circuitBreakerStatus, wsConnected,
       activeConsignments, submitWithdrawal, createConsignment,
-      // Clickwrap & geo-blocking
       hasSignedClickwrap, showClickwrap, setShowClickwrap, signClickwrap,
       geoBlocked, userCountry, BLOCKED_COUNTRIES, HIGH_VALUE_THRESHOLD_KAS,
-      // Human verification (bot detection)
-      showHumanVerification, humanVerified, handleHumanVerified, handleHumanVerificationFailed,
-      isReturningUser, identityHash, avatarName, resetVerification,
-      // Verified L1 wallet from onboarding
+      showHumanVerification, 
+      humanVerified: isAuthenticated, 
+      handleHumanVerified, handleHumanVerificationFailed,
+      isReturningUser, 
+      identityHash, avatarName, resetVerification,
       verifiedL1Wallet, setVerifiedL1Wallet,
-      // Store/Coupon Bridge (CRITICAL: Builder → Mailbox)
       hostNodes, setHostNodes, coupons, setCoupons, dapps, setDapps
     }}>
       {children}
     </GlobalContext.Provider>
   );
 };
-
 // --- 4. CORE UI COMPONENTS ---
 
 const Card = ({ className, children, ...props }) => (
@@ -2100,7 +1981,8 @@ const createAvatarPersonalQuestions = (avatar) => {
 };
 // --- HUMAN VERIFICATION SCREEN ---
 const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedAvatarName = '' }) => {
-  const [step, setStep] = useState(isReturningUser ? 'questions' : 'avatar');
+  // Inside OnboardingScreen component
+const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
   const [session, setSession] = useState(null);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [score, setScore] = useState(0);
@@ -2186,6 +2068,73 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
   const getStoryPrompt = () => {
     return "Tell me a story about your avatar.";
   };
+  useEffect(() => {
+    const initFlow = async () => {
+      // 1. RETURNING USER LOGIC
+      if (isReturningUser) {
+        console.log("🔄 Returning user detected. Loading memory check...");
+        const storedAvatarStr = localStorage.getItem('kv_avatar_data');
+        
+        // Safety: If they claimed to be returning but have no data, force them to 'welcome'
+        if (!storedAvatarStr) {
+          console.warn("⚠️ No avatar data found. Resetting to Welcome screen.");
+          setStep('welcome');
+          setIsLoading(false);
+          return;
+        }
+
+        const storedAvatar = JSON.parse(storedAvatarStr);
+        
+        // Generate Memory Questions locally
+        // (We generate 2 questions: Name and Class/Race)
+        const memoryQuestions = [];
+        
+        // Q1: Name Check
+        if (storedAvatar.name) {
+          const fakeNames = ['Shadow', 'Phoenix', 'Storm', 'Blade'].filter(n => n !== storedAvatar.name);
+          const options = [storedAvatar.name, ...fakeNames.slice(0, 3)].sort(() => Math.random() - 0.5);
+          memoryQuestions.push({
+            id: 'mem_name',
+            question: 'What is your avatar\'s name?',
+            options: options,
+            correct_index: options.indexOf(storedAvatar.name),
+            isAvatarQuestion: true,
+          });
+        }
+
+        // Q2: Class Check
+        if (storedAvatar.class) {
+          const fakeClasses = AVATAR_CLASSES.filter(c => c !== storedAvatar.class).slice(0, 3);
+          const options = [storedAvatar.class, ...fakeClasses].sort(() => Math.random() - 0.5);
+          memoryQuestions.push({
+             id: 'mem_class',
+             question: 'What class is your avatar?',
+             options: options,
+             correct_index: options.indexOf(storedAvatar.class),
+             isAvatarQuestion: true,
+          });
+        }
+
+        setSession({
+          session_id: `return_${Date.now()}`,
+          questions: memoryQuestions,
+          started_at: Date.now(),
+          time_limit_seconds: 30,
+        });
+        
+        setIsLoading(false);
+      } 
+      // 2. NEW USER LOGIC
+      else {
+        // Just stop loading so the 'welcome' screen appears
+        // We will generate the session later when they finish the avatar form
+        setIsLoading(false);
+        setAvatarTimings(prev => ({ ...prev, stepStart: Date.now() }));
+      }
+    };
+
+    initFlow();
+  }, [isReturningUser]);
 
   useEffect(() => {
     const startSession = async () => {
@@ -2654,7 +2603,80 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
       </div>
     );
   }
+// ============================================================
+  // WELCOME SCREEN (THE VILL) - KNICKS THEME
+  // ============================================================
+  if (step === 'welcome') {
+    return (
+      <div className="fixed inset-0 bg-[#006BB6] flex items-center justify-center z-50 p-6 overflow-hidden">
+        {/* Background Decorative Elements */}
+        <div className="absolute top-10 left-10 w-20 h-20 rounded-full border-8 border-[#F58426] opacity-20"></div>
+        <div className="absolute bottom-20 right-10 w-32 h-32 rounded-full bg-[#F58426] opacity-10"></div>
 
+        <motion.div 
+          initial={{ scale: 0.8, opacity: 0, y: 50 }} 
+          animate={{ scale: 1, opacity: 1, y: 0 }} 
+          transition={{ type: "spring", bounce: 0.5 }}
+          className="w-full max-w-md text-center relative z-10"
+        >
+          {/* BUBBLE LETTERS TITLE */}
+          <div className="mb-2 transform -rotate-2">
+            <h1 
+              className="text-6xl md:text-7xl font-black text-[#F58426] leading-none"
+              style={{ 
+                fontFamily: 'impact, sans-serif', 
+                textShadow: '3px 3px 0px #FFFFFF, 6px 6px 0px #000000',
+                letterSpacing: '1px',
+                WebkitTextStroke: '2px white'
+              }}
+            >
+              KasVillage
+            </h1>
+          </div>
+          
+          <div className="mb-8 transform rotate-1">
+            <h2 
+              className="text-4xl font-black text-white"
+              style={{ 
+                fontFamily: 'impact, sans-serif', 
+                textShadow: '3px 3px 0px #F58426, 5px 5px 0px #000000',
+                letterSpacing: '1px'
+              }}
+            >
+              AKA "THE VILL"
+            </h2>
+          </div>
+
+          {/* MESSAGE CARD */}
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ delay: 0.3 }}
+            className="bg-white border-4 border-[#F58426] rounded-3xl p-6 mb-8 shadow-[8px_8px_0px_0px_rgba(0,0,0,0.3)] relative"
+          >
+            {/* Speech Bubble Triangle */}
+            <div className="absolute -top-4 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[15px] border-l-transparent border-r-[15px] border-r-transparent border-b-[20px] border-b-[#F58426]"></div>
+            
+            <p className="text-stone-900 text-lg font-bold leading-relaxed">
+              "You don't have to fill out <span className="text-[#006BB6] font-black">ALL</span> the avatar questions... just enough to form an identity."
+            </p>
+          </motion.div>
+
+          {/* BUTTON */}
+          <button 
+            onClick={() => setStep('avatar')}
+            className="w-full py-4 bg-[#F58426] hover:bg-[#ff9035] text-white text-xl font-black rounded-2xl border-4 border-white shadow-[4px_4px_0px_0px_#000000] transition-all active:translate-y-1 active:shadow-none uppercase tracking-widest flex items-center justify-center gap-2"
+          >
+            Create Identity <span className="text-2xl">🏀</span>
+          </button>
+          
+          <p className="mt-6 text-white/60 text-xs font-bold uppercase tracking-widest">
+            Protocol v2.0 • Decentralized Living
+          </p>
+        </motion.div>
+      </div>
+    );
+  }
   // Step 1: Avatar Creation (NEW USERS ONLY)
   if (step === 'avatar') {
     const filledCount = [
@@ -3178,7 +3200,11 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
   if (step === 'questions') {
     const question = getCurrentQuestion();
     if (!question) return null;
+    
+    // Timer styling
     const timerColor = timeLeft <= 5 ? 'text-red-500' : timeLeft <= 10 ? 'text-amber-500' : 'text-green-500';
+    
+    // Identify question type for UI context
     const isAvatarQ = question.isStoryQuestion;
     const isKeywordQ = question.isKeywordQuestion;
     const isSpecialQ = isAvatarQ || isKeywordQ;
@@ -3186,6 +3212,8 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
     return (
       <div className="fixed inset-0 bg-stone-900 flex items-center justify-center z-50 p-4">
         <div className="w-full max-w-lg">
+          
+          {/* Header */}
           <div className="text-center mb-4">
             <h2 className="text-xl font-black text-white mb-1">
               {isReturningUser ? `Welcome Back${storedAvatarName ? `, ${storedAvatarName}` : ''}!` : 
@@ -3197,6 +3225,7 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
             </p>
           </div>
 
+          {/* Progress Bar */}
           <div className="mb-4">
             <div className="flex justify-between text-xs text-stone-400 mb-1">
               <span>Question {currentIndex + 1}/{totalQuestions}</span>
@@ -3207,11 +3236,13 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
             </div>
           </div>
 
+          {/* Timer */}
           <div className="text-center mb-4">
             <div className={cn("text-5xl font-black", timerColor)}>{timeLeft}</div>
             <p className="text-stone-500 text-xs">seconds</p>
           </div>
 
+          {/* Question Card */}
           <motion.div key={currentIndex} initial={{ x: 50, opacity: 0 }} animate={{ x: 0, opacity: 1 }} 
             className={cn("rounded-2xl p-6 mb-4", 
               isAvatarQ ? "bg-purple-900/50 border border-purple-500" : 
@@ -3238,6 +3269,7 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
             </div>
           </motion.div>
 
+          {/* Feedback Overlay */}
           {feedback && (
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
               className={cn("text-center py-2 rounded-xl font-bold",
@@ -3252,64 +3284,32 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
           <p className="text-center text-stone-600 text-xs mt-4">
             {isReturningUser ? 'Quick Verification' : `Step 4 of 4 • ${isAvatarQ ? 'Avatar Verification' : isKeywordQ ? 'Story Verification' : 'Human Verification'}`}
           </p>
+
+          {/* RESET BUTTON (For Returning Users who want to start over) */}
+          {isReturningUser && (
+            <button 
+              onClick={() => {
+                // Wipe Local Storage
+                localStorage.removeItem('kv_verified');
+                localStorage.removeItem('kv_identity_hash');
+                localStorage.removeItem('kv_avatar_name');
+                localStorage.removeItem('kv_avatar_data');
+                localStorage.removeItem('kv_verified_at');
+                
+                // Force Reload to ensure clean state
+                window.location.reload(); 
+              }}
+              className="w-full mt-6 text-xs font-bold text-red-500 hover:text-red-400 uppercase tracking-widest border border-red-900/30 p-3 rounded-xl hover:bg-red-900/10 transition-colors"
+            >
+              Start Over / Create New Identity
+            </button>
+          )}
+
         </div>
       </div>
     );
   }
-
-  // Step 5: Complete
-  if (step === 'complete') {
-    return (
-      <div className="fixed inset-0 bg-stone-900 flex items-center justify-center z-50">
-        <motion.div initial={{ scale: 0.8, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="text-center">
-          {passed ? (
-            <>
-              <div className="w-24 h-24 bg-green-500 rounded-full flex items-center justify-center mx-auto mb-6">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                </svg>
-              </div>
-              <h2 className="text-3xl font-black text-white mb-2">Verified Human!</h2>
-              <p className="text-green-400 text-lg">{score}/{totalQuestions} correct</p>
-              <p className="text-stone-400 mt-4">Welcome to KasVillage</p>
-              <p className="text-stone-500 text-xs mt-2">Redirecting...</p>
-              <button
-                onClick={() => onComplete({ 
-                  identityHash: localStorage.getItem('kv_identity_hash'),
-                  score: score
-                })}
-                className="mt-4 px-6 py-3 bg-green-600 hover:bg-green-500 text-white rounded-xl font-bold transition-all"
-              >
-                Continue to Village →
-              </button>
-            </>
-          ) : (
-            <>
-              <div className="w-24 h-24 bg-red-500 rounded-full flex items-center justify-center mx-auto mb-6">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </div>
-              <h2 className="text-3xl font-black text-white mb-2">Verification Failed</h2>
-              <p className="text-red-400 text-lg">{score}/{totalQuestions} correct (need {passThreshold})</p>
-              <p className="text-stone-400 mt-4">Please try again</p>
-              <button
-                onClick={() => onFail({ reason: 'low_score', score })}
-                className="mt-4 px-6 py-3 bg-red-600 hover:bg-red-500 text-white rounded-xl font-bold transition-all"
-              >
-                Try Again
-              </button>
-            </>
-          )}
-        </motion.div>
-      </div>
-    );
-  }
-
-  return null;
-};
-
-
+} 
 // --- 5. SAFETY METER ---
 
 const SafetyMeter = () => {
@@ -7117,8 +7117,10 @@ const LoginScreen = () => {
     } else {
       const newAttempts = attempts + 1;
       setAttempts(newAttempts);
+      // Inside finalizeOnboarding function in LoginScreen
       if (newAttempts >= ONBOARDING_MAX_ATTEMPTS) {
-        const time = Date.now() + LOCKOUT_DURATION_MS;
+        // FIX: Use the correct global constant
+        const time = Date.now() + ONBOARDING_LOCKOUT_DURATION; 
         setLockoutTime(time);
         localStorage.setItem('kv_lockout', time.toString());
         setStep('locked');
@@ -8603,6 +8605,18 @@ const Navigation = ({ activeTab, setActiveTab, onToggleIdentity }) => {
     </div>
   );
 };
+const NavButton = ({ active, icon: Icon, label, onClick }) => (
+  <button 
+    onClick={onClick} 
+    className={cn(
+      "flex flex-col items-center gap-1 transition-all", 
+      active ? "text-red-800 scale-110" : "text-amber-400 hover:text-amber-600"
+    )}
+  >
+    <Icon size={24} strokeWidth={active ? 3 : 2} />
+    <span className="text-[9px] font-black uppercase tracking-tighter">{label}</span>
+  </button>
+);
 // --- 15. MAIN DASHBOARD ---
 // ============================================================================
 // DASHBOARD COMPONENT (Updated with Returning User Verification Flow)
@@ -8677,146 +8691,265 @@ const Dashboard = () => {
     setIsSearching(false);
   };
 
-  // --- NEW HANDLER FOR WALLET OVERVIEW LOOKUP ---
-  const handleTrustModalCheck = async (query) => {
-    setTrustModalQuery(query);
-    setShowTrustModal(true);
-    setTrustModalSearching(true);
-    const data = await api.getCounterpartyBayesian(query);
-    setTrustModalStats(data);
-    setTrustModalSearching(false);
-  };
-  // ----------------------------------------------
+ // --- NEW HANDLER FOR WALLET OVERVIEW LOOKUP ---
+ const handleTrustModalCheck = async (query) => {
+  setTrustModalQuery(query);
+  setShowTrustModal(true);
+  setTrustModalSearching(true);
+  const data = await api.getCounterpartyBayesian(query);
+  setTrustModalStats(data);
+  setTrustModalSearching(false);
+};
+// ----------------------------------------------
 
-  const userHostNode = hostNodes?.find(s => s.owner_tier === user.tier) || {
-      host_id: 'new', name: "My Shop", description: "Builder mode active.", items: [], apartment: user.apartment, theme: "LightMarket"
-  };
+const userHostNode = hostNodes?.find(s => s.owner_tier === user.tier) || {
+    host_id: 'new', name: "My Shop", description: "Builder mode active.", items: [], apartment: user.apartment, theme: "LightMarket"
+};
 
-  if (geoBlocked) return <GeoBlockScreen countryCode={userCountry} />;
-  if (showHumanVerification) return <OnboardingScreen onComplete={handleHumanVerified} onFail={handleHumanVerificationFailed} isReturningUser={isReturningUser} storedAvatarName={avatarName} />;
-  if (showClickwrap) return <ClickwrapModal onSign={signClickwrap} onCancel={() => setShowClickwrap(false)} />;
-  if (!isAuthenticated) return <LoginScreen />;
+// ==============================================================================
+// GATING LOGIC (Replaces LoginScreen)
+// ==============================================================================
 
+// 1. Sanctions Check (Geo-Block)
+if (geoBlocked) return <GeoBlockScreen countryCode={userCountry} />;
+
+// 2. Avatar/Human Verification (This acts as the Login)
+if (showHumanVerification) { 
   return (
-    <div className="min-h-screen bg-amber-50 pb-28 font-sans text-amber-900">
-      <div className="sticky top-0 z-40 bg-amber-50/90 backdrop-blur-md px-6 pt-6 pb-4">
-        <div className="flex justify-between items-center mb-4">
-          <div>
-            <h1 className="text-xl font-black text-amber-900 flex items-center gap-2">
-              <MapPin size={20} className="text-red-800"/> Apt {user.apartment}
-            </h1>
-            <p className="text-[10px] font-bold text-amber-600 uppercase tracking-tighter">L2 Identity Protocol</p>
-          </div>
-          <div className="flex items-center gap-2">
-            <WebSocketStatusIndicator />
-            <div className="w-10 h-10 bg-white border-2 border-amber-200 rounded-full flex items-center justify-center shadow-sm">
-              <User size={20} className="text-amber-800"/>
-            </div>
+    <OnboardingScreen 
+      onComplete={handleHumanVerified} 
+      onFail={handleHumanVerificationFailed} 
+      isReturningUser={isReturningUser} 
+      storedAvatarName={avatarName} 
+    />
+  );
+}
+
+// 3. Terms of Service (Clickwrap)
+if (showClickwrap) return <ClickwrapModal onSign={signClickwrap} onCancel={() => setShowClickwrap(false)} />;
+
+// 4. MAIN DASHBOARD RENDER (If all above pass)
+return (
+  <div className="min-h-screen bg-amber-50 pb-28 font-sans text-amber-900">
+    
+    {/* --- HEADER --- */}
+    <div className="sticky top-0 z-40 bg-amber-50/90 backdrop-blur-md px-6 pt-6 pb-4">
+      <div className="flex justify-between items-center mb-4">
+        <div>
+          <h1 className="text-xl font-black text-amber-900 flex items-center gap-2">
+            <MapPin size={20} className="text-red-800"/> Apt {user.apartment}
+          </h1>
+          <p className="text-[10px] font-bold text-amber-600 uppercase tracking-tighter">L2 Identity Protocol</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <WebSocketStatusIndicator />
+          <div className="w-10 h-10 bg-white border-2 border-amber-200 rounded-full flex items-center justify-center shadow-sm">
+            <User size={20} className="text-amber-800"/>
           </div>
         </div>
-        <SafetyMeter />
       </div>
-      <ProtocolStatsBanner />
-      
-      <AnimatePresence mode="wait">
-        <motion.div key={activeTab} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
-          {activeTab === "wallet" && (
-            <WalletOverview 
-              setRampMode={setRampMode} setShowOnRamp={setShowOnRamp} setShowDAppMarketplace={setShowDAppMarketplace}
-              openHostNodeInterface={setActiveHost} openAcademicProfile={() => setActiveDApp('academics')}
-              setShowMutualPayment={setShowMutualPayment} setShowReceiveModal={setShowReceiveModal}
-              setShowWithdrawalModal={setShowWithdrawalModal} setActiveDApp={setActiveDApp}
-              protocolReserves={protocolReserves} 
-              txCompleteStats={txCompleteStats} 
-              deadlockStats={deadlockStats}
-              bayesianStats={bayesianStats}
-              onTrustCheck={handleTrustModalCheck} // <--- Pass handler
-            />
-          )}
-
-          {activeTab === "mailbox" && <MailboxTabContent openHost={setActiveHost} onOpenDAppMarketplace={() => setShowDAppMarketplace(true)} openStorefront={setActiveStorefront} openAcademic={setActiveAcademic} openDAppDetail={setActiveDAppDetail} />}
-          {activeTab === "builder" && <HostNodeBuilder hostNode={userHostNode} userXp={user.xp} openDApp={setActiveDApp} openHost={setActiveHost} />}
-
-          {activeTab === "trade" && (
-            <div className="px-6 py-4 space-y-6">
-              <div className="p-6 bg-stone-900 rounded-3xl text-white shadow-2xl">
-                  <h2 className="text-xl font-black flex items-center gap-2 mb-2"><ShieldCheck className="text-blue-400"/> Counterparty Risk</h2>
-                  <p className="text-stone-400 text-[10px] uppercase font-bold tracking-widest mb-6">Enter an Apartment # to assess trust</p>
-                  <div className="flex gap-2">
-                     <input value={counterpartySearch} onChange={(e) => setCounterpartySearch(e.target.value)} placeholder="e.g. 320, 101, 404..." className="flex-1 bg-stone-800 border-2 border-stone-700 rounded-xl p-3 text-sm outline-none focus:border-blue-500" />
-                     <button onClick={handleCounterpartySearch} className="bg-blue-600 px-4 rounded-xl font-bold hover:bg-blue-500">{isSearching ? <RefreshCw className="animate-spin" size={18}/> : "Analyze"}</button>
-                  </div>
-                  {counterpartyStats && (
-                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="mt-8 space-y-6 border-t border-stone-800 pt-6">
-                        <div className="flex justify-between items-center">
-                          <div><p className="text-[9px] text-stone-500 uppercase font-black">Trust Rating</p><p className={cn("text-lg font-black", counterpartyStats.rating === "Highly Trusted" ? "text-green-400" : counterpartyStats.rating === "High Danger" ? "text-red-500" : "text-amber-500")}>{counterpartyStats.rating}</p></div>
-                          <div className="text-right"><Badge tier={counterpartyStats.tier} /><p className="text-[10px] text-stone-500 mt-1">{counterpartyStats.xp_balance} XP</p></div>
-                        </div>
-                        <div className="space-y-4">
-                           <div>
-                              <div className="flex justify-between text-[10px] font-black uppercase mb-1"><span className="text-blue-400">Completion Probability</span><span>{(counterpartyStats.p_complete * 100).toFixed(1)}%</span></div>
-                              <div className="w-full bg-stone-800 h-2 rounded-full overflow-hidden"><motion.div initial={{ width: 0 }} animate={{ width: `${counterpartyStats.p_complete * 100}%` }} className="bg-blue-500 h-full" /></div>
-                           </div>
-                           <div className="grid grid-cols-2 gap-4">
-                              <div className="p-3 bg-stone-800 rounded-xl border border-stone-700"><p className="text-[9px] text-stone-500 uppercase font-bold">Successful Deals</p><p className="text-xl font-black text-white">{counterpartyStats.successes}</p></div>
-                              <div className="p-3 bg-stone-800 rounded-xl border border-stone-700"><p className="text-[9px] text-stone-500 uppercase font-bold">Deadlocks</p><p className="text-xl font-black text-red-500">{counterpartyStats.deadlocks}</p></div>
-                           </div>
-                        </div>
-                    </motion.div>
-                  )}
-              </div>
-              <TradeFiSection onClose={() => {}} /> 
-            </div>
-          )}
-        </motion.div>
-      </AnimatePresence>
-
-      <div className="fixed bottom-0 w-full bg-white border-t-2 border-amber-100 p-4 flex justify-around items-center z-50 pb-10">
-         <NavButton active={activeTab === "wallet"} icon={Wallet} label="Wallet" onClick={() => setActiveTab("wallet")} />
-         <NavButton active={activeTab === "mailbox"} icon={Mail} label="Village" onClick={() => setActiveTab("mailbox")} />
-         <NavButton active={activeTab === "builder"} icon={Store} label="Builder" onClick={() => setActiveTab("builder")} />
-         <NavButton active={activeTab === "trade"} icon={Scale} label="Trade" onClick={() => setActiveTab("trade")} />
-      </div>
-
-      <AnimatePresence>
-        {securityStep > 0 && <SecurityCheckModal />}
-        {showTransactionSigner && <TransactionSigner onClose={() => setShowTransactionSigner(false)} onOpenMutualPay={() => setShowMutualPayment(true)} />}
-        {activeHost && <HostNodeInterface hostNode={activeHost} templateId={activeHost.theme} onClose={() => setActiveHost(null)} />}
-        {activeStorefront && <StorefrontViewer hostName={activeStorefront.hostName} hostId={activeStorefront.hostId} onClose={() => setActiveStorefront(null)} />}
-        {activeAcademic && <AcademicViewer item={activeAcademic} onClose={() => setActiveAcademic(null)} />}
-        {activeDAppDetail && <DAppViewer dapp={activeDAppDetail} onClose={() => setActiveDAppDetail(null)} />}
-        {activeDApp === 'consignment' && <ConsignmentModule onClose={() => setActiveDApp(null)} />}
-        {activeDApp === 'academics' && <AcademicResearchPreview onClose={() => setActiveDApp(null)} />}
-        {activeDApp === 'validator' && <ValidatorDashboard onClose={() => setActiveDApp(null)} />}
-        {showWithdrawalModal && <WithdrawalTimelockPanel onClose={() => setShowWithdrawalModal(false)} />}
-        {showReceiveModal && <ReceiveModal onClose={() => setShowReceiveModal(false)} apartment={user.apartment} />}
-        {showDAppMarketplace && <DAppMarketplace onClose={() => setShowDAppMarketplace(false)} onOpenQualityGate={() => { setShowDAppMarketplace(false); setShowQualityGate(true); }} />}
-        {showQualityGate && <QualityGateModal onClose={() => setShowQualityGate(false)} onPublish={(m) => { alert(`DApp ${m.name} published!`); setShowQualityGate(false); }} />}
-        {showMutualPayment && <MutualPaymentFlow isOpen={showMutualPayment} onClose={() => setShowMutualPayment(false)} />}
-        {showOnRamp && <OnOffRampFlow onClose={() => setShowOnRamp(false)} mode={rampMode} />}
-        
-        {/* --- RENDER TRUST MODAL --- */}
-        {showTrustModal && (
-          <CounterpartyStatsModal 
-            isOpen={showTrustModal} 
-            onClose={() => setShowTrustModal(false)} 
-            stats={trustModalStats} 
-            searching={trustModalSearching} 
-            query={trustModalQuery}
+      <SafetyMeter />
+    </div>
+    <ProtocolStatsBanner />
+    
+    {/* --- MAIN CONTENT AREA (Tabs) --- */}
+    <AnimatePresence mode="wait">
+      <motion.div 
+        key={activeTab} 
+        initial={{ opacity: 0, y: 10 }} 
+        animate={{ opacity: 1, y: 0 }} 
+        exit={{ opacity: 0, y: -10 }}
+        transition={{ duration: 0.2 }}
+      >
+        {/* 1. WALLET TAB */}
+        {activeTab === "wallet" && (
+          <WalletOverview 
+            setRampMode={setRampMode} 
+            setShowOnRamp={setShowOnRamp} 
+            setShowDAppMarketplace={setShowDAppMarketplace}
+            openHostNodeInterface={setActiveHost} 
+            openAcademicProfile={() => setActiveDApp('academics')}
+            setShowMutualPayment={setShowMutualPayment} 
+            setShowReceiveModal={setShowReceiveModal}
+            setShowWithdrawalModal={setShowWithdrawalModal} 
+            setActiveDApp={setActiveDApp}
+            protocolReserves={protocolReserves} 
+            txCompleteStats={txCompleteStats} 
+            deadlockStats={deadlockStats}
+            bayesianStats={bayesianStats}
+            onTrustCheck={handleTrustModalCheck} 
           />
         )}
-      </AnimatePresence>
-    </div>
-  );
-};
-// Internal Helper for Navigation
-const NavButton = ({ active, icon: Icon, label, onClick }) => (
-  <button onClick={onClick} className={cn("flex flex-col items-center gap-1 transition-all", active ? "text-red-800 scale-110" : "text-amber-400")}>
-    <Icon size={24} strokeWidth={active ? 3 : 2} />
-    <span className="text-[9px] font-black uppercase tracking-tighter">{label}</span>
-  </button>
-);
 
+        {/* 2. MAILBOX / VILLAGE TAB */}
+        {activeTab === "mailbox" && (
+          <MailboxTabContent 
+            openHost={setActiveHost} 
+            onOpenDAppMarketplace={() => setShowDAppMarketplace(true)} 
+            openStorefront={setActiveStorefront} 
+            openAcademic={setActiveAcademic} 
+            openDAppDetail={setActiveDAppDetail} 
+          />
+        )}
+
+        {/* 3. BUILDER TAB */}
+        {activeTab === "builder" && (
+          <HostNodeBuilder 
+            hostNode={userHostNode} 
+            userXp={user.xp} 
+            openDApp={setActiveDApp} 
+            openHost={setActiveHost} 
+          />
+        )}
+
+        {/* 4. TRADE TAB */}
+        {activeTab === "trade" && (
+          <div className="px-6 py-4 space-y-6">
+            <div className="p-6 bg-stone-900 rounded-3xl text-white shadow-2xl">
+                <h2 className="text-xl font-black flex items-center gap-2 mb-2">
+                  <ShieldCheck className="text-blue-400"/> Counterparty Risk
+                </h2>
+                <p className="text-stone-400 text-[10px] uppercase font-bold tracking-widest mb-6">
+                  Enter an Apartment # to assess trust
+                </p>
+                <div className="flex gap-2">
+                   <input 
+                     value={counterpartySearch} 
+                     onChange={(e) => setCounterpartySearch(e.target.value)} 
+                     placeholder="e.g. 320, 101, 404..." 
+                     className="flex-1 bg-stone-800 border-2 border-stone-700 rounded-xl p-3 text-sm outline-none focus:border-blue-500" 
+                   />
+                   <button 
+                     onClick={handleCounterpartySearch} 
+                     className="bg-blue-600 px-4 rounded-xl font-bold hover:bg-blue-500"
+                   >
+                     {isSearching ? <RefreshCw className="animate-spin" size={18}/> : "Analyze"}
+                   </button>
+                </div>
+                {counterpartyStats && (
+                  <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="mt-8 space-y-6 border-t border-stone-800 pt-6">
+                      <div className="flex justify-between items-center">
+                        <div>
+                          <p className="text-[9px] text-stone-500 uppercase font-black">Trust Rating</p>
+                          <p className={cn("text-lg font-black", counterpartyStats.rating === "Highly Trusted" ? "text-green-400" : counterpartyStats.rating === "High Danger" ? "text-red-500" : "text-amber-500")}>
+                            {counterpartyStats.rating}
+                          </p>
+                        </div>
+                        <div className="text-right">
+                          <Badge tier={counterpartyStats.tier} />
+                          <p className="text-[10px] text-stone-500 mt-1">{counterpartyStats.xp_balance} XP</p>
+                        </div>
+                      </div>
+                      <div className="space-y-4">
+                         <div>
+                            <div className="flex justify-between text-[10px] font-black uppercase mb-1">
+                              <span className="text-blue-400">Completion Probability</span>
+                              <span>{(counterpartyStats.p_complete * 100).toFixed(1)}%</span>
+                            </div>
+                            <div className="w-full bg-stone-800 h-2 rounded-full overflow-hidden">
+                              <motion.div initial={{ width: 0 }} animate={{ width: `${counterpartyStats.p_complete * 100}%` }} className="bg-blue-500 h-full" />
+                            </div>
+                         </div>
+                         <div className="grid grid-cols-2 gap-4">
+                            <div className="p-3 bg-stone-800 rounded-xl border border-stone-700">
+                              <p className="text-[9px] text-stone-500 uppercase font-bold">Successful Deals</p>
+                              <p className="text-xl font-black text-white">{counterpartyStats.successes}</p>
+                            </div>
+                            <div className="p-3 bg-stone-800 rounded-xl border border-stone-700">
+                              <p className="text-[9px] text-stone-500 uppercase font-bold">Deadlocks</p>
+                              <p className="text-xl font-black text-red-500">{counterpartyStats.deadlocks}</p>
+                            </div>
+                         </div>
+                      </div>
+                  </motion.div>
+                )}
+            </div>
+            <TradeFiSection onClose={() => {}} /> 
+          </div>
+        )}
+      </motion.div>
+    </AnimatePresence>
+
+    {/* --- FOOTER NAVIGATION --- */}
+    <div className="fixed bottom-0 w-full bg-white border-t-2 border-amber-100 p-4 flex justify-around items-center z-50 pb-10">
+       <NavButton active={activeTab === "wallet"} icon={Wallet} label="Wallet" onClick={() => setActiveTab("wallet")} />
+       <NavButton active={activeTab === "mailbox"} icon={Mail} label="Village" onClick={() => setActiveTab("mailbox")} />
+       <NavButton active={activeTab === "builder"} icon={Store} label="Builder" onClick={() => setActiveTab("builder")} />
+       <NavButton active={activeTab === "trade"} icon={Scale} label="Trade" onClick={() => setActiveTab("trade")} />
+    </div>
+
+    {/* --- GLOBAL MODALS --- */}
+    <AnimatePresence>
+      {securityStep > 0 && <SecurityCheckModal />}
+      
+      {showTransactionSigner && (
+        <TransactionSigner 
+          onClose={() => setShowTransactionSigner(false)} 
+          onOpenMutualPay={() => setShowMutualPayment(true)} 
+        />
+      )}
+      
+      {activeHost && (
+        <HostNodeInterface 
+          hostNode={activeHost} 
+          templateId={activeHost.theme} 
+          onClose={() => setActiveHost(null)} 
+        />
+      )}
+      
+      {activeStorefront && (
+        <StorefrontViewer 
+          hostName={activeStorefront.hostName} 
+          hostId={activeStorefront.hostId} 
+          onClose={() => setActiveStorefront(null)} 
+        />
+      )}
+      
+      {activeAcademic && <AcademicViewer item={activeAcademic} onClose={() => setActiveAcademic(null)} />}
+      
+      {activeDAppDetail && <DAppViewer dapp={activeDAppDetail} onClose={() => setActiveDAppDetail(null)} />}
+      
+      {activeDApp === 'consignment' && <ConsignmentModule onClose={() => setActiveDApp(null)} />}
+      
+      {activeDApp === 'academics' && <AcademicResearchPreview onClose={() => setActiveDApp(null)} />}
+      
+      {activeDApp === 'validator' && <ValidatorDashboard onClose={() => setActiveDApp(null)} />}
+      
+      {showWithdrawalModal && <WithdrawalTimelockPanel onClose={() => setShowWithdrawalModal(false)} />}
+      
+      {showReceiveModal && <ReceiveModal onClose={() => setShowReceiveModal(false)} apartment={user.apartment} />}
+      
+      {showDAppMarketplace && (
+        <DAppMarketplace 
+          onClose={() => setShowDAppMarketplace(false)} 
+          onOpenQualityGate={() => { setShowDAppMarketplace(false); setShowQualityGate(true); }} 
+        />
+      )}
+      
+      {showQualityGate && (
+        <QualityGateModal 
+          onClose={() => setShowQualityGate(false)} 
+          onPublish={(m) => { alert(`DApp ${m.name} published!`); setShowQualityGate(false); }} 
+        />
+      )}
+      
+      {showMutualPayment && <MutualPaymentFlow isOpen={showMutualPayment} onClose={() => setShowMutualPayment(false)} />}
+      
+      {showOnRamp && <OnOffRampFlow onClose={() => setShowOnRamp(false)} mode={rampMode} />}
+      
+      {showTrustModal && (
+        <CounterpartyStatsModal 
+          isOpen={showTrustModal} 
+          onClose={() => setShowTrustModal(false)} 
+          stats={trustModalStats} 
+          searching={trustModalSearching} 
+          query={trustModalQuery}
+        />
+      )}
+    </AnimatePresence>
+  </div>
+);
+};
 // ============================================================================
 // ON/OFF RAMP GUIDED FLOW (Kraken-style State-Aware UX)
 // ============================================================================

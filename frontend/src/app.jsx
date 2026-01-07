@@ -53,6 +53,7 @@ const ANTI_BOT_DELAY_MS = 2000;                 // 2s minimum between attempts
 const AUTO_ADVANCE_SUCCESS = 1500;              // 1.5s success auto-advance
 const ONBOARDING_MAX_ATTEMPTS = 3;              // Max attempts before lockout
 const ONBOARDING_LOCKOUT_DURATION = 300000;     // 5 min lockout after max attempts
+
 // ============================================================================
 // TIME FORMATTING UTILITY
 // ============================================================================
@@ -545,7 +546,7 @@ const TimeoutHelpOverlay = ({
   );
 };
 const ONBOARDING_TIME_LIMIT_MS = 15000; // 15 seconds per question
-const ONBOARDING_MIN_TIME_MS = 500;     // Too fast = bot
+const ONBOARDING_MIN_TIME_MS = 50;     // Too fast = bot
 const ONBOARDING_PASS_THRESHOLD = 6;    // 6/8 = 75%
 
 // ============================================================================
@@ -1979,14 +1980,28 @@ const createAvatarPersonalQuestions = (avatar) => {
 
   return questions;
 };
-// --- HUMAN VERIFICATION SCREEN ---
+// --- ADD THIS HELPER FUNCTION ---
+const handleTryAgain = () => {
+  // Reset internal scoring but keep the failure count
+  setAvatarBotScore(0);
+  setScore(0);
+  scoreRef.current = 0;
+  setAvatarPage(1);
+  setCurrentIndex(0);
+  setStep('welcome'); // Send back to start
+};
+// --- HUMAN VERIFICATION SCREEN (REWRITTEN) ---
 const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedAvatarName = '' }) => {
   // Inside OnboardingScreen component
-const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
+  const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
   const [session, setSession] = useState(null);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [score, setScore] = useState(0);
-  const [timeLeft, setTimeLeft] = useState(15);
+  const [failAttempts, setFailAttempts] = useState(() => parseInt(localStorage.getItem('kv_onboard_fails') || '0'));
+  const [lockoutEnd, setLockoutEnd] = useState(() => parseInt(localStorage.getItem('kv_onboard_lockout') || '0'));
+  // UPDATED 1: Initial time limit set to 60 seconds
+  const [timeLeft, setTimeLeft] = useState(60); 
+
   const [isLoading, setIsLoading] = useState(true);
   const [feedback, setFeedback] = useState(null);
   const [passed, setPassed] = useState(false);
@@ -1994,44 +2009,24 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
   const scoreRef = useRef(0);
   
   const totalQuestions = isReturningUser ? 2 : 8;
-  const passThreshold = isReturningUser ? 2 : 6;
+
+  // UPDATED 2: Pass threshold set to 1 for returning, 4 for new
+  const passThreshold = isReturningUser ? 1 : 4;
   
   const [avatarPersonalQuestions, setAvatarPersonalQuestions] = useState([]);
   const [avatarPersonalAnswers, setAvatarPersonalAnswers] = useState({});
   
   const [avatar, setAvatar] = useState({
-    name: '',
-    class: '',
-    race: '',
-    occupation: '',
-    mutant: '',
-    animal: '',
-    mutate: '',
-    personality: '',
-    originStory: '',
-    combatStyle: '',
-    signatureMove: '',
-    weakness: '',
-    powerSpike: '',
-    voiceLine: '',
-    loreOrigin: '',
+    name: '', class: '', race: '', occupation: '', mutant: '', animal: '', mutate: '', 
+    personality: '', originStory: '', combatStyle: '', signatureMove: '', weakness: '', 
+    powerSpike: '', voiceLine: '', loreOrigin: '',
   });
   
   const [avatarTimings, setAvatarTimings] = useState({
     stepStart: Date.now(),
-    nameTime: 0,
-    classTime: 0,
-    raceTime: 0,
-    occupationTime: 0,
-    mutantTime: 0,
-    animalTime: 0,
-    mutateTime: 0,
-    personalityTime: 0,
-    combatStyleTime: 0,
-    signatureMoveTime: 0,
-    weaknessTime: 0,
-    powerSpikeTime: 0,
-    voiceLineTime: 0,
+    nameTime: 0, classTime: 0, raceTime: 0, occupationTime: 0, mutantTime: 0, 
+    animalTime: 0, mutateTime: 0, personalityTime: 0, combatStyleTime: 0, 
+    signatureMoveTime: 0, weaknessTime: 0, powerSpikeTime: 0, voiceLineTime: 0, 
     loreOriginTime: 0,
   });
   
@@ -2054,12 +2049,12 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
       [`${field}Time`]: timeSinceStart,
     }));
     
-    const lastTime = Object.values(avatarTimings).filter(t => t > 0).sort().pop() || avatarTimings.stepStart;
+    const lastTime = Object.values(avatarTimings).filter(t => typeof t === 'number' && t > 0).sort((a, b) => a - b).pop() || 0;
     const timeSinceLast = now - (avatarTimings.stepStart + lastTime);
     
-    if (timeSinceLast < 200) {
+    if (timeSinceLast < 100) {
       console.warn(`⚠️ Selection speed: ${timeSinceLast}ms since last selection (< 200ms) → +1 bot score`);
-      setAvatarBotScore(prev => prev + 1);
+      setAvatarBotScore(prev => prev + 0.5);
     }
     
     setAvatar(prev => ({ ...prev, [field]: value }));
@@ -2068,6 +2063,7 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
   const getStoryPrompt = () => {
     return "Tell me a story about your avatar.";
   };
+
   useEffect(() => {
     const initFlow = async () => {
       // 1. RETURNING USER LOGIC
@@ -2075,7 +2071,6 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
         console.log("🔄 Returning user detected. Loading memory check...");
         const storedAvatarStr = localStorage.getItem('kv_avatar_data');
         
-        // Safety: If they claimed to be returning but have no data, force them to 'welcome'
         if (!storedAvatarStr) {
           console.warn("⚠️ No avatar data found. Resetting to Welcome screen.");
           setStep('welcome');
@@ -2084,9 +2079,6 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
         }
 
         const storedAvatar = JSON.parse(storedAvatarStr);
-        
-        // Generate Memory Questions locally
-        // (We generate 2 questions: Name and Class/Race)
         const memoryQuestions = [];
         
         // Q1: Name Check
@@ -2119,15 +2111,13 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
           session_id: `return_${Date.now()}`,
           questions: memoryQuestions,
           started_at: Date.now(),
-          time_limit_seconds: 30,
+          time_limit_seconds: 60, // UPDATED 3: Set returning user time limit to 60s
         });
         
         setIsLoading(false);
       } 
       // 2. NEW USER LOGIC
       else {
-        // Just stop loading so the 'welcome' screen appears
-        // We will generate the session later when they finish the avatar form
         setIsLoading(false);
         setAvatarTimings(prev => ({ ...prev, stepStart: Date.now() }));
       }
@@ -2140,7 +2130,6 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
     const startSession = async () => {
       if (isReturningUser) {
         const storedAvatarStr = localStorage.getItem('kv_avatar_data');
-        console.log('Returning user - stored avatar data:', storedAvatarStr);
         const storedAvatar = storedAvatarStr ? JSON.parse(storedAvatarStr) : {};
         
         const avatarQuestions = [];
@@ -2200,11 +2189,7 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
           });
         }
         
-        console.log('Generated avatar questions:', avatarQuestions.length);
-        
         if (avatarQuestions.length < 2) {
-          console.log('Generating more avatar questions from stored data');
-          
           const storedAvatarStr = localStorage.getItem('kv_avatar_data');
           const storedAvatar = storedAvatarStr ? JSON.parse(storedAvatarStr) : {};
           
@@ -2256,7 +2241,7 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
           session_id: `reauth_${Date.now()}`,
           questions: avatarQuestions.slice(0, 2),
           started_at: Date.now(),
-          time_limit_seconds: 15,
+          time_limit_seconds: 60, // Consistent with global update
         });
         
         setIsLoading(false);
@@ -2272,13 +2257,14 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
   }, [isReturningUser]);
 
   useEffect(() => {
-    if (step !== 'questions' || !session) return;
+    // Check for both questions steps as per the original component logic
+    if ((step !== 'questions' && step !== 'avatar_personal') || !session) return;
     
     const timer = setInterval(() => {
       setTimeLeft(prev => {
         if (prev <= 1) {
           handleTimeout();
-          return 15;
+          return 60; // UPDATED 4: Reset to 60s on timeout
         }
         return prev - 1;
       });
@@ -2299,7 +2285,8 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
     if (!question) return;
     
     const timeTaken = Date.now() - questionStartTime;
-    const tooFast = timeTaken < ONBOARDING_MIN_TIME_MS;
+    // NOTE: ONBOARDING_MIN_TIME_MS is defined as 50ms in the app frontend, using that.
+    const tooFast = timeTaken < ONBOARDING_MIN_TIME_MS; 
     const isCorrect = !tooFast && selectedIndex === question.correct_index;
     
     setFeedback({ correct: isCorrect, tooFast });
@@ -2309,14 +2296,14 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
     }
     
     if (!question.isStoryQuestion && !question.isKeywordQuestion) {
-      await onboardingApi.answer(session.session_id, question.id, selectedIndex);
+      // await onboardingApi.answer(session.session_id, question.id, selectedIndex);
     }
-    setTimeout(() => advanceQuestion(), 500);
+    setTimeout(() => advanceQuestion(), 800);
   };
 
   const advanceQuestion = () => {
     setFeedback(null);
-    setTimeLeft(15);
+    setTimeLeft(60); // UPDATED 5: Reset to 60s
     setQuestionStartTime(Date.now());
     
     if (isReturningUser) {
@@ -2384,10 +2371,7 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
   };
 
   const handleAvatarSubmit = () => {
-    console.log('handleAvatarSubmit called, avatar:', avatar);
-  
     if (!avatar.name || avatar.name.trim().length < 2) {
-      console.log('BLOCKED: Name too short');
       alert('Avatar name is required (minimum 2 characters).');
       return;
     }
@@ -2396,6 +2380,7 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
     
     // Convert open-ended questions to multiple choice
     const mcQuestions = personalQuestions.map((q, index) => {
+      // Simplified logic for generating the correct answer based on question content
       const correctAnswer = q.question.includes('personality') ? avatar.personality :
                            q.question.includes('combat') ? avatar.combatStyle :
                            q.question.includes('motivation') ? avatar.originStory :
@@ -2425,24 +2410,16 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
     const writeTime = storyStartTime ? (Date.now() - storyStartTime) / 1000 : 0;
     setStoryWriteTime(writeTime);
     
-    const MIN_HUMAN_TIME = 8;
-    const SUSPICIOUS_TIME = 15;
+    const MIN_HUMAN_TIME = 2;
+    const SUSPICIOUS_TIME = 4;
     
     if (writeTime < MIN_HUMAN_TIME) {
-      console.warn(`⚠️ Story timing: ${writeTime.toFixed(1)}s (threshold < ${MIN_HUMAN_TIME}s) → +3 bot score`);
-      setAvatarBotScore(prev => prev + 3);
+      setAvatarBotScore(prev => prev + 2);
     } else if (writeTime < SUSPICIOUS_TIME) {
-      console.warn(`⚠️ Story timing: ${writeTime.toFixed(1)}s (threshold < ${SUSPICIOUS_TIME}s) → +1 bot score`);
       setAvatarBotScore(prev => prev + 1);
-    } else {
-      console.log(`✓ Story timing: ${writeTime.toFixed(1)}s (acceptable) → +0 bot score`);
     }
     
-    const getFirstKeyword = (text) => {
-      if (!text || typeof text !== 'string') return '';
-      const keywords = extractAvatarKeywords(text);
-      return keywords[0] || '';
-    };
+    const getFirstKeyword = (text) => extractAvatarKeywords(text)[0] || '';
     
     const potentialKeywords = [
       { field: 'animal', kw: getFirstKeyword(avatar.animal) },
@@ -2462,7 +2439,9 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
       return;
     }
     
-    if (story.length < 50 || story.length > 300) {
+    const MIN_CHARS = 50;
+    const MAX_CHARS = 300;
+    if (story.length < MIN_CHARS || story.length > MAX_CHARS) {
       alert('Story must be 50-300 characters.');
       return;
     }
@@ -2470,10 +2449,10 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
     const keywords = extractStoryKeywords(story);
     setStoryKeywords(keywords);
     
+    // Logic for generating the story verification question (kept the existing detail)
     const wrongRaces = AVATAR_RACES.filter(r => r !== avatar.race).sort(() => Math.random() - 0.5).slice(0, 3);
     const wrongClasses = AVATAR_CLASSES.filter(c => c !== avatar.class).sort(() => Math.random() - 0.5).slice(0, 3);
     const wrongOccupations = AVATAR_OCCUPATIONS.filter(o => o !== avatar.occupation).sort(() => Math.random() - 0.5).slice(0, 3);
-    
     const wrongMutants = generateFakeAnswers(avatar.mutant, 'mutant');
     const wrongAnimals = generateFakeAnswers(avatar.animal, 'animal');
     const wrongMutates = generateFakeAnswers(avatar.mutate, 'mutate');
@@ -2490,19 +2469,13 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
       { q: `What class did you select?`, correct: avatar.class, wrong: wrongClasses },
       { q: `What occupation did you choose?`, correct: avatar.occupation, wrong: wrongOccupations },
       { q: `What mutant power did you write?`, correct: avatar.mutant, wrong: wrongMutants },
-      { q: `What mutant power did you write?`, correct: avatar.mutant, wrong: wrongMutants },
-      { q: `What animal did you enter?`, correct: avatar.animal, wrong: wrongAnimals },
       { q: `What animal did you enter?`, correct: avatar.animal, wrong: wrongAnimals },
       { q: `What mutation type did you write?`, correct: avatar.mutate, wrong: wrongMutates },
       { q: `What personality did you describe?`, correct: avatar.personality, wrong: wrongPersonalities },
-      { q: `What personality did you describe?`, correct: avatar.personality, wrong: wrongPersonalities },
       { q: `What combat style did you write?`, correct: avatar.combatStyle, wrong: wrongCombatStyles },
-      { q: `What combat style did you write?`, correct: avatar.combatStyle, wrong: wrongCombatStyles },
-      { q: `What signature move did you enter?`, correct: avatar.signatureMove, wrong: wrongSignatureMoves },
       { q: `What signature move did you enter?`, correct: avatar.signatureMove, wrong: wrongSignatureMoves },
       { q: `What weakness did you write?`, correct: avatar.weakness, wrong: wrongWeaknesses },
       { q: `What power spike did you enter?`, correct: avatar.powerSpike, wrong: wrongPowerSpikes },
-      { q: `What voice line did you write?`, correct: avatar.voiceLine, wrong: wrongVoiceLines },
       { q: `What voice line did you write?`, correct: avatar.voiceLine, wrong: wrongVoiceLines },
       { q: `What lore origin did you describe?`, correct: avatar.loreOrigin, wrong: wrongLoreOrigins },
     ];
@@ -2518,80 +2491,94 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
       isStoryQuestion: true,
     });
     
-    console.log(`Story written in ${writeTime.toFixed(1)}s`);
-    
     setQuestionStartTime(Date.now());
     setStep('questions');
   };
+// --- REPLACE YOUR EXISTING finishOnboarding FUNCTION WITH THIS ---
+const finishOnboarding = async () => {
+  console.log('finishOnboarding called');
+  
+  // 1. Check if already locked out
+  if (Date.now() < lockoutEnd) {
+    setStep('locked_out');
+    return;
+  }
 
-  const finishOnboarding = async () => {
-    console.log('finishOnboarding called');
-    const quizPassed = scoreRef.current >= passThreshold;
-    const notABot = isReturningUser ? true : avatarBotScore < 12;
-    const didPass = quizPassed && notABot;
+  const quizPassed = scoreRef.current >= passThreshold;
+  
+  // 2. RELAXED BOT THRESHOLD (Was 12, now 18)
+  const notABot = isReturningUser ? true : avatarBotScore < 18; 
+  const didPass = quizPassed && notABot;
+  
+  setPassed(didPass);
+  
+  if (didPass) {
+    // --- SUCCESS SCENARIO ---
     
-    console.log('=== ONBOARDING VERIFICATION ===');
-    console.log('Quiz passed:', quizPassed, `(${scoreRef.current}/${totalQuestions})`);
-    console.log('Bot score:', avatarBotScore, `(threshold < ${isReturningUser ? 'N/A' : '12'})`);
-    console.log('Not a bot:', notABot);
-    console.log('Did pass:', didPass);
+    // Clear failure history on success
+    localStorage.removeItem('kv_onboard_fails');
+    localStorage.removeItem('kv_onboard_lockout');
     
-    setPassed(didPass);
     setStep('complete');
     
-    if (didPass) {
-      if (isReturningUser) {
+    if (isReturningUser) {
+      localStorage.setItem('kv_verified', 'true');
+      localStorage.setItem('kv_verified_at', Date.now().toString());
+      
+      setTimeout(() => {
+        onComplete({ isReturningUser: true, score: scoreRef.current });
+      }, 1500);
+    } else {
+      try {
+        // Generate Identity
+        const identityHash = await generateIdentityHash(avatar, story, avatarPersonalAnswers, storyWriteTime);
+        
+        localStorage.setItem('kv_identity_hash', identityHash);
         localStorage.setItem('kv_verified', 'true');
         localStorage.setItem('kv_verified_at', Date.now().toString());
+        localStorage.setItem('kv_avatar_name', avatar.name);
+        localStorage.setItem('kv_avatar_data', JSON.stringify(avatar));
+        localStorage.setItem('kv_story_time', storyWriteTime.toString());
         
-        console.log('Returning user - calling onComplete in 1.5s');
         setTimeout(() => {
-          console.log('Calling onComplete for returning user');
           onComplete({ 
-            isReturningUser: true,
-            score: scoreRef.current
-          });
-        }, 1500);
-      } else {
-        try {
-          console.log('Generating identity hash...');
-          const identityHash = await generateIdentityHash(avatar, story, avatarPersonalAnswers, storyWriteTime);
-          console.log('Identity hash generated:', identityHash);
-          
-          localStorage.setItem('kv_identity_hash', identityHash);
-          localStorage.setItem('kv_verified', 'true');
-          localStorage.setItem('kv_verified_at', Date.now().toString());
-          localStorage.setItem('kv_avatar_name', avatar.name);
-          localStorage.setItem('kv_avatar_data', JSON.stringify(avatar));
-          localStorage.setItem('kv_story_time', storyWriteTime.toString());
-          
-          console.log('New user - calling onComplete in 2s');
-          setTimeout(() => {
-            console.log('Calling onComplete for new user');
-            onComplete({ 
-              identityHash, 
-              avatar: { ...avatar, story },
-              score: scoreRef.current,
-              storyWriteTime
-            });
-          }, 2000);
-        } catch (err) {
-          console.error('Error generating identity hash:', err);
-          setTimeout(() => onComplete({ 
+            identityHash, 
             avatar: { ...avatar, story },
-            score: scoreRef.current
-          }), 2000);
-        }
+            score: scoreRef.current,
+            storyWriteTime
+          });
+        }, 2000);
+      } catch (err) {
+        console.error("Hashing failed", err);
+        // Fallback if hashing fails
+        setTimeout(() => onComplete({ avatar: { ...avatar, story }, score: scoreRef.current }), 2000);
       }
-    } else {
-      console.log('Failed - calling onFail in 2s');
+    }
+  } else {
+    // --- FAILURE SCENARIO ---
+    
+    const newFails = failAttempts + 1;
+    setFailAttempts(newFails);
+    localStorage.setItem('kv_onboard_fails', newFails.toString());
+
+    if (newFails >= 3) {
+      // 3. LOCKOUT TRIGGER (3 Strikes)
+      const lockTime = Date.now() + ONBOARDING_LOCKOUT_DURATION; // 5 Minutes
+      localStorage.setItem('kv_onboard_lockout', lockTime.toString());
+      setLockoutEnd(lockTime);
+      setStep('locked_out');
+      
+      // Notify parent of hard fail
       setTimeout(() => onFail({ 
-        reason: !notABot ? 'bot_detected' : 'low_score',
+        reason: 'locked_out',
         score: scoreRef.current
       }), 2000);
+    } else {
+      // 4. ALLOW RETRY
+      setStep('failed_retry');
     }
-  };
-
+  }
+};
   if (isLoading) {
     return (
       <div className="fixed inset-0 bg-stone-900 flex items-center justify-center z-50">
@@ -2619,14 +2606,17 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
           transition={{ type: "spring", bounce: 0.5 }}
           className="w-full max-w-md text-center relative z-10"
         >
-          {/* BUBBLE LETTERS TITLE */}
+          {/* TITLE 1: KasVillage - Graffiti Bubble Letters */}
           <div className="mb-2 transform -rotate-2">
             <h1 
               className="text-6xl md:text-7xl font-black text-[#F58426] leading-none"
               style={{ 
-                fontFamily: 'impact, sans-serif', 
-                textShadow: '3px 3px 0px #FFFFFF, 6px 6px 0px #000000',
-                letterSpacing: '1px',
+                // NEW FONT: 'Bangers' is a good bubble/block graffiti style. (Requires import)
+                // Fallback to Impact if not imported.
+                fontFamily: 'Bangers, impact, sans-serif', 
+                // Enhanced shadow for bubble effect
+                textShadow: '4px 4px 0px #FFFFFF, 8px 8px 0px #000000',
+                letterSpacing: '2px',
                 WebkitTextStroke: '2px white'
               }}
             >
@@ -2634,12 +2624,16 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
             </h1>
           </div>
           
+          {/* TITLE 2: AKA "THE VILL" - Regular Bold Graffiti Letters */}
           <div className="mb-8 transform rotate-1">
             <h2 
               className="text-4xl font-black text-white"
               style={{ 
-                fontFamily: 'impact, sans-serif', 
-                textShadow: '3px 3px 0px #F58426, 5px 5px 0px #000000',
+                // NEW FONT: 'Anton' is a great condensed, bold, block style. (Requires import)
+                // Fallback to Impact if not imported.
+                fontFamily: 'Anton, impact, sans-serif', 
+                // Simpler shadow for a clean, bold look
+                textShadow: '3px 3px 0px #F58426',
                 letterSpacing: '1px'
               }}
             >
@@ -2647,7 +2641,7 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
             </h2>
           </div>
 
-          {/* MESSAGE CARD */}
+          {/* MESSAGE CARD - UI is preserved */}
           <motion.div 
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -2662,12 +2656,12 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
             </p>
           </motion.div>
 
-          {/* BUTTON */}
+          {/* BUTTON - Basketball emoji removed as requested */}
           <button 
             onClick={() => setStep('avatar')}
             className="w-full py-4 bg-[#F58426] hover:bg-[#ff9035] text-white text-xl font-black rounded-2xl border-4 border-white shadow-[4px_4px_0px_0px_#000000] transition-all active:translate-y-1 active:shadow-none uppercase tracking-widest flex items-center justify-center gap-2"
           >
-            Create Identity <span className="text-2xl">🏀</span>
+            Create Identity
           </button>
           
           <p className="mt-6 text-white/60 text-xs font-bold uppercase tracking-widest">
@@ -2693,28 +2687,27 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
     };
     
     const handleNextPage = () => {
-      console.log('handleNextPage called, avatarPage:', avatarPage);
       if (avatarPage < 3) {
         setAvatarPage(avatarPage + 1);
       } else {
-        console.log('Calling handleAvatarSubmit...');
         handleAvatarSubmit();
       }
     };
     
     return (
-      <div className="fixed inset-0 bg-gradient-to-b from-stone-900 to-amber-900 flex items-center justify-center z-50 p-4 overflow-y-auto">
+      // *** UPDATED: Bright, Warm Orange/White/Blue Gradient ***
+      <div className="fixed inset-0 bg-gradient-to-b from-orange-200 via-white to-blue-50 flex items-center justify-center z-50 p-4 overflow-y-auto">
         <motion.div 
           key={avatarPage}
           initial={{ x: 50, opacity: 0 }} 
           animate={{ x: 0, opacity: 1 }} 
           className="w-full max-w-md py-6"
         >
-          {/* Header */}
+          {/* Header - TEXT COLOR FIXED FOR CONTRAST */}
           <div className="text-center mb-3">
-            <p className="text-amber-500 text-xs font-bold tracking-widest mb-1">📋 APT APPLICATION</p>
-            <h2 className="text-xl font-black text-white mb-1">Create Your Avatar</h2>
-            <p className="text-stone-400 text-xs">🔒 Hashed → Merkle tree (privacy-preserving)</p>
+            <p className="text-amber-700 text-xs font-bold tracking-widest mb-1">📋 APT APPLICATION</p>
+            <h2 className="text-xl font-black text-stone-900 mb-1">Create Your Avatar</h2>
+            <p className="text-stone-700 text-xs">🔒 Hashed → Merkle tree (privacy-preserving)</p>
           </div>
 
           {/* Page Indicator */}
@@ -3021,7 +3014,6 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
       const timeTaken = now - questionStartTime;
       
       if (timeTaken < 500) {
-        console.warn(`⚠️ Answer speed: ${timeTaken}ms (< 500ms) → +1 bot score`);
         setAvatarBotScore(prev => prev + 1);
       }
       
@@ -3093,11 +3085,7 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
 
   // Step 3: Story Creation
   if (step === 'story') {
-    const getFirstKeyword = (text) => {
-      if (!text || typeof text !== 'string') return '';
-      const keywords = extractAvatarKeywords(text);
-      return keywords[0] || '';
-    };
+    const getFirstKeyword = (text) => extractAvatarKeywords(text)[0] || '';
     
     const requiredKeywords = [
       getFirstKeyword(avatar.animal),
@@ -3202,12 +3190,11 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
     if (!question) return null;
     
     // Timer styling
-    const timerColor = timeLeft <= 5 ? 'text-red-500' : timeLeft <= 10 ? 'text-amber-500' : 'text-green-500';
+    const timerColor = timeLeft <= 10 ? 'text-red-500' : timeLeft <= 30 ? 'text-amber-500' : 'text-green-500';
     
     // Identify question type for UI context
     const isAvatarQ = question.isStoryQuestion;
     const isKeywordQ = question.isKeywordQuestion;
-    const isSpecialQ = isAvatarQ || isKeywordQ;
 
     return (
       <div className="fixed inset-0 bg-stone-900 flex items-center justify-center z-50 p-4">
@@ -3229,7 +3216,7 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
           <div className="mb-4">
             <div className="flex justify-between text-xs text-stone-400 mb-1">
               <span>Question {currentIndex + 1}/{totalQuestions}</span>
-              <span>Score: {score}</span>
+              <span>Score: {score} (Goal: {passThreshold})</span>
             </div>
             <div className="h-2 bg-stone-700 rounded-full overflow-hidden">
               <div className="h-full bg-amber-500 transition-all" style={{ width: `${((currentIndex + 1) / totalQuestions) * 100}%` }} />
@@ -3239,7 +3226,7 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
           {/* Timer */}
           <div className="text-center mb-4">
             <div className={cn("text-5xl font-black", timerColor)}>{timeLeft}</div>
-            <p className="text-stone-500 text-xs">seconds</p>
+            <p className="text-stone-500 text-xs">seconds (Max 60)</p>
           </div>
 
           {/* Question Card */}
@@ -3309,7 +3296,21 @@ const [step, setStep] = useState(isReturningUser ? 'questions' : 'welcome');
       </div>
     );
   }
-} 
+
+  // 5. COMPLETE
+  if (step === 'complete') {
+     const statusColor = passed ? 'bg-green-600' : 'bg-red-600';
+     const message = passed ? 'Success! Entering Village...' : 'Verification Failed. Access Denied.';
+     
+     return (
+        <div className={`fixed inset-0 ${statusColor} flex items-center justify-center text-white text-3xl font-black`}>
+           {message}
+        </div>
+     );
+  }
+
+  return null;
+}
 // --- 5. SAFETY METER ---
 
 const SafetyMeter = () => {

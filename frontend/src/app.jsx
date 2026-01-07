@@ -254,11 +254,19 @@ const AVATAR_LORE_ORIGINS = [
   'Reformed villain seeking redemption'
 ];
 
-// Identity Hash: Avatar + Story → SHA256 → Merkle Tree
+// Locate generateIdentityHash (around line 304)
+
 // --- FIX: Add personalAnswers to parameters ---
 const generateIdentityHash = async (avatar, story, personalAnswers, storyWriteTime = 0) => {
   try {
     const storyHash = await sha256Hash(story || '');
+    
+    // Convert object to sorted array of values for consistent hashing
+    // This ensures that the order of questions doesn't change the final hash.
+    const personalAnswersString = JSON.stringify(
+        Object.keys(personalAnswers).sort().map(key => personalAnswers[key])
+    );
+    
     const identityData = JSON.stringify({
       name: avatar?.name || '',
       class: avatar?.class || '',
@@ -277,7 +285,7 @@ const generateIdentityHash = async (avatar, story, personalAnswers, storyWriteTi
       loreOrigin: avatar?.loreOrigin || '',
       storyHash,
       writeTimeRange: storyWriteTime < 15 ? 'fast' : storyWriteTime < 45 ? 'normal' : 'slow',
-      personalAnswers, // This now references the argument correctly
+      personalAnswers: personalAnswersString, // Hash includes the open-ended text content
     });
     return await sha256Hash(identityData);
   } catch (err) {
@@ -546,8 +554,8 @@ const TimeoutHelpOverlay = ({
   );
 };
 const ONBOARDING_TIME_LIMIT_MS = 15000; // 15 seconds per question
-const ONBOARDING_MIN_TIME_MS = 50;     // Too fast = bot
-const ONBOARDING_PASS_THRESHOLD = 6;    // 6/8 = 75%
+const ONBOARDING_MIN_TIME_MS = 500;     // Too fast = bot
+const ONBOARDING_PASS_THRESHOLD = 5;    // 6/8 = 75%
 
 // ============================================================================
 // QUESTION UTILITY: Expand 4 options → 8 options + shuffle for variety
@@ -1738,6 +1746,7 @@ export const AppProvider = ({ children }) => {
   // Determine if they are returning based on local storage data
   const [isReturningUser, setIsReturningUser] = useState(hasAvatarData);
 
+  const [showBridge, setShowBridge] = useState(false); // <--- ADD THIS STATE FOR THE BRIDGE
   // ---------------------------------------------------------
   // 2. OTHER STATE (Standard)
   // ---------------------------------------------------------
@@ -1794,9 +1803,9 @@ export const AppProvider = ({ children }) => {
     if (!localStorage.getItem('clickwrap_signature')) setShowClickwrap(true);
   };
 
+  // --- UPDATED handleHumanVerified to use the Bridge ---
   const handleHumanVerified = (result) => {
-    // 1. Mark as verified in storage
-    localStorage.setItem('kv_verified', 'true');
+    // 1. Mark as verified in storage (done in OnboardingScreen but good to ensure)
     
     // 2. Save identity if it's a new user
     if (result?.identityHash) {
@@ -1808,13 +1817,19 @@ export const AppProvider = ({ children }) => {
       localStorage.setItem('kv_avatar_name', result.avatar.name);
     }
     
-    // 3. Close Onboarding -> Open Dashboard
+    // 3. Close Onboarding -> Open Bridge Screen
     setShowHumanVerification(false);
-    login();
+    setShowBridge(true); // <--- CRITICAL: OPEN THE BRIDGE
   };
   
   const handleHumanVerificationFailed = () => {
     alert('Verification failed. Please try again.');
+  };
+  
+  // --- NEW HANDLER TO COMPLETE THE BRIDGE AND LOG IN ---
+  const handleBridgeComplete = () => {
+    setShowBridge(false); // Close the bridge screen
+    login();             // Triggers isAuthenticated=true
   };
   
   // DEBUG TOOL: Call this to reset everything and see the Knicks screen
@@ -1887,7 +1902,12 @@ export const AppProvider = ({ children }) => {
       isReturningUser, 
       identityHash, avatarName, resetVerification,
       verifiedL1Wallet, setVerifiedL1Wallet,
-      hostNodes, setHostNodes, coupons, setCoupons, dapps, setDapps
+      hostNodes, setHostNodes, coupons, setCoupons, dapps, setDapps,
+      
+      // CRITICAL ADDITIONS: Exporting the bridge state and handler
+      showBridge, 
+      handleBridgeComplete,
+      
     }}>
       {children}
     </GlobalContext.Provider>
@@ -1980,16 +2000,7 @@ const createAvatarPersonalQuestions = (avatar) => {
 
   return questions;
 };
-// --- ADD THIS HELPER FUNCTION ---
-const handleTryAgain = () => {
-  // Reset internal scoring but keep the failure count
-  setAvatarBotScore(0);
-  setScore(0);
-  scoreRef.current = 0;
-  setAvatarPage(1);
-  setCurrentIndex(0);
-  setStep('welcome'); // Send back to start
-};
+
 // --- HUMAN VERIFICATION SCREEN (REWRITTEN) ---
 const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedAvatarName = '' }) => {
   // Inside OnboardingScreen component
@@ -2007,8 +2018,7 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
   const [passed, setPassed] = useState(false);
   const [questionStartTime, setQuestionStartTime] = useState(Date.now());
   const scoreRef = useRef(0);
-  
-  const totalQuestions = isReturningUser ? 2 : 8;
+  const [totalQuestions, setTotalQuestions] = useState(isReturningUser ? 2 : 8); 
 
   // UPDATED 2: Pass threshold set to 1 for returning, 4 for new
   const passThreshold = isReturningUser ? 1 : 4;
@@ -2022,13 +2032,17 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
     powerSpike: '', voiceLine: '', loreOrigin: '',
   });
   
-  const [avatarTimings, setAvatarTimings] = useState({
-    stepStart: Date.now(),
-    nameTime: 0, classTime: 0, raceTime: 0, occupationTime: 0, mutantTime: 0, 
-    animalTime: 0, mutateTime: 0, personalityTime: 0, combatStyleTime: 0, 
-    signatureMoveTime: 0, weaknessTime: 0, powerSpikeTime: 0, voiceLineTime: 0, 
-    loreOriginTime: 0,
-  });
+ 
+  // Inside OnboardingScreen component (around line 800)
+
+const [avatarTimings, setAvatarTimings] = useState({
+  // stepStart: Date.now(), // <-- REMOVE: This is the source of the calculation error
+  lastSelectionTime: Date.now(), // <--- NEW: Track the single last update time
+  nameTime: 0, classTime: 0, raceTime: 0, occupationTime: 0, mutantTime: 0, 
+  animalTime: 0, mutateTime: 0, personalityTime: 0, combatStyleTime: 0, 
+  signatureMoveTime: 0, weaknessTime: 0, powerSpikeTime: 0, voiceLineTime: 0, 
+  loreOriginTime: 0,
+});
   
   const [avatarBotScore, setAvatarBotScore] = useState(0);
   const [avatarPage, setAvatarPage] = useState(1);
@@ -2040,26 +2054,42 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
   const [storyWriteTime, setStoryWriteTime] = useState(0);
   const [verifyQuestion, setVerifyQuestion] = useState(null);
 
-  const trackAvatarSelection = (field, value) => {
-    const now = Date.now();
-    const timeSinceStart = now - avatarTimings.stepStart;
-    
-    setAvatarTimings(prev => ({
-      ...prev,
-      [`${field}Time`]: timeSinceStart,
-    }));
-    
-    const lastTime = Object.values(avatarTimings).filter(t => typeof t === 'number' && t > 0).sort((a, b) => a - b).pop() || 0;
-    const timeSinceLast = now - (avatarTimings.stepStart + lastTime);
-    
-    if (timeSinceLast < 100) {
-      console.warn(`⚠️ Selection speed: ${timeSinceLast}ms since last selection (< 200ms) → +1 bot score`);
-      setAvatarBotScore(prev => prev + 0.5);
-    }
-    
-    setAvatar(prev => ({ ...prev, [field]: value }));
-  };
+  // Inside OnboardingScreen component (around line 820)
+// ▼▼▼ ADD THIS FUNCTION BEFORE trackAvatarSelection ▼▼▼
+const handleTryAgain = () => {
+  setAvatarBotScore(0);
+  setScore(0);
+  scoreRef.current = 0;
+  setAvatarPage(1);
+  setCurrentIndex(0);
+  setStep('welcome');
+};
 
+const trackAvatarSelection = (field, value) => {
+  const now = Date.now();
+  const lastTime = avatarTimings.lastSelectionTime; // Get the previous time
+  
+  // Check time elapsed since the last selection
+  const timeSinceLast = now - lastTime;
+  
+  // LOGIC FIX: The calculation now uses only positive integers (now - previous time)
+  if (timeSinceLast <90) { 
+    console.warn(`⚠️ Selection speed: ${timeSinceLast}ms since last selection (< 90ms) → +0.5 bot score`);
+    setAvatarBotScore(prev => prev + 0.5);
+  }
+  
+  // Atomically update the avatar and the last selection time
+  setAvatar(prev => ({ ...prev, [field]: value }));
+  
+  // CRITICAL: Set a single, consistent marker for the next update
+  setAvatarTimings(prev => ({
+      ...prev,
+      lastSelectionTime: now, // <-- Update the single reference point for the next calculation
+      // Ensure to still save the individual field time if needed for other checks, 
+      // but for speed, the single reference is safer.
+      [`${field}Time`]: now - avatarTimings.stepStart // (or similar data if needed)
+  }));
+};
   const getStoryPrompt = () => {
     return "Tell me a story about your avatar.";
   };
@@ -2369,42 +2399,106 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
     }
     return session?.questions?.[currentIndex];
   };
+  // Inside handleAvatarSubmit function (around line 905)
 
-  const handleAvatarSubmit = () => {
-    if (!avatar.name || avatar.name.trim().length < 2) {
-      alert('Avatar name is required (minimum 2 characters).');
-      return;
-    }
-  
-    const personalQuestions = createAvatarPersonalQuestions(avatar);
+const handleAvatarSubmit = () => {
+  const storedAvatar = avatar;
+
+  if (!storedAvatar.name || storedAvatar.name.trim().length < 2) {
+    alert('Avatar name is required (minimum 2 characters).');
+    return;
+  }
+
+    const quizQuestions = [];
     
-    // Convert open-ended questions to multiple choice
-    const mcQuestions = personalQuestions.map((q, index) => {
-      // Simplified logic for generating the correct answer based on question content
-      const correctAnswer = q.question.includes('personality') ? avatar.personality :
-                           q.question.includes('combat') ? avatar.combatStyle :
-                           q.question.includes('motivation') ? avatar.originStory :
-                           q.question.includes('learning') ? avatar.powerSpike :
-                           q.question.includes('social') ? avatar.voiceLine :
-                           avatar.weakness;
-      
-      const wrongAnswers = generateFakeAnswers(correctAnswer, 'general');
-      const options = [correctAnswer, ...wrongAnswers].sort(() => Math.random() - 0.5);
-      
-      return {
-        ...q,
-        options: options,
-        correct_index: options.indexOf(correctAnswer),
-        isAvatarQuestion: true,
-      };
+    // --- 1. Define ALL 13 Avatar Fields for Quiz Generation ---
+    const allAvatarFields = [
+        // FIXED-OPTION FIELDS (Simpler to generate wrong answers)
+        { key: 'class', q: 'What class did you choose?', pool: AVATAR_CLASSES, type: 'fixed' },
+        { key: 'race', q: 'What race did you select?', pool: AVATAR_RACES, type: 'fixed' },
+        { key: 'occupation', q: 'What occupation did you pick?', pool: AVATAR_OCCUPATIONS, type: 'fixed' },
+        { key: 'personality', q: 'What personality did you choose?', pool: AVATAR_PERSONALITIES, type: 'fixed' },
+        
+        // OPEN-ENDED TEXT FIELDS (Require keyword/phrase extraction for false answers)
+        { key: 'mutant', q: 'What Mutant Power did you enter?', pool: AVATAR_MUTANTS, type: 'open' },
+        { key: 'animal', q: 'What Animal did you choose?', pool: AVATAR_ANIMALS, type: 'open' },
+        { key: 'mutate', q: 'What Mutation Type did you specify?', pool: AVATAR_MUTATES, type: 'open' },
+        { key: 'originStory', q: 'What Origin Story did you write?', type: 'open_text' }, // Requires longer input
+        { key: 'combatStyle', q: 'What Combat Style did you describe?', pool: AVATAR_COMBAT_STYLES, type: 'open' },
+        { key: 'signatureMove', q: 'What Signature Move did you enter?', pool: AVATAR_SIGNATURE_MOVES, type: 'open' },
+        { key: 'weakness', q: 'What Weakness did you list?', pool: AVATAR_WEAKNESSES, type: 'open' },
+        { key: 'powerSpike', q: 'When is your Avatar\'s Power Spike?', pool: AVATAR_POWER_SPIKES, type: 'open' },
+        { key: 'voiceLine', q: 'What Voice Line did you enter?', pool: AVATAR_VOICE_LINES, type: 'open' },
+    ];
+    
+    // --- 2. Build Quiz from ONLY fields the user filled out ---
+    const availableFields = allAvatarFields.filter(field => 
+        // Must have data and be at least 2 characters long
+        storedAvatar[field.key] && storedAvatar[field.key].trim().length > 1
+    );
+
+    // Limit the quiz length to a reasonable amount (e.g., max 8 questions)
+    const fieldsToQuiz = availableFields.sort(() => Math.random() - 0.5).slice(0, 8);
+
+    fieldsToQuiz.forEach(field => {
+        const correctAnswer = storedAvatar[field.key];
+        let wrongAnswers = [];
+
+        if (field.type === 'fixed') {
+            // For fixed pools (Class, Race, etc.), filter out the correct answer
+            wrongAnswers = field.pool.filter(opt => opt !== correctAnswer).sort(() => Math.random() - 0.5).slice(0, 3);
+        } else {
+            // For open-ended fields (Combat Style, Mutant, etc.), use the safe generator
+            // Fallback to pool if the open-ended input matches a pool option
+            const pool = field.pool || AVATAR_PERSONALITIES; 
+            const isMatch = pool.includes(correctAnswer);
+
+            if (isMatch) {
+                wrongAnswers = pool.filter(opt => opt !== correctAnswer).sort(() => Math.random() - 0.5).slice(0, 3);
+            } else {
+                // Generate plausible but incorrect answers
+                wrongAnswers = generateFakeAnswers(correctAnswer, field.key).slice(0, 3);
+            }
+        }
+        
+        // Ensure options always has 4 elements
+        const options = [correctAnswer, ...wrongAnswers].slice(0, 4).sort(() => Math.random() - 0.5);
+
+        quizQuestions.push({
+            id: `quiz_${field.key}`,
+            question: field.q,
+            options: options,
+            correct_index: options.indexOf(correctAnswer),
+            isAvatarQuestion: true,
+        });
     });
+
+    // --- 3. Enforce Minimum Quiz Length ---
+    if (quizQuestions.length < 2) {
+        alert('Security Alert: Please fill out at least 2 Avatar Characteristics (e.g., Name and Class) to create a robust identity quiz.');
+        return;
+    }
     
-    setAvatarPersonalQuestions(mcQuestions);
+    // --- 4. Start the Quiz ---
+    setSession(prev => ({
+        ...prev,
+        questions: quizQuestions, // Set the newly generated memory quiz
+        started_at: Date.now(),
+    }));
+    
+    // Reset Story/Personal Answer state (since we are skipping those steps)
+    setStory('');
+    setStoryWriteTime(0);
     setAvatarPersonalAnswers({});
+    
     setCurrentIndex(0);
+    // CRITICAL: Set totalQuestions to the number of memory questions
+    setTotalQuestions(quizQuestions.length); 
+    
     setQuestionStartTime(Date.now());
-    setStep('avatar_personal');
-  };
+    setStep('questions'); // Jump straight to the consolidated memory quiz
+};
+  
 
   const handleStorySubmit = () => {
     const writeTime = storyStartTime ? (Date.now() - storyStartTime) / 1000 : 0;
@@ -2495,6 +2589,7 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
     setStep('questions');
   };
 // --- REPLACE YOUR EXISTING finishOnboarding FUNCTION WITH THIS ---
+// --- REPLACE YOUR EXISTING finishOnboarding FUNCTION WITH THIS ---
 const finishOnboarding = async () => {
   console.log('finishOnboarding called');
   
@@ -2505,9 +2600,8 @@ const finishOnboarding = async () => {
   }
 
   const quizPassed = scoreRef.current >= passThreshold;
-  
-  // 2. RELAXED BOT THRESHOLD (Was 12, now 18)
-  const notABot = isReturningUser ? true : avatarBotScore < 18; 
+  // This is the core logic: True if not enough quick answers, False if too many were fast.
+  const notABot = avatarBotScore < 18; 
   const didPass = quizPassed && notABot;
   
   setPassed(didPass);
@@ -2521,38 +2615,32 @@ const finishOnboarding = async () => {
     
     setStep('complete');
     
-    if (isReturningUser) {
-      localStorage.setItem('kv_verified', 'true');
-      localStorage.setItem('kv_verified_at', Date.now().toString());
-      
-      setTimeout(() => {
-        onComplete({ isReturningUser: true, score: scoreRef.current });
-      }, 1500);
-    } else {
-      try {
-        // Generate Identity
-        const identityHash = await generateIdentityHash(avatar, story, avatarPersonalAnswers, storyWriteTime);
+    try {
+        // Generate Identity & Store Data
+        // NOTE: Since the old 'story' and 'personalAnswers' steps are removed, 
+        // they are passed as empty, but the function is required for identityHash.
+        const identityHash = await generateIdentityHash(avatar, '', {}, 0); 
         
         localStorage.setItem('kv_identity_hash', identityHash);
         localStorage.setItem('kv_verified', 'true');
         localStorage.setItem('kv_verified_at', Date.now().toString());
         localStorage.setItem('kv_avatar_name', avatar.name);
         localStorage.setItem('kv_avatar_data', JSON.stringify(avatar));
-        localStorage.setItem('kv_story_time', storyWriteTime.toString());
         
+        // CRITICAL FIX: Signal completion via the prop immediately
         setTimeout(() => {
-          onComplete({ 
-            identityHash, 
-            avatar: { ...avatar, story },
-            score: scoreRef.current,
-            storyWriteTime
-          });
-        }, 2000);
-      } catch (err) {
-        console.error("Hashing failed", err);
-        // Fallback if hashing fails
-        setTimeout(() => onComplete({ avatar: { ...avatar, story }, score: scoreRef.current }), 2000);
-      }
+           onComplete({ // This calls handleHumanVerified, which sets showBridge=true
+              identityHash, 
+              avatar: { ...avatar, story: '' },
+              score: scoreRef.current,
+              storyWriteTime: 0
+            });
+        }, 1500); // Wait for the success animation
+        
+    } catch (err) {
+      console.error("Hashing failed", err);
+      // Fallback if hashing fails
+      setTimeout(() => onComplete({ avatar: { ...avatar, story: '' }, score: scoreRef.current }), 2000);
     }
   } else {
     // --- FAILURE SCENARIO ---
@@ -2575,7 +2663,15 @@ const finishOnboarding = async () => {
       }), 2000);
     } else {
       // 4. ALLOW RETRY
-      setStep('failed_retry');
+      
+      // Set a generic 'failed' step to show the message, then redirect to 'welcome'
+      setStep('failed'); 
+      
+      setTimeout(() => {
+        // We use a small timeout to let the user see the failure screen
+        handleTryAgain(); // <--- Calls the reset utility to go to 'welcome'
+        // alert(`Verification Failed. You have ${3 - newFails} attempt(s) remaining.`); // Alert is now inside the failed screen
+      }, 2000); 
     }
   }
 };
@@ -2590,6 +2686,28 @@ const finishOnboarding = async () => {
       </div>
     );
   }
+ // --- NEW FAILURE/RETRY SCREEN (REQUIRED FOR FLOW FIX) ---
+ if (step === 'failed') {
+  return (
+      <motion.div 
+          key="failed_message" 
+          initial={{ opacity: 0 }} 
+          animate={{ opacity: 1 }} 
+          className="fixed inset-0 bg-red-900/90 flex items-center justify-center z-50 p-4"
+      >
+          <div className="bg-white rounded-2xl p-6 text-center max-w-sm shadow-2xl">
+              <AlertTriangle className="w-12 h-12 text-red-600 mx-auto mb-4"/>
+              <h3 className="text-xl font-black text-stone-800 mb-2">Verification Failed</h3>
+              <p className="text-sm text-stone-600 mb-4">
+                  Your identity check did not pass. You will be redirected to try again.
+              </p>
+              <div className="text-xs text-red-700 font-bold">
+                  {ONBOARDING_MAX_ATTEMPTS - failAttempts} attempt(s) remaining before lockout.
+              </div>
+          </div>
+      </motion.div>
+  );
+}
 // ============================================================
   // WELCOME SCREEN (THE VILL) - KNICKS THEME
   // ============================================================
@@ -2999,190 +3117,6 @@ const finishOnboarding = async () => {
     );
   }
 
-  // Step 2: Avatar Personal Questions
-  if (step === 'avatar_personal') {
-    const currentQuestion = avatarPersonalQuestions[currentIndex];
-    const totalPersonalQuestions = avatarPersonalQuestions.length;
-    
-    const handlePersonalAnswer = (selectedIndex) => {
-      setAvatarPersonalAnswers(prev => ({
-        ...prev,
-        [currentQuestion.id]: selectedIndex
-      }));
-      
-      const now = Date.now();
-      const timeTaken = now - questionStartTime;
-      
-      if (timeTaken < 500) {
-        setAvatarBotScore(prev => prev + 1);
-      }
-      
-      setTimeout(() => {
-        if (currentIndex < totalPersonalQuestions - 1) {
-          setCurrentIndex(prev => prev + 1);
-          setQuestionStartTime(Date.now());
-        } else {
-          setStoryStartTime(Date.now());
-          setStep('story');
-        }
-      }, 300);
-    };
-    
-    return (
-      <div className="fixed inset-0 bg-gradient-to-b from-stone-900 to-purple-900 flex items-center justify-center z-50 p-4">
-        <motion.div 
-          key={currentIndex}
-          initial={{ x: 50, opacity: 0 }}
-          animate={{ x: 0, opacity: 1 }}
-          className="w-full max-w-md"
-        >
-          <div className="text-center mb-4">
-            <h2 className="text-xl font-black text-white mb-1">
-              Personality Profile
-            </h2>
-            <p className="text-purple-200 text-sm">
-              Question {currentIndex + 1} of {totalPersonalQuestions}
-            </p>
-          </div>
-          
-          <div className="mb-4">
-            <div className="h-2 bg-stone-700 rounded-full overflow-hidden">
-              <div className="h-full bg-purple-500 transition-all" 
-                style={{ width: `${((currentIndex + 1) / totalPersonalQuestions) * 100}%` }} />
-            </div>
-          </div>
-          
-          <div className="bg-stone-800 rounded-2xl p-6 mb-4">
-            <p className="text-white text-lg font-bold text-center mb-6">
-              {currentQuestion?.question}
-            </p>
-            
-            <div className="space-y-3">
-              {currentQuestion?.options?.map((option, idx) => (
-                <button
-                  key={idx}
-                  onClick={() => handlePersonalAnswer(idx)}
-                  className="w-full p-4 bg-stone-700 hover:bg-purple-600 text-white rounded-xl font-bold text-sm transition-all hover:scale-105 active:scale-95 text-left"
-                >
-                  {option}
-                </button>
-              ))}
-            </div>
-          </div>
-          
-          <div className="text-center">
-            <p className="text-xs text-stone-400">
-              These answers help create your unique avatar fingerprint
-            </p>
-            <p className="text-[10px] text-stone-500 mt-1">
-              Answer {totalPersonalQuestions - currentIndex - 1} more questions to continue
-            </p>
-          </div>
-        </motion.div>
-      </div>
-    );
-  }
-
-  // Step 3: Story Creation
-  if (step === 'story') {
-    const getFirstKeyword = (text) => extractAvatarKeywords(text)[0] || '';
-    
-    const requiredKeywords = [
-      getFirstKeyword(avatar.animal),
-      getFirstKeyword(avatar.personality),
-      getFirstKeyword(avatar.signatureMove),
-    ].filter(k => k && k.length > 2);
-    
-    const storyLower = story.toLowerCase();
-    const foundKeywords = requiredKeywords.filter(k => storyLower.includes(k));
-    const missingKeywords = requiredKeywords.filter(k => !storyLower.includes(k));
-    
-    const MIN_CHARS = 50;
-    const MAX_CHARS = 300;
-    const isValidLength = story.length >= MIN_CHARS && story.length <= MAX_CHARS;
-    const hasAllKeywords = missingKeywords.length === 0;
-    const canSubmit = isValidLength && hasAllKeywords;
-    
-    return (
-      <div className="fixed inset-0 bg-gradient-to-b from-stone-900 to-amber-900 flex items-center justify-center z-50 p-4 overflow-y-auto">
-        <motion.div initial={{ y: 50, opacity: 0 }} animate={{ y: 0, opacity: 1 }} className="w-full max-w-md">
-          <div className="text-center mb-4">
-            <div className="w-16 h-16 bg-blue-500 rounded-full flex items-center justify-center mx-auto mb-3">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-              </svg>
-            </div>
-            <h2 className="text-2xl font-black text-white mb-1">What Did {avatar.name} Do Today?</h2>
-            <p className="text-blue-200 text-sm">Describe a scene using YOUR selected traits</p>
-          </div>
-
-          <div className="bg-stone-800 rounded-2xl p-4 mb-3">
-            <p className="text-amber-400 text-xs font-bold mb-2">⚠️ MUST INCLUDE THESE KEYWORDS:</p>
-            <div className="flex flex-wrap gap-2 mb-3">
-              {requiredKeywords.map((kw, i) => (
-                <span 
-                  key={i}
-                  className={cn(
-                    "px-2 py-1 rounded text-xs font-bold",
-                    storyLower.includes(kw) 
-                      ? "bg-green-600 text-white" 
-                      : "bg-red-600 text-white animate-pulse"
-                  )}
-                >
-                  {storyLower.includes(kw) ? '✓' : '✗'} {kw}
-                </span>
-              ))}
-            </div>
-            
-            <textarea
-              value={story}
-              onChange={(e) => {
-                if (e.target.value.length <= MAX_CHARS) {
-                  setStory(e.target.value);
-                }
-              }}
-              placeholder={`Example: "Today ${avatar.name} the ${avatar.personality} ${avatar.race} used their ${avatar.animal} spirit..."`}
-              className="w-full h-32 p-3 bg-stone-700 rounded-xl text-white placeholder-stone-400 outline-none focus:ring-2 focus:ring-blue-500 resize-none text-sm"
-            />
-            
-            <div className="flex justify-between items-center mt-2">
-              <p className={cn(
-                "text-xs",
-                story.length < MIN_CHARS ? "text-red-400" : 
-                story.length > MAX_CHARS - 20 ? "text-amber-400" : "text-green-400"
-              )}>
-                {story.length}/{MAX_CHARS} chars (min {MIN_CHARS})
-              </p>
-              <p className="text-xs text-stone-500">
-                {foundKeywords.length}/{requiredKeywords.length} keywords found
-              </p>
-            </div>
-
-            <button
-              onClick={handleStorySubmit} 
-              disabled={!canSubmit}
-              className={cn(
-                "w-full h-12 mt-4 text-white rounded-xl font-bold transition-all",
-                canSubmit ? "bg-blue-600 hover:bg-blue-500" : "bg-stone-600 cursor-not-allowed"
-              )}
-            >
-              {!isValidLength ? `Need ${MIN_CHARS - story.length} more chars` :
-               !hasAllKeywords ? `Missing: ${missingKeywords[0]}` :
-               'Continue to Verification →'}
-            </button>
-          </div>
-
-          <div className="bg-stone-800/50 rounded-xl p-3 text-xs text-stone-400">
-            <p className="font-bold text-amber-400 mb-1">💡 Example answers:</p>
-            <p className="italic">"The {avatar.personality} {avatar.name} sat filing taxes while their {avatar.animal} spirit watched."</p>
-            <p className="italic mt-1">"{avatar.name} performed their signature move then went grocery shopping."</p>
-          </div>
-
-          <p className="text-center text-stone-500 text-xs mt-3">Step 3 of 4 • Prove You Remember</p>
-        </motion.div>
-      </div>
-    );
-  }
 
   // Step 4: Questions
   if (step === 'questions') {
@@ -7471,12 +7405,16 @@ const handleFreeTextVerify = () => {
 // ============================================================================
 // SEPARATE BRIDGE COMPONENT (Fixes "Stuck" Issue)
 // ============================================================================
+// ============================================================================
+// SEPARATE BRIDGE COMPONENT (Manual Advance Fix)
+// ============================================================================
 const VerificationBridgeScreen = ({ onBridgeComplete }) => {
   const [steps, setSteps] = useState({
     sanction: false,
     ledger: false,
     relay: false
   });
+  const [isAnimationComplete, setIsAnimationComplete] = useState(false);
 
   // Auto-run the checklist animation
   useEffect(() => {
@@ -7484,14 +7422,18 @@ const VerificationBridgeScreen = ({ onBridgeComplete }) => {
     const s2 = setTimeout(() => setSteps(s => ({ ...s, ledger: true })), 1200);
     const s3 = setTimeout(() => setSteps(s => ({ ...s, relay: true })), 2000);
     
-    // THE CRITICAL TRIGGER: Auto-advance after 3 seconds
+    // Auto-complete the checklist animation after 3.5 seconds
     const s4 = setTimeout(() => {
-      console.log("🚀 Bridge Auto-Triggering...");
-      if(onBridgeComplete) onBridgeComplete();
-    }, 3200);
+      setIsAnimationComplete(true);
+    }, 3500);
 
-    return () => { clearTimeout(s1); clearTimeout(s2); clearTimeout(s3); clearTimeout(s4); };
-  }, [onBridgeComplete]);
+    return () => { 
+      clearTimeout(s1); 
+      clearTimeout(s2); 
+      clearTimeout(s3); 
+      clearTimeout(s4); 
+    };
+  }, []);
 
   return (
     <div className="fixed inset-0 bg-stone-900/95 backdrop-blur-md flex items-center justify-center p-4 z-[9999]">
@@ -7512,13 +7454,21 @@ const VerificationBridgeScreen = ({ onBridgeComplete }) => {
            <BridgeCheckItem label="Kaspa Node Relay" active={steps.relay} />
         </div>
 
-        {/* Manual Force Button (The "Unstick" Button) */}
-        <button
+        {/* Manual Continue Button */}
+        <Button
           onClick={onBridgeComplete}
-          className="w-full py-4 bg-stone-900 text-white rounded-xl font-bold hover:bg-stone-800 transition-all flex items-center justify-center gap-2 shadow-lg active:scale-95"
+          disabled={!isAnimationComplete} // Button is disabled until animation finishes
+          className={cn(
+             "w-full py-4 font-bold transition-all flex items-center justify-center gap-2 shadow-lg active:scale-95",
+             isAnimationComplete ? "bg-green-600 hover:bg-green-700 text-white" : "bg-stone-300 text-stone-600 cursor-wait"
+          )}
         >
-          Continue to Dashboard <ArrowRight size={18} />
-        </button>
+          {isAnimationComplete ? (
+            <>Continue to Dashboard <ArrowRight size={18} /></>
+          ) : (
+            <>Initializing Bridge...</>
+          )}
+        </Button>
       </div>
     </div>
   );
@@ -8639,7 +8589,9 @@ const Dashboard = () => {
     user, isAuthenticated, securityStep, showTransactionSigner, setShowTransactionSigner,
     hostNodes, coupons, dapps, geoBlocked, userCountry, showClickwrap, setShowClickwrap,
     signClickwrap, showHumanVerification, handleHumanVerified, handleHumanVerificationFailed,
-    isReturningUser, avatarName, resetVerification, verifiedL1Wallet, setVerifiedL1Wallet
+    isReturningUser, avatarName, resetVerification, verifiedL1Wallet, setVerifiedL1Wallet,
+    showBridge,       
+     handleBridgeComplete, 
   } = useContext(GlobalContext);
 
   const [txCompleteStats, setTxCompleteStats] = useState({ total: 0, completedCount: 0, successRate: 0 });
@@ -8725,7 +8677,13 @@ if (showHumanVerification) {
     />
   );
 }
-
+if (showBridge) {
+  return (
+    <VerificationBridgeScreen 
+      onBridgeComplete={handleBridgeComplete} // This calls login() and closes the bridge
+    />
+  );
+}
 // 3. Terms of Service (Clickwrap)
 if (showClickwrap) return <ClickwrapModal onSign={signClickwrap} onCancel={() => setShowClickwrap(false)} />;
 

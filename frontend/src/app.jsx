@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { 
+import {  
   Search, Wallet, QrCode, X, Zap, 
   ShieldCheck, AlertTriangle, User, Lock, Activity,
   Store, Mail, Link, MapPin, CloudSun, CloudDrizzle, Sun, 

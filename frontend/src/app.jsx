@@ -55,6 +55,62 @@ const ONBOARDING_MAX_ATTEMPTS = 3;              // Max attempts before lockout
 const ONBOARDING_LOCKOUT_DURATION = 300000;     // 5 min lockout after max attempts
 
 // ============================================================================
+// AVATAR DATA VERSION (Cache Invalidation)
+// ============================================================================
+const AVATAR_DATA_VERSION = 2;  // Increment to force re-onboarding for all users
+
+// Check for stale/corrupt avatar data and clean if needed
+const validateAndCleanAvatarCache = () => {
+  if (typeof window === 'undefined') return false;
+  
+  // Check for ?reset=1 URL param - force clear
+  const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.get('reset') === '1') {
+    console.log('🧹 Reset param detected - clearing all KV data');
+    localStorage.removeItem('kv_avatar_data');
+    localStorage.removeItem('kv_avatar_name');
+    localStorage.removeItem('kv_identity_hash');
+    localStorage.removeItem('kv_verified');
+    localStorage.removeItem('kv_verified_at');
+    localStorage.removeItem('kv_onboard_fails');
+    localStorage.removeItem('kv_onboard_lockout');
+    // Clean URL
+    window.history.replaceState({}, '', window.location.pathname);
+    return false;
+  }
+  
+  const storedData = localStorage.getItem('kv_avatar_data');
+  if (!storedData) return false;
+  
+  try {
+    const parsed = JSON.parse(storedData);
+    
+    // Version mismatch - clear stale data
+    if (parsed._version !== AVATAR_DATA_VERSION) {
+      console.log('🔄 Avatar data version mismatch - clearing stale cache');
+      localStorage.removeItem('kv_avatar_data');
+      localStorage.removeItem('kv_avatar_name');
+      return false;
+    }
+    
+    // Validate required fields exist
+    if (!parsed.name || typeof parsed.name !== 'string' || parsed.name.trim() === '') {
+      console.log('⚠️ Avatar data missing required name field - clearing');
+      localStorage.removeItem('kv_avatar_data');
+      localStorage.removeItem('kv_avatar_name');
+      return false;
+    }
+    
+    return true; // Valid returning user
+  } catch (e) {
+    console.error('❌ Corrupt avatar data JSON - clearing', e);
+    localStorage.removeItem('kv_avatar_data');
+    localStorage.removeItem('kv_avatar_name');
+    return false;
+  }
+};
+
+// ============================================================================
 // TIME FORMATTING UTILITY
 // ============================================================================
 const formatTime = (seconds) => {
@@ -1782,8 +1838,8 @@ export const AppProvider = ({ children }) => {
   // 1. INITIALIZATION & STATE
   // ---------------------------------------------------------
   
-  // Check if we have saved avatar data (The definition of a Returning User)
-  const hasAvatarData = typeof window !== 'undefined' && localStorage.getItem('kv_avatar_data') !== null;
+  // Check if we have valid avatar data (with version check and cleanup)
+  const hasAvatarData = typeof window !== 'undefined' && validateAndCleanAvatarCache();
   
   // User Profile State
   const [user, setUser] = useState({ 
@@ -2101,6 +2157,7 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
   const [avatarBotScore, setAvatarBotScore] = useState(0);
   const [avatarStartTime] = useState(Date.now()); // Track when avatar creation started
   const [avatarPage, setAvatarPage] = useState(1);
+  const [avatarTimings, setAvatarTimings] = useState({ stepStart: Date.now() });
   
   
 
@@ -2559,12 +2616,12 @@ const finishOnboarding = async () => {
       console.error("Hashing failed, using fallback:", err);
     }
     
-    // Store data immediately (don't wait)
+    // Store data immediately (don't wait) - WITH VERSION
     localStorage.setItem('kv_identity_hash', identityHash);
     localStorage.setItem('kv_verified', 'true');
     localStorage.setItem('kv_verified_at', Date.now().toString());
     localStorage.setItem('kv_avatar_name', avatar.name || 'Villager');
-    localStorage.setItem('kv_avatar_data', JSON.stringify(avatar));
+    localStorage.setItem('kv_avatar_data', JSON.stringify({ ...avatar, _version: AVATAR_DATA_VERSION }));
     
     // CRITICAL: Call onComplete after brief delay for animation
     const completionData = { 
@@ -7086,7 +7143,7 @@ const LoginScreen = () => {
 
   const finalizeOnboarding = (finalScore) => {
     if (finalScore >= ONBOARDING_PASS_THRESHOLD) {
-      localStorage.setItem('kv_avatar_data', JSON.stringify(appData));
+      localStorage.setItem('kv_avatar_data', JSON.stringify({ ...appData, _version: AVATAR_DATA_VERSION }));
       setStoredData(appData);
       setStep('wallet-check');
     } else {

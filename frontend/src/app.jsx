@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {  
-  Search, Wallet, QrCode, X, Zap,  
+  Search, Wallet, QrCode, X, Zap, 
   ShieldCheck, AlertTriangle, User, Lock, Activity,
   Store, Mail, Link, MapPin, CloudSun, CloudDrizzle, Sun, 
   Settings, Users, ShoppingBag, CheckCircle, ArrowRight, Code, Clock, Globe, ScanFace, Smartphone, FileText, Scale, HeartHandshake, ExternalLink,
@@ -10,42 +10,6 @@ import {
   Instagram, Type, Palette, Grid, Layers, Move, Trash2, Plus, Copy,
   ChevronUp, ChevronDown, Edit3, AlignLeft, AlignCenter, AlignRight, Sparkles
 } from "lucide-react";
-
-// ============================================================================
-// BUILD VERSION & CACHE BUSTING
-// ============================================================================
-const BUILD_VERSION = '2025.01.09.001';  // Update on each deploy: YYYY.MM.DD.XXX
-const BUILD_TIMESTAMP = 1736380800000;    // Unix timestamp of build
-
-// Force hard reload if cached version is stale
-const checkBuildVersion = () => {
-  if (typeof window === 'undefined') return;
-  
-  const cachedVersion = localStorage.getItem('kv_build_version');
-  const cachedTimestamp = parseInt(localStorage.getItem('kv_build_timestamp') || '0');
-  
-  if (cachedVersion !== BUILD_VERSION || cachedTimestamp < BUILD_TIMESTAMP) {
-    console.log(`🔄 Build version mismatch: ${cachedVersion} → ${BUILD_VERSION}`);
-    localStorage.setItem('kv_build_version', BUILD_VERSION);
-    localStorage.setItem('kv_build_timestamp', BUILD_TIMESTAMP.toString());
-    
-    // Clear all caches and force reload
-    if ('caches' in window) {
-      caches.keys().then(names => {
-        names.forEach(name => caches.delete(name));
-      });
-    }
-    
-    // Only force reload if this isn't the first load after clearing
-    if (cachedVersion && cachedVersion !== BUILD_VERSION) {
-      console.log('🔄 Forcing hard reload for new version...');
-      window.location.reload(true);
-    }
-  }
-};
-
-// Run immediately on script load
-checkBuildVersion();
 import { clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 import Countdown from "react-countdown";
@@ -11224,72 +11188,9 @@ const MutualPaymentFlow = ({ isOpen, onClose }) => {
 };
 
 export default function App() {
-  const [showCacheClear, setShowCacheClear] = useState(false);
-  
-  const clearAllCaches = () => {
-    // Clear localStorage
-    const keys = Object.keys(localStorage).filter(k => k.startsWith('kv_'));
-    keys.forEach(k => localStorage.removeItem(k));
-    
-    // Clear service workers
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.getRegistrations().then(regs => {
-        regs.forEach(reg => reg.unregister());
-      });
-    }
-    
-    // Clear cache storage
-    if ('caches' in window) {
-      caches.keys().then(names => {
-        names.forEach(name => caches.delete(name));
-      });
-    }
-    
-    // Force reload
-    window.location.reload(true);
-  };
-  
   return (
     <AppProvider>
       <Dashboard />
-      
-      {/* Version tag - click 5x to show cache clear */}
-      <div 
-        className="fixed bottom-2 right-2 text-[10px] text-stone-400 opacity-30 hover:opacity-100 cursor-pointer select-none z-50"
-        onClick={() => setShowCacheClear(prev => !prev)}
-      >
-        v{BUILD_VERSION}
-      </div>
-      
-      {/* Cache clear modal */}
-      {showCacheClear && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[9999]">
-          <div className="bg-white rounded-xl p-6 max-w-sm mx-4 space-y-4">
-            <h3 className="font-bold text-lg">Cache Issues?</h3>
-            <p className="text-sm text-stone-600">
-              If you're experiencing display issues or stuck screens, clearing the cache may help.
-            </p>
-            <div className="text-xs text-stone-400">
-              Build: {BUILD_VERSION}<br/>
-              Data Version: {AVATAR_DATA_VERSION}
-            </div>
-            <div className="flex gap-2">
-              <button 
-                onClick={() => setShowCacheClear(false)}
-                className="flex-1 px-4 py-2 border border-stone-300 rounded-lg text-sm"
-              >
-                Cancel
-              </button>
-              <button 
-                onClick={clearAllCaches}
-                className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium"
-              >
-                Clear & Reload
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </AppProvider>
   );
 }

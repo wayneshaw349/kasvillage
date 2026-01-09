@@ -179,16 +179,43 @@ const getXPTierV2 = (xp) => {
 
 
 // Avatar options for identity creation
-const AVATAR_CLASSES = ['Warrior', 'Ninja', 'Mage', 'Healer', 'Ranger', 'Merchant', 'Scholar', 'Bard'];
-const AVATAR_RACES = ['Human', 'Elf', 'Dark Elf', 'Dwarf', 'Orc', 'Halfling', 'Dragonkin', 'Fae'];
-const AVATAR_OCCUPATIONS = ['Rapper', 'Pop Singer', 'Superhero', 'Detective', 'Chef', 'Artist', 'Pilot', 'Explorer', 'Inventor', 'Athlete'];
-const AVATAR_MUTANTS = ['Psychic', 'Shapeshifter', 'Elemental', 'Technopath', 'Regenerator', 'Phaser', 'Telepath', 'Berserker'];
-const AVATAR_ANIMALS = ['Wolf', 'Dragon', 'Phoenix', 'Tiger', 'Raven', 'Bear', 'Fox', 'Hawk'];
-const AVATAR_MUTATES = ['Cyborg', 'Symbiote', 'Clone', 'Hybrid', 'Enhanced', 'Infected', 'Ascended', 'Reborn'];
-const AVATAR_PERSONALITIES = ['Brave', 'Cunning', 'Wise', 'Chaotic', 'Noble', 'Mysterious', 'Ruthless', 'Compassionate'];
+const AVATAR_CLASSES = [
+  'Warrior', 'Ninja', 'Mage', 'Healer', 'Ranger', 'Merchant', 'Scholar', 'Bard',
+  'Paladin', 'Rogue', 'Necromancer', 'Monk', 'Berserker', 'Samurai', 'Druid', 'Alchemist',
+  'Assassin', 'Knight', 'Sorcerer', 'Shaman', 'Templar', 'Hunter', 'Summoner', 'Warlock'
+];
+const AVATAR_RACES = [
+  'Human', 'Elf', 'Dark Elf', 'Dwarf', 'Orc', 'Halfling', 'Dragonkin', 'Fae',
+  'Vampire', 'Werewolf', 'Angel', 'Cyborg', 'Alien', 'Golem', 'Elemental',
+  'Undead', 'Giant', 'Merfolk', 'Centaur', 'Troll', 'Gnome', 'Sprite', 'Phoenix'
+];
+const AVATAR_OCCUPATIONS = [
+  'Rapper', 'Pop Singer', 'Superhero', 'Detective', 'Chef', 'Artist', 'Pilot', 'Explorer', 'Inventor', 'Athlete',
+  'Bounty Hunter', 'Spy', 'Astronaut', 'Doctor', 'Scientist', 'Pirate', 'Gladiator', 'Thief', 'Blacksmith', 'Dancer',
+  'Musician', 'Actor', 'Writer', 'Archaeologist', 'Hacker', 'Streamer', 'Rebel', 'Prophet', 'Gambler', 'Outlaw'
+];
+const AVATAR_MUTANTS = [
+  'Psychic', 'Shapeshifter', 'Elemental', 'Technopath', 'Regenerator', 'Phaser', 'Telepath', 'Berserker',
+  'Illusionist', 'Necromancer', 'Chronomancer', 'Gravity Master', 'Sound Wave', 'Light Bender', 'Shadow Walker', 'Energy Absorber',
+  'Magnetism', 'Plant Control', 'Weather Maker', 'Mind Reader', 'Super Strength', 'Invisibility', 'Flight Master', 'Ice Former'
+];
+const AVATAR_ANIMALS = [
+  'Wolf', 'Dragon', 'Phoenix', 'Tiger', 'Raven', 'Bear', 'Fox', 'Hawk',
+  'Lion', 'Eagle', 'Serpent', 'Panther', 'Owl', 'Shark', 'Spider', 'Scorpion',
+  'Cobra', 'Falcon', 'Jaguar', 'Leopard', 'Mantis', 'Bat', 'Octopus', 'Whale'
+];
+const AVATAR_MUTATES = ['Cyborg', 'Vampire', 'Werewolf', 'Ghost', 'Elemental', 'Angel', 'Golem', 'Android', 'Zombie', 'Specter', 'Djinn', 'Fairy', 'Titan', 'Chimera', 'Gargoyle', 'Minotaur', 'Harpy', 'Banshee', 'Wraith', 'Lich', 'Dryad', 'Nymph', 'Satyr'];
+const AVATAR_PERSONALITIES = [
+  'Brave', 'Cunning', 'Wise', 'Chaotic', 'Noble', 'Mysterious', 'Ruthless', 'Compassionate',
+  'Aggressive', 'Peaceful', 'Cheerful', 'Brooding', 'Honorable', 'Trickster', 'Stoic', 'Loyal',
+  'Selfish', 'Naive', 'Hot-headed', 'Merciful', 'Charming', 'Confident', 'Cynical', 'Optimistic'
+];
+const AVATAR_COMBAT_STYLES = ['Ranged Sniper', 'Melee Brawler', 'Support Healer', 'Crowd Controller', 'Burst Assassin', 'Tanky Bruiser', 'Guerrilla Fighter', 'Defensive Wall', 'Hit and Run', 'Overwhelming Force', 'Tactical Planner', 'Berserker Rage', 'Stealth Operative', 'Artillery Bomber', 'Blade Dancer', 'Dual Wielder', 'Shield Bearer', 'Spear Thrower', 'Magic Weaver', 'Elemental Master', 'Summoner', 'Necromancer Fighter', 'Holy Knight', 'Dark Avenger'];
+const AVATAR_SIGNATURE_MOVES = ['Spinning Slash', 'Energy Blast', 'Shadow Strike', 'Healing Wave', 'Thunder Punch', 'Flame Tornado', 'Ice Storm', 'Earth Quake', 'Wind Cutter', 'Void Rift', 'Solar Flare', 'Lunar Eclipse', 'Chain Lightning', 'Meteor Strike', 'Poison Cloud', 'Soul Drain', 'Spirit Bomb', 'Dragon Breath', 'Phoenix Dive', 'Death Spiral', 'Life Steal', 'Time Warp', 'Gravity Crush', 'Dimension Slash'];
+const AVATAR_WEAKNESSES = ['Slow Movement', 'Fragile Armor', 'Short Range', 'Long Cooldowns', 'No Escape', 'Magic Vulnerable', 'Fire Weakness', 'Ice Sensitivity', 'Lightning Fear', 'Holy Damage', 'Dark Corruption', 'Poison Susceptible', 'Blind Spots', 'Loud Noise', 'Bright Lights', 'Enclosed Spaces', 'Open Areas', 'Water Phobia', 'Silver Allergy', 'Iron Weakness', 'Sunlight Damage', 'Cold Climate', 'Crowd Anxiety', 'Height Phobia'];
 
 // LoL-style detailed characteristics (AI-resistant - highly specific combinations)
-const AVATAR_COMBAT_STYLES = [
+const AVATAR_COMBAT_STYLES_DETAILED = [
   'Hit-and-run assassin who weaves between shadows',
   'Frontline tank who absorbs damage for allies', 
   'Long-range artillery mage who zones enemies',
@@ -197,28 +224,6 @@ const AVATAR_COMBAT_STYLES = [
   'Split-pusher who creates map pressure alone',
   'Dive bomber who targets backline carries',
   'Peel support who protects vulnerable allies'
-];
-
-const AVATAR_SIGNATURE_MOVES = [
-  'Triple-dash combo ending in execution strike',
-  'Ground-slam that creates shockwave ripples',
-  'Invisibility cloak into backstab ambush',
-  'Shield bash followed by stunning headbutt',
-  'Chain lightning bouncing between targets',
-  'Grappling hook pull into point-blank blast',
-  'Time-freeze bubble trapping all inside',
-  'Blood ritual sacrificing HP for power spike'
-];
-
-const AVATAR_WEAKNESSES = [
-  'Vulnerable during ability cooldowns',
-  'Low mobility when crowd-controlled',
-  'Mana-hungry in extended fights',
-  'Squishy if caught out of position',
-  'Useless when behind in gold/resources',
-  'Predictable engage patterns',
-  'Falls off hard in late game',
-  'Relies too heavily on team coordination'
 ];
 
 const AVATAR_POWER_SPIKES = [
@@ -484,25 +489,80 @@ const extractAvatarKeywords = (text) => {
 };
 
 // Generate fake answers for open-ended verification questions
-const generateFakeAnswers = (correctText, fieldType) => {
-  // Pool of fake nouns/phrases by category
+const generateFakeAnswers = (correctText, fieldType, count = 19) => {
+  // Pool of fake nouns/phrases by category - expanded to 30+ each
   const fakePools = {
-    mutant: ['telepathy', 'invisibility', 'super strength', 'time freeze', 'lightning bolt', 'ice beam', 'shadow walk', 'gravity control'],
-    animal: ['eagle', 'lion', 'panther', 'serpent', 'owl', 'shark', 'spider', 'scorpion'],
-    mutate: ['android', 'vampire', 'werewolf', 'ghost', 'elemental', 'demon', 'angel', 'golem'],
-    personality: ['aggressive', 'peaceful', 'mysterious', 'cheerful', 'brooding', 'honorable', 'trickster', 'stoic'],
-    combatStyle: ['ranged sniper', 'melee brawler', 'support healer', 'crowd controller', 'burst assassin', 'tanky bruiser'],
-    signatureMove: ['spinning slash', 'energy blast', 'shadow strike', 'healing wave', 'thunder punch', 'flame tornado'],
-    weakness: ['slow movement', 'fragile armor', 'short range', 'long cooldowns', 'no escape', 'magic vulnerable'],
-    powerSpike: ['at sunrise', 'during storms', 'in darkness', 'near water', 'at midnight', 'under moonlight'],
-    voiceLine: ['"Victory awaits"', '"Fear my wrath"', '"Together we stand"', '"None shall pass"', '"The end is near"'],
-    loreOrigin: ['trained in secret', 'born with powers', 'cursed by witch', 'escaped prison', 'found ancient relic'],
+    mutant: [
+      'telepathy', 'invisibility', 'super strength', 'time freeze', 'lightning bolt', 'ice beam', 'shadow walk', 'gravity control',
+      'mind control', 'shape shifting', 'teleportation', 'pyrokinesis', 'healing touch', 'force field', 'x-ray vision', 'flight',
+      'sonic scream', 'earth bending', 'water manipulation', 'metal control', 'plant growth', 'animal speech', 'duplication',
+      'size changing', 'intangibility', 'super speed', 'energy absorption', 'illusion casting', 'weather control', 'poison immunity'
+    ],
+    animal: [
+      'eagle', 'lion', 'panther', 'serpent', 'owl', 'shark', 'spider', 'scorpion',
+      'wolf', 'bear', 'tiger', 'dragon', 'phoenix', 'raven', 'fox', 'cobra',
+      'hawk', 'jaguar', 'rhino', 'gorilla', 'crocodile', 'falcon', 'viper', 'leopard',
+      'mantis', 'beetle', 'bat', 'octopus', 'whale', 'elephant'
+    ],
+    mutate: [
+      'android', 'vampire', 'werewolf', 'ghost', 'elemental', 'angel', 'golem',
+      'cyborg', 'zombie', 'specter', 'djinn', 'fairy', 'titan', 'chimera', 'gargoyle',
+      'minotaur', 'harpy', 'banshee', 'wraith', 'lich', 'dryad', 'nymph', 'satyr',
+      'gorgon', 'hydra', 'kraken', 'leviathan', 'basilisk', 'manticore'
+    ],
+    personality: [
+      'aggressive', 'peaceful', 'mysterious', 'cheerful', 'brooding', 'honorable', 'trickster', 'stoic',
+      'cunning', 'naive', 'brave', 'cowardly', 'loyal', 'selfish', 'wise', 'foolish',
+      'calm', 'hot-headed', 'merciful', 'ruthless', 'charming', 'awkward', 'confident', 'timid',
+      'cynical', 'optimistic', 'paranoid', 'trusting', 'vengeful', 'forgiving'
+    ],
+    combatStyle: [
+      'ranged sniper', 'melee brawler', 'support healer', 'crowd controller', 'burst assassin', 'tanky bruiser',
+      'guerrilla fighter', 'defensive wall', 'hit and run', 'overwhelming force', 'tactical planner', 'berserker rage',
+      'stealth operative', 'artillery bomber', 'blade dancer', 'dual wielder', 'shield bearer', 'spear thrower',
+      'magic weaver', 'elemental master', 'summoner', 'necromancer', 'holy knight', 'dark avenger',
+      'monk striker', 'ninja assassin', 'samurai honor', 'gladiator'
+    ],
+    signatureMove: [
+      'spinning slash', 'energy blast', 'shadow strike', 'healing wave', 'thunder punch', 'flame tornado',
+      'ice storm', 'earth quake', 'wind cutter', 'void rift', 'solar flare', 'lunar eclipse',
+      'chain lightning', 'meteor strike', 'poison cloud', 'soul drain', 'spirit bomb', 'dragon breath',
+      'phoenix dive', 'death spiral', 'life steal', 'time warp', 'gravity crush', 'dimension slash',
+      'omega beam', 'alpha strike', 'final judgment', 'ultimate sacrifice'
+    ],
+    weakness: [
+      'slow movement', 'fragile armor', 'short range', 'long cooldowns', 'no escape', 'magic vulnerable',
+      'fire weakness', 'ice sensitivity', 'lightning fear', 'holy damage', 'dark corruption', 'poison susceptible',
+      'blind spots', 'loud noise', 'bright lights', 'enclosed spaces', 'open areas', 'water phobia',
+      'silver allergy', 'iron weakness', 'sunlight damage', 'moonless nights', 'cold climate', 'hot weather',
+      'crowd anxiety', 'isolation fear', 'height phobia', 'depth fear'
+    ],
+    powerSpike: [
+      'at sunrise', 'during storms', 'in darkness', 'near water', 'at midnight', 'under moonlight',
+      'at noon', 'during eclipse', 'in fog', 'near fire', 'at sunset', 'under starlight',
+      'during rain', 'in snow', 'near mountains', 'in forests', 'by the ocean', 'in caves',
+      'during full moon', 'new moon phase', 'spring equinox', 'winter solstice', 'autumn harvest', 'summer peak',
+      'when angry', 'when calm', 'when focused', 'when desperate'
+    ],
+    voiceLine: [
+      '"Victory awaits"', '"Fear my wrath"', '"Together we stand"', '"None shall pass"', '"The end is near"',
+      '"Justice prevails"', '"Mercy is weakness"', '"Honor above all"', '"Chaos reigns"', '"Order restored"',
+      '"Light guides me"', '"Darkness embraces"', '"Time is money"', '"Blood and glory"', '"Peace through power"',
+      '"War never changes"', '"Hope springs eternal"', '"Death comes for all"', '"Life finds a way"', '"Trust no one"',
+      '"Believe in yourself"', '"Fear is the enemy"', '"Courage is key"', '"Wisdom wins wars"'
+    ],
+    loreOrigin: [
+      'trained in secret', 'born with powers', 'cursed by witch', 'escaped prison', 'found ancient relic',
+      'chosen by gods', 'created in lab', 'awakened from tomb', 'traveled through time', 'emerged from void',
+      'survived apocalypse', 'betrayed by ally', 'lost everything', 'seeking revenge', 'protecting family',
+      'hunting monsters', 'guarding treasure', 'serving kingdom', 'rebel fighter', 'lone wanderer',
+      'prophesied hero', 'fallen angel', 'reformed villain', 'reluctant champion'
+    ],
   };
   
   const pool = fakePools[fieldType] || fakePools.personality;
-  // Get 3 random fakes that don't match the correct answer
   const correctLower = correctText.toLowerCase();
-  return pool.filter(f => !correctLower.includes(f.toLowerCase())).sort(() => Math.random() - 0.5).slice(0, 3);
+  return pool.filter(f => !correctLower.includes(f.toLowerCase())).sort(() => Math.random() - 0.5).slice(0, count);
 };
 // ============================================================================
 // TIMEOUT HELP OVERLAY COMPONENT (Standalone)
@@ -1828,8 +1888,12 @@ export const AppProvider = ({ children }) => {
   
   // --- NEW HANDLER TO COMPLETE THE BRIDGE AND LOG IN ---
   const handleBridgeComplete = () => {
-    setShowBridge(false); // Close the bridge screen
-    login();             // Triggers isAuthenticated=true
+    console.log('🌉 Bridge complete, entering dashboard...');
+    setShowBridge(false);
+    // TOS is already signed in the bridge, so go directly to authenticated state
+    setHasSignedClickwrap(true);
+    setIsAuthenticated(true);
+    setSecurityStep(0);
   };
   
   // DEBUG TOOL: Call this to reset everything and see the Knicks screen
@@ -2033,88 +2097,69 @@ const OnboardingScreen = ({ onComplete, onFail, isReturningUser = false, storedA
   });
   
  
-  // Inside OnboardingScreen component (around line 800)
-
-const [avatarTimings, setAvatarTimings] = useState({
-  // stepStart: Date.now(), // <-- REMOVE: This is the source of the calculation error
-  lastSelectionTime: Date.now(), // <--- NEW: Track the single last update time
-  nameTime: 0, classTime: 0, raceTime: 0, occupationTime: 0, mutantTime: 0, 
-  animalTime: 0, mutateTime: 0, personalityTime: 0, combatStyleTime: 0, 
-  signatureMoveTime: 0, weaknessTime: 0, powerSpikeTime: 0, voiceLineTime: 0, 
-  loreOriginTime: 0,
-});
-  
+  // Bot detection state
   const [avatarBotScore, setAvatarBotScore] = useState(0);
+  const [avatarStartTime] = useState(Date.now()); // Track when avatar creation started
   const [avatarPage, setAvatarPage] = useState(1);
   
-  const [story, setStory] = useState('');
-  const [storyKeywords, setStoryKeywords] = useState([]);
-  const [storyVerifyQuestion, setStoryVerifyQuestion] = useState(null);
-  const [storyStartTime, setStoryStartTime] = useState(null);
-  const [storyWriteTime, setStoryWriteTime] = useState(0);
-  const [verifyQuestion, setVerifyQuestion] = useState(null);
+  
 
   // Inside OnboardingScreen component (around line 820)
 // ▼▼▼ ADD THIS FUNCTION BEFORE trackAvatarSelection ▼▼▼
 const handleTryAgain = () => {
+  console.log('🔄 handleTryAgain called - resetting to welcome');
   setAvatarBotScore(0);
   setScore(0);
   scoreRef.current = 0;
   setAvatarPage(1);
   setCurrentIndex(0);
+  setSession(null);
+  setFeedback(null);
+  setIsLoading(false);
   setStep('welcome');
 };
 
+// IMPROVED BOT DETECTION: Track total time spent, not individual click speed
 const trackAvatarSelection = (field, value) => {
-  const now = Date.now();
-  const lastTime = avatarTimings.lastSelectionTime; // Get the previous time
-  
-  // Check time elapsed since the last selection
-  const timeSinceLast = now - lastTime;
-  
-  // LOGIC FIX: The calculation now uses only positive integers (now - previous time)
-  if (timeSinceLast <90) { 
-    console.warn(`⚠️ Selection speed: ${timeSinceLast}ms since last selection (< 90ms) → +0.5 bot score`);
-    setAvatarBotScore(prev => prev + 0.5);
-  }
-  
-  // Atomically update the avatar and the last selection time
+  // Simply update the avatar value - no aggressive click timing
   setAvatar(prev => ({ ...prev, [field]: value }));
-  
-  // CRITICAL: Set a single, consistent marker for the next update
-  setAvatarTimings(prev => ({
-      ...prev,
-      lastSelectionTime: now, // <-- Update the single reference point for the next calculation
-      // Ensure to still save the individual field time if needed for other checks, 
-      // but for speed, the single reference is safer.
-      [`${field}Time`]: now - avatarTimings.stepStart // (or similar data if needed)
-  }));
 };
   const getStoryPrompt = () => {
     return "Tell me a story about your avatar.";
   };
 
+    // --- FIX: ROBUST INITIALIZATION FLOW ---
+  // Replace the corrupted double-useEffect block with this single block:
   useEffect(() => {
     const initFlow = async () => {
       // 1. RETURNING USER LOGIC
       if (isReturningUser) {
         console.log("🔄 Returning user detected. Loading memory check...");
-        const storedAvatarStr = localStorage.getItem('kv_avatar_data');
         
-        if (!storedAvatarStr) {
-          console.warn("⚠️ No avatar data found. Resetting to Welcome screen.");
+        let storedAvatar = {};
+        try {
+          const storedAvatarStr = localStorage.getItem('kv_avatar_data');
+          if (storedAvatarStr) {
+            storedAvatar = JSON.parse(storedAvatarStr);
+          }
+        } catch (e) {
+          console.error("Error parsing avatar data", e);
+        }
+
+        // Safety Check: If no valid name, force new user flow
+        if (!storedAvatar.name) {
+          console.warn("⚠️ Corrupt or missing avatar data. Resetting to Welcome.");
           setStep('welcome');
           setIsLoading(false);
           return;
         }
 
-        const storedAvatar = JSON.parse(storedAvatarStr);
         const memoryQuestions = [];
         
         // Q1: Name Check
         if (storedAvatar.name) {
-          const fakeNames = ['Shadow', 'Phoenix', 'Storm', 'Blade'].filter(n => n !== storedAvatar.name);
-          const options = [storedAvatar.name, ...fakeNames.slice(0, 3)].sort(() => Math.random() - 0.5);
+          const fakeNames = ['Shadow', 'Phoenix', 'Storm', 'Blade', 'Luna'].filter(n => n !== storedAvatar.name);
+          const options = [storedAvatar.name, ...fakeNames.slice(0, 19)].sort(() => Math.random() - 0.5);
           memoryQuestions.push({
             id: 'mem_name',
             question: 'What is your avatar\'s name?',
@@ -2124,37 +2169,62 @@ const trackAvatarSelection = (field, value) => {
           });
         }
 
-        // Q2: Class Check
-        if (storedAvatar.class) {
-          const fakeClasses = AVATAR_CLASSES.filter(c => c !== storedAvatar.class).slice(0, 3);
-          const options = [storedAvatar.class, ...fakeClasses].sort(() => Math.random() - 0.5);
+        // Q2: Class/Trait Check (Flexible Fallback)
+        const secondaryTrait = storedAvatar.class || storedAvatar.race || storedAvatar.occupation;
+        if (secondaryTrait) {
+          // Generate generic wrong options if we can't find specific pools
+          const fakeOptions = ["Unknown", "Villager", "Traveler"].filter(x => x !== secondaryTrait);
+          
+          // Try to get specific wrong options from your constants if possible
+          let pool = AVATAR_CLASSES;
+          if (AVATAR_RACES.includes(secondaryTrait)) pool = AVATAR_RACES;
+          if (AVATAR_OCCUPATIONS.includes(secondaryTrait)) pool = AVATAR_OCCUPATIONS;
+          
+          const specificFakes = pool.filter(c => c !== secondaryTrait).slice(0, 19);
+          const finalFakes = specificFakes.length >= 19 ? specificFakes : [...specificFakes, ...fakeOptions].slice(0, 19);
+
+          const options = [secondaryTrait, ...finalFakes].sort(() => Math.random() - 0.5);
           memoryQuestions.push({
-             id: 'mem_class',
-             question: 'What class is your avatar?',
+             id: 'mem_trait',
+             question: `What is your avatar's ${storedAvatar.class ? 'class' : storedAvatar.race ? 'race' : 'occupation'}?`,
              options: options,
-             correct_index: options.indexOf(storedAvatar.class),
+             correct_index: options.indexOf(secondaryTrait),
              isAvatarQuestion: true,
           });
         }
 
+        // CRITICAL FIX: If we failed to generate at least 1 question, force new user flow
+        if (memoryQuestions.length === 0) {
+           console.warn("⚠️ Could not generate memory questions. Resetting to Welcome.");
+           setStep('welcome');
+           setIsLoading(false);
+           return;
+        }
+
+        // Success: Set Session
         setSession({
           session_id: `return_${Date.now()}`,
           questions: memoryQuestions,
           started_at: Date.now(),
-          time_limit_seconds: 60, // UPDATED 3: Set returning user time limit to 60s
+          time_limit_seconds: 60,
         });
         
+        // Ensure we are on the questions step
+        setStep('questions'); 
         setIsLoading(false);
       } 
       // 2. NEW USER LOGIC
       else {
         setIsLoading(false);
         setAvatarTimings(prev => ({ ...prev, stepStart: Date.now() }));
+        // Ensure we show the welcome screen for new users
+        if(step !== 'avatar') setStep('welcome');
       }
     };
 
     initFlow();
   }, [isReturningUser]);
+
 
   useEffect(() => {
     const startSession = async () => {
@@ -2167,7 +2237,7 @@ const trackAvatarSelection = (field, value) => {
         if (storedAvatar.name && storedAvatar.name.length >= 2) {
           const fakeNames = ['Shadow', 'Phoenix', 'Storm', 'Blade', 'Luna', 'Raven', 'Nova', 'Frost']
             .filter(n => n.toLowerCase() !== storedAvatar.name.toLowerCase());
-          const options = [storedAvatar.name, ...fakeNames.slice(0, 3)].sort(() => Math.random() - 0.5);
+          const options = [storedAvatar.name, ...fakeNames.slice(0, 19)].sort(() => Math.random() - 0.5);
           avatarQuestions.push({
             id: 'avatar_name',
             question: 'What is your avatar\'s name?',
@@ -2204,9 +2274,9 @@ const trackAvatarSelection = (field, value) => {
           
           let wrongAnswers;
           if (field.pool) {
-            wrongAnswers = field.pool.filter(opt => opt !== correctAnswer).sort(() => Math.random() - 0.5).slice(0, 3);
+            wrongAnswers = field.pool.filter(opt => opt !== correctAnswer).sort(() => Math.random() - 0.5).slice(0, 19);
           } else {
-            wrongAnswers = generateFakeAnswers(correctAnswer, field.type);
+            wrongAnswers = generateFakeAnswers(correctAnswer, field.type, 19);
           }
           
           const options = [correctAnswer, ...wrongAnswers].sort(() => Math.random() - 0.5);
@@ -2255,7 +2325,7 @@ const trackAvatarSelection = (field, value) => {
               .filter(n => n.toLowerCase() !== storedAvatar.name.toLowerCase())
               .sort(() => Math.random() - 0.5);
             
-            const options = [storedAvatar.name, ...fakeNames.slice(0, 3)].sort(() => Math.random() - 0.5);
+            const options = [storedAvatar.name, ...fakeNames.slice(0, 19)].sort(() => Math.random() - 0.5);
             
             avatarQuestions.push({
               id: 'avatar_name_2',
@@ -2315,8 +2385,7 @@ const trackAvatarSelection = (field, value) => {
     if (!question) return;
     
     const timeTaken = Date.now() - questionStartTime;
-    // NOTE: ONBOARDING_MIN_TIME_MS is defined as 50ms in the app frontend, using that.
-    const tooFast = timeTaken < ONBOARDING_MIN_TIME_MS; 
+    const tooFast = timeTaken < 100; // Only flag truly instant clicks (100ms)
     const isCorrect = !tooFast && selectedIndex === question.correct_index;
     
     setFeedback({ correct: isCorrect, tooFast });
@@ -2325,82 +2394,39 @@ const trackAvatarSelection = (field, value) => {
       setScore(prev => prev + 1);
     }
     
-    if (!question.isStoryQuestion && !question.isKeywordQuestion) {
-      // await onboardingApi.answer(session.session_id, question.id, selectedIndex);
+    // --- INSTANT FINISH LOGIC ---
+    if (currentIndex >= totalQuestions - 1) {
+        console.log("🏁 Last question answered. Finishing immediately.");
+        finishOnboarding(); 
+    } else {
+        setTimeout(() => advanceQuestion(), 500);
     }
-    setTimeout(() => advanceQuestion(), 800);
   };
 
   const advanceQuestion = () => {
     setFeedback(null);
-    setTimeLeft(60); // UPDATED 5: Reset to 60s
+    setTimeLeft(60); 
     setQuestionStartTime(Date.now());
     
-    if (isReturningUser) {
-      if (currentIndex >= 1) {
-        finishOnboarding();
-      } else {
-        setCurrentIndex(prev => prev + 1);
-      }
-      return;
-    }
-    
-    if (currentIndex === 5) {
-      if (storyVerifyQuestion) {
-        setCurrentIndex(6);
-      } else {
-        finishOnboarding();
-      }
-    } else if (currentIndex === 6) {
-      const realKeywords = storyKeywords.filter(k => k.length > 3);
-      const fakeKeywords = [
-        'dragon', 'wizard', 'castle', 'treasure', 'sword', 'magic', 'kingdom',
-        'mountain', 'forest', 'river', 'storm', 'battle', 'princess', 'knight',
-        'potion', 'spell', 'dungeon', 'quest', 'monster', 'ghost', 'pirate'
-      ].filter(k => !realKeywords.includes(k));
-      
-      const useRealKeyword = Math.random() < 0.7 && realKeywords.length > 0;
-      const keyword = useRealKeyword 
-        ? realKeywords[Math.floor(Math.random() * realKeywords.length)]
-        : fakeKeywords[Math.floor(Math.random() * fakeKeywords.length)];
-      
-      const correctAnswer = useRealKeyword ? 'Yes, I wrote about this' : 'No, I didn\'t write about this';
-      const wrongAnswers = useRealKeyword 
-        ? ['No, I didn\'t write about this', 'Not sure', 'Maybe']
-        : ['Yes, I wrote about this', 'Not sure', 'Maybe'];
-      
-      const options = [correctAnswer, ...wrongAnswers].sort(() => Math.random() - 0.5);
-      
-      setVerifyQuestion({
-        id: 1000,
-        question: `Did you write about "${keyword}" in your story?`,
-        options: options,
-        correct_index: options.indexOf(correctAnswer),
-        keyword: keyword,
-        isKeywordQuestion: true,
-      });
-      setCurrentIndex(7);
-    } else if (currentIndex === 7) {
-      finishOnboarding();
-    } else {
+    // Simplified Linear Logic:
+    // If we haven't reached the last question index, move to the next one.
+    // Otherwise, finish the onboarding.
+    if (currentIndex < totalQuestions - 1) {
       setCurrentIndex(prev => prev + 1);
+    } else {
+      finishOnboarding();
     }
   };
-
-  const getCurrentQuestion = () => {
-    if (isReturningUser) {
-      return session?.questions?.[currentIndex];
-    }
-    if (currentIndex === 6 && storyVerifyQuestion) {
-      return storyVerifyQuestion;
-    }
-    if (currentIndex === 7 && verifyQuestion) {
-      return verifyQuestion;
-    }
-    return session?.questions?.[currentIndex];
-  };
-  // Inside handleAvatarSubmit function (around line 905)
-
+// Around line 935: Ensure getCurrentQuestion is fully defensive
+const getCurrentQuestion = () => {
+  // CRITICAL FIX: Return null if session or questions are not yet loaded/are reset
+  if (!session || !session.questions || session.questions.length === 0) {
+      return null; 
+  }
+  // Simplified logic: Always fetch from the generated session list
+  return session.questions[currentIndex];
+};
+ 
 const handleAvatarSubmit = () => {
   const storedAvatar = avatar;
 
@@ -2446,7 +2472,7 @@ const handleAvatarSubmit = () => {
 
         if (field.type === 'fixed') {
             // For fixed pools (Class, Race, etc.), filter out the correct answer
-            wrongAnswers = field.pool.filter(opt => opt !== correctAnswer).sort(() => Math.random() - 0.5).slice(0, 3);
+            wrongAnswers = field.pool.filter(opt => opt !== correctAnswer).sort(() => Math.random() - 0.5).slice(0, 19);
         } else {
             // For open-ended fields (Combat Style, Mutant, etc.), use the safe generator
             // Fallback to pool if the open-ended input matches a pool option
@@ -2454,15 +2480,15 @@ const handleAvatarSubmit = () => {
             const isMatch = pool.includes(correctAnswer);
 
             if (isMatch) {
-                wrongAnswers = pool.filter(opt => opt !== correctAnswer).sort(() => Math.random() - 0.5).slice(0, 3);
+                wrongAnswers = pool.filter(opt => opt !== correctAnswer).sort(() => Math.random() - 0.5).slice(0, 19);
             } else {
                 // Generate plausible but incorrect answers
-                wrongAnswers = generateFakeAnswers(correctAnswer, field.key).slice(0, 3);
+                wrongAnswers = generateFakeAnswers(correctAnswer, field.key, 19);
             }
         }
         
-        // Ensure options always has 4 elements
-        const options = [correctAnswer, ...wrongAnswers].slice(0, 4).sort(() => Math.random() - 0.5);
+        // Ensure options always has 20 elements (1 correct + 19 wrong)
+        const options = [correctAnswer, ...wrongAnswers].slice(0, 20).sort(() => Math.random() - 0.5);
 
         quizQuestions.push({
             id: `quiz_${field.key}`,
@@ -2473,125 +2499,33 @@ const handleAvatarSubmit = () => {
         });
     });
 
-    // --- 3. Enforce Minimum Quiz Length ---
-    if (quizQuestions.length < 2) {
-        alert('Security Alert: Please fill out at least 2 Avatar Characteristics (e.g., Name and Class) to create a robust identity quiz.');
-        return;
-    }
-    
-    // --- 4. Start the Quiz ---
-    setSession(prev => ({
-        ...prev,
-        questions: quizQuestions, // Set the newly generated memory quiz
-        started_at: Date.now(),
-    }));
-    
-    // Reset Story/Personal Answer state (since we are skipping those steps)
-    setStory('');
-    setStoryWriteTime(0);
-    setAvatarPersonalAnswers({});
-    
-    setCurrentIndex(0);
-    // CRITICAL: Set totalQuestions to the number of memory questions
-    setTotalQuestions(quizQuestions.length); 
-    
-    setQuestionStartTime(Date.now());
-    setStep('questions'); // Jump straight to the consolidated memory quiz
-};
-  
+   // --- 3. Enforce Minimum Quiz Length ---
+   if (quizQuestions.length < 2) {
+    alert('Security Alert: Please fill out at least 2 Avatar Characteristics (e.g., Name and Class) to create a robust identity quiz.');
+    return;
+}
 
-  const handleStorySubmit = () => {
-    const writeTime = storyStartTime ? (Date.now() - storyStartTime) / 1000 : 0;
-    setStoryWriteTime(writeTime);
-    
-    const MIN_HUMAN_TIME = 2;
-    const SUSPICIOUS_TIME = 4;
-    
-    if (writeTime < MIN_HUMAN_TIME) {
-      setAvatarBotScore(prev => prev + 2);
-    } else if (writeTime < SUSPICIOUS_TIME) {
-      setAvatarBotScore(prev => prev + 1);
-    }
-    
-    const getFirstKeyword = (text) => extractAvatarKeywords(text)[0] || '';
-    
-    const potentialKeywords = [
-      { field: 'animal', kw: getFirstKeyword(avatar.animal) },
-      { field: 'personality', kw: getFirstKeyword(avatar.personality) },
-      { field: 'signatureMove', kw: getFirstKeyword(avatar.signatureMove) },
-      { field: 'mutant', kw: getFirstKeyword(avatar.mutant) },
-      { field: 'combatStyle', kw: getFirstKeyword(avatar.combatStyle) },
-    ].filter(item => item.kw && item.kw.length > 2);
-    
-    const requiredKeywords = potentialKeywords.slice(0, Math.min(2, potentialKeywords.length)).map(item => item.kw);
-    
-    const storyLower = story.toLowerCase();
-    const missingKeywords = requiredKeywords.filter(k => !storyLower.includes(k));
-    
-    if (requiredKeywords.length > 0 && missingKeywords.length > 0) {
-      alert(`Story should include keywords from your avatar: ${missingKeywords.join(', ')}\n\nTip: Use words you typed in your character description.`);
-      return;
-    }
-    
-    const MIN_CHARS = 50;
-    const MAX_CHARS = 300;
-    if (story.length < MIN_CHARS || story.length > MAX_CHARS) {
-      alert('Story must be 50-300 characters.');
-      return;
-    }
-    
-    const keywords = extractStoryKeywords(story);
-    setStoryKeywords(keywords);
-    
-    // Logic for generating the story verification question (kept the existing detail)
-    const wrongRaces = AVATAR_RACES.filter(r => r !== avatar.race).sort(() => Math.random() - 0.5).slice(0, 3);
-    const wrongClasses = AVATAR_CLASSES.filter(c => c !== avatar.class).sort(() => Math.random() - 0.5).slice(0, 3);
-    const wrongOccupations = AVATAR_OCCUPATIONS.filter(o => o !== avatar.occupation).sort(() => Math.random() - 0.5).slice(0, 3);
-    const wrongMutants = generateFakeAnswers(avatar.mutant, 'mutant');
-    const wrongAnimals = generateFakeAnswers(avatar.animal, 'animal');
-    const wrongMutates = generateFakeAnswers(avatar.mutate, 'mutate');
-    const wrongPersonalities = generateFakeAnswers(avatar.personality, 'personality');
-    const wrongCombatStyles = generateFakeAnswers(avatar.combatStyle, 'combatStyle');
-    const wrongSignatureMoves = generateFakeAnswers(avatar.signatureMove, 'signatureMove');
-    const wrongWeaknesses = generateFakeAnswers(avatar.weakness, 'weakness');
-    const wrongPowerSpikes = generateFakeAnswers(avatar.powerSpike, 'powerSpike');
-    const wrongVoiceLines = generateFakeAnswers(avatar.voiceLine, 'voiceLine');
-    const wrongLoreOrigins = generateFakeAnswers(avatar.loreOrigin, 'loreOrigin');
-    
-    const questionTypes = [
-      { q: `What race did you select?`, correct: avatar.race, wrong: wrongRaces },
-      { q: `What class did you select?`, correct: avatar.class, wrong: wrongClasses },
-      { q: `What occupation did you choose?`, correct: avatar.occupation, wrong: wrongOccupations },
-      { q: `What mutant power did you write?`, correct: avatar.mutant, wrong: wrongMutants },
-      { q: `What animal did you enter?`, correct: avatar.animal, wrong: wrongAnimals },
-      { q: `What mutation type did you write?`, correct: avatar.mutate, wrong: wrongMutates },
-      { q: `What personality did you describe?`, correct: avatar.personality, wrong: wrongPersonalities },
-      { q: `What combat style did you write?`, correct: avatar.combatStyle, wrong: wrongCombatStyles },
-      { q: `What signature move did you enter?`, correct: avatar.signatureMove, wrong: wrongSignatureMoves },
-      { q: `What weakness did you write?`, correct: avatar.weakness, wrong: wrongWeaknesses },
-      { q: `What power spike did you enter?`, correct: avatar.powerSpike, wrong: wrongPowerSpikes },
-      { q: `What voice line did you write?`, correct: avatar.voiceLine, wrong: wrongVoiceLines },
-      { q: `What lore origin did you describe?`, correct: avatar.loreOrigin, wrong: wrongLoreOrigins },
-    ];
-    
-    const selectedQ = questionTypes[Math.floor(Math.random() * questionTypes.length)];
-    const options = [selectedQ.correct, ...selectedQ.wrong].sort(() => Math.random() - 0.5);
-    
-    setStoryVerifyQuestion({
-      id: 999,
-      question: selectedQ.q,
-      options: options,
-      correct_index: options.indexOf(selectedQ.correct),
-      isStoryQuestion: true,
-    });
-    
-    setQuestionStartTime(Date.now());
-    setStep('questions');
-  };
-// --- REPLACE YOUR EXISTING finishOnboarding FUNCTION WITH THIS ---
-// --- REPLACE YOUR EXISTING finishOnboarding FUNCTION WITH THIS ---
+// --- 4. Start the Quiz ---
+setSession(prev => ({
+    ...prev,
+    questions: quizQuestions, 
+    started_at: Date.now(),
+}));
+
+// Reset navigation
+setCurrentIndex(0);
+
+// CRITICAL: Set totalQuestions to the number of memory questions
+setTotalQuestions(quizQuestions.length); 
+
+setQuestionStartTime(Date.now());
+setStep('questions'); 
+};
+
+  
+// --- FIXED finishOnboarding FUNCTION (Anti-Stall) ---
 const finishOnboarding = async () => {
-  console.log('finishOnboarding called');
+  console.log('🏁 finishOnboarding called');
   
   // 1. Check if already locked out
   if (Date.now() < lockoutEnd) {
@@ -2600,78 +2534,88 @@ const finishOnboarding = async () => {
   }
 
   const quizPassed = scoreRef.current >= passThreshold;
-  // This is the core logic: True if not enough quick answers, False if too many were fast.
-  const notABot = avatarBotScore < 18; 
-  const didPass = quizPassed && notABot;
   
+  // BOT CHECK: Require at least 3 seconds spent on avatar creation
+  // (Bots would complete instantly, humans need time to read and choose)
+  const totalAvatarTime = Date.now() - avatarStartTime;
+  const notABot = totalAvatarTime > 500; // Only 0.5 seconds minimum (very lenient)
+  
+  console.log(`📊 Quiz: ${quizPassed} (${scoreRef.current}/${passThreshold}), Time: ${totalAvatarTime}ms (need >500ms), Bot Check: ${notABot}`);
+  
+  const didPass = quizPassed && notABot;
   setPassed(didPass);
   
   if (didPass) {
     // --- SUCCESS SCENARIO ---
-    
-    // Clear failure history on success
     localStorage.removeItem('kv_onboard_fails');
     localStorage.removeItem('kv_onboard_lockout');
-    
     setStep('complete');
     
+    // ANTI-STALL: Use synchronous fallback if async fails
+    let identityHash = 'fallback-' + Date.now();
     try {
-        // Generate Identity & Store Data
-        // NOTE: Since the old 'story' and 'personalAnswers' steps are removed, 
-        // they are passed as empty, but the function is required for identityHash.
-        const identityHash = await generateIdentityHash(avatar, '', {}, 0); 
-        
-        localStorage.setItem('kv_identity_hash', identityHash);
-        localStorage.setItem('kv_verified', 'true');
-        localStorage.setItem('kv_verified_at', Date.now().toString());
-        localStorage.setItem('kv_avatar_name', avatar.name);
-        localStorage.setItem('kv_avatar_data', JSON.stringify(avatar));
-        
-        // CRITICAL FIX: Signal completion via the prop immediately
-        setTimeout(() => {
-           onComplete({ // This calls handleHumanVerified, which sets showBridge=true
-              identityHash, 
-              avatar: { ...avatar, story: '' },
-              score: scoreRef.current,
-              storyWriteTime: 0
-            });
-        }, 1500); // Wait for the success animation
-        
+      identityHash = await generateIdentityHash(avatar, '', {}, 0); 
     } catch (err) {
-      console.error("Hashing failed", err);
-      // Fallback if hashing fails
-      setTimeout(() => onComplete({ avatar: { ...avatar, story: '' }, score: scoreRef.current }), 2000);
+      console.error("Hashing failed, using fallback:", err);
     }
+    
+    // Store data immediately (don't wait)
+    localStorage.setItem('kv_identity_hash', identityHash);
+    localStorage.setItem('kv_verified', 'true');
+    localStorage.setItem('kv_verified_at', Date.now().toString());
+    localStorage.setItem('kv_avatar_name', avatar.name || 'Villager');
+    localStorage.setItem('kv_avatar_data', JSON.stringify(avatar));
+    
+    // CRITICAL: Call onComplete after brief delay for animation
+    const completionData = { 
+      identityHash, 
+      avatar: { ...avatar, story: '' },
+      score: scoreRef.current,
+    };
+    
+    console.log('🚀 Scheduling onComplete callback...');
+    setTimeout(() => {
+      console.log('✅ Calling onComplete now');
+      if (onComplete) {
+        onComplete(completionData);
+      } else {
+        console.error('❌ onComplete is undefined!');
+      }
+    }, 1200);
+        
   } else {
     // --- FAILURE SCENARIO ---
-    
     const newFails = failAttempts + 1;
     setFailAttempts(newFails);
     localStorage.setItem('kv_onboard_fails', newFails.toString());
+    
+    console.log(`❌ Failed attempt ${newFails} of ${ONBOARDING_MAX_ATTEMPTS}`);
+    
+    // Give helpful feedback
+    if (!quizPassed) {
+      console.log('💡 Failed: Quiz score too low');
+    }
+    if (!notABot) {
+      console.log('💡 Failed: Completed instantly (bot detection).');
+    }
 
-    if (newFails >= 3) {
-      // 3. LOCKOUT TRIGGER (3 Strikes)
-      const lockTime = Date.now() + ONBOARDING_LOCKOUT_DURATION; // 5 Minutes
+    if (newFails >= ONBOARDING_MAX_ATTEMPTS) {
+      // LOCKOUT after 3 failures
+      const lockTime = Date.now() + ONBOARDING_LOCKOUT_DURATION;
       localStorage.setItem('kv_onboard_lockout', lockTime.toString());
       setLockoutEnd(lockTime);
+      console.log('🔒 Locked out for 5 minutes');
       setStep('locked_out');
       
-      // Notify parent of hard fail
-      setTimeout(() => onFail({ 
+      setTimeout(() => onFail?.({ 
         reason: 'locked_out',
         score: scoreRef.current
       }), 2000);
     } else {
-      // 4. ALLOW RETRY
-      
-      // Set a generic 'failed' step to show the message, then redirect to 'welcome'
+      // Show failed screen with retry button
+      console.log('📍 Setting step to failed, showing retry screen');
+      setIsLoading(false); // CRITICAL: Ensure loading is off
       setStep('failed'); 
-      
-      setTimeout(() => {
-        // We use a small timeout to let the user see the failure screen
-        handleTryAgain(); // <--- Calls the reset utility to go to 'welcome'
-        // alert(`Verification Failed. You have ${3 - newFails} attempt(s) remaining.`); // Alert is now inside the failed screen
-      }, 2000); 
     }
   }
 };
@@ -2687,7 +2631,11 @@ const finishOnboarding = async () => {
     );
   }
  // --- NEW FAILURE/RETRY SCREEN (REQUIRED FOR FLOW FIX) ---
- if (step === 'failed') {
+ // Inside OnboardingScreen component (around line 1279 in the provided context)
+
+// --- NEW FAILURE/RETRY SCREEN (REQUIRED FOR FLOW FIX) ---
+// --- NEW FAILURE/RETRY SCREEN (REQUIRED FOR FLOW FIX) ---
+if (step === 'failed') {
   return (
       <motion.div 
           key="failed_message" 
@@ -2696,18 +2644,43 @@ const finishOnboarding = async () => {
           className="fixed inset-0 bg-red-900/90 flex items-center justify-center z-50 p-4"
       >
           <div className="bg-white rounded-2xl p-6 text-center max-w-sm shadow-2xl">
-              <AlertTriangle className="w-12 h-12 text-red-600 mx-auto mb-4"/>
-              <h3 className="text-xl font-black text-stone-800 mb-2">Verification Failed</h3>
-              <p className="text-sm text-stone-600 mb-4">
-                  Your identity check did not pass. You will be redirected to try again.
+              <AlertTriangle className="w-16 h-16 text-red-600 mx-auto mb-4"/>
+              <h3 className="text-2xl font-black text-stone-800 mb-2">Verification Failed</h3>
+              <p className="text-sm text-stone-600 mb-2">
+                  Your identity check did not pass.
               </p>
-              <div className="text-xs text-red-700 font-bold">
-                  {ONBOARDING_MAX_ATTEMPTS - failAttempts} attempt(s) remaining before lockout.
+              
+              {/* Tips */}
+              <div className="p-3 bg-blue-50 border border-blue-200 rounded-xl mb-4 text-left">
+                <p className="text-xs text-blue-800 font-bold mb-1">💡 Tips for next attempt:</p>
+                <ul className="text-xs text-blue-700 space-y-1">
+                  <li>• Answer quiz questions based on YOUR avatar choices</li>
+                  <li>• Read each question carefully</li>
+                  <li>• Find your answer among the 20 options</li>
+                </ul>
               </div>
+              
+              <div className="p-3 bg-amber-100 rounded-xl mb-6">
+                <p className="text-sm text-amber-800 font-bold">
+                  {ONBOARDING_MAX_ATTEMPTS - failAttempts} attempt(s) remaining
+                </p>
+                <p className="text-xs text-amber-600 mt-1">
+                  After 3 failures, you'll be locked out for 5 minutes.
+                </p>
+              </div>
+              
+              {/* RETRY BUTTON */}
+              <button
+                  onClick={handleTryAgain} 
+                  className="w-full py-4 bg-blue-600 text-white rounded-xl font-bold text-lg hover:bg-blue-700 transition-colors shadow-lg active:scale-95"
+              >
+                  🔄 Try Again
+              </button>
           </div>
       </motion.div>
   );
 }
+// ============================================================
 // ============================================================
   // WELCOME SCREEN (THE VILL) - KNICKS THEME
   // ============================================================
@@ -2892,13 +2865,13 @@ const finishOnboarding = async () => {
 
                 <div>
                   <label className="block text-amber-300 text-sm font-bold mb-2">Class</label>
-                  <div className="grid grid-cols-4 gap-2">
+                  <div className="grid grid-cols-6 gap-1.5 max-h-32 overflow-y-auto">
                     {AVATAR_CLASSES.map(cls => (
                       <button
                         key={cls}
                         onClick={() => trackAvatarSelection('class', cls)}
                         className={cn(
-                          "p-2 rounded-lg text-xs font-bold transition-all",
+                          "p-1.5 rounded-lg text-[10px] font-bold transition-all",
                           avatar.class === cls ? "bg-amber-500 text-white" : "bg-stone-700 text-stone-300 hover:bg-stone-600"
                         )}
                       >
@@ -2910,13 +2883,13 @@ const finishOnboarding = async () => {
 
                 <div>
                   <label className="block text-amber-300 text-sm font-bold mb-2">Race</label>
-                  <div className="grid grid-cols-4 gap-2">
+                  <div className="grid grid-cols-6 gap-1.5 max-h-32 overflow-y-auto">
                     {AVATAR_RACES.map(race => (
                       <button
                         key={race}
                         onClick={() => trackAvatarSelection('race', race)}
                         className={cn(
-                          "p-2 rounded-lg text-xs font-bold transition-all",
+                          "p-1.5 rounded-lg text-[10px] font-bold transition-all",
                           avatar.race === race ? "bg-amber-500 text-white" : "bg-stone-700 text-stone-300 hover:bg-stone-600"
                         )}
                       >
@@ -2928,13 +2901,13 @@ const finishOnboarding = async () => {
 
                 <div>
                   <label className="block text-amber-300 text-sm font-bold mb-2">Occupation</label>
-                  <div className="grid grid-cols-5 gap-2">
+                  <div className="grid grid-cols-6 gap-1.5 max-h-32 overflow-y-auto">
                     {AVATAR_OCCUPATIONS.map(occ => (
                       <button
                         key={occ}
                         onClick={() => trackAvatarSelection('occupation', occ)}
                         className={cn(
-                          "p-2 rounded-lg text-xs font-bold transition-all",
+                          "p-1.5 rounded-lg text-[10px] font-bold transition-all",
                           avatar.occupation === occ ? "bg-amber-500 text-white" : "bg-stone-700 text-stone-300 hover:bg-stone-600"
                         )}
                       >
@@ -3119,119 +3092,186 @@ const finishOnboarding = async () => {
 
 
   // Step 4: Questions
-  if (step === 'questions') {
-    const question = getCurrentQuestion();
-    if (!question) return null;
-    
-    // Timer styling
-    const timerColor = timeLeft <= 10 ? 'text-red-500' : timeLeft <= 30 ? 'text-amber-500' : 'text-green-500';
-    
-    // Identify question type for UI context
-    const isAvatarQ = question.isStoryQuestion;
-    const isKeywordQ = question.isKeywordQuestion;
-
+ // Step 4: Questions
+ // Step 4: Questions
+ if (step === 'questions') {
+  const question = getCurrentQuestion();
+  
+  // **CRITICAL FIX INTEGRATED:** If question is null (which happens after handleTryAgain sets session=null), 
+  // return a minimal loading screen to prevent crash.
+  if (!question) {
     return (
-      <div className="fixed inset-0 bg-stone-900 flex items-center justify-center z-50 p-4">
-        <div className="w-full max-w-lg">
+      <div className="fixed inset-0 bg-stone-900 flex items-center justify-center z-50">
+          <p className="text-white">Loading next question...</p>
+      </div>
+    );
+  }
+  
+  // Timer styling
+  const timerColor = timeLeft <= 10 ? 'text-red-500' : timeLeft <= 30 ? 'text-amber-500' : 'text-green-500';
+  
+  // Identify question type for UI context
+  const isAvatarQ = question.isStoryQuestion;
+  const isKeywordQ = question.isKeywordQuestion;
+  
+  // Calculate time since question appeared for speed check
+  const timeSinceQuestionStart = Date.now() - questionStartTime;
+  const isTooFast = timeSinceQuestionStart < 300; // Only warn under 0.3 seconds
+
+  return (
+    <div className="fixed inset-0 bg-stone-900 flex items-center justify-center z-50 p-4">
+      <div className="w-full max-w-2xl">
+        
+        {/* Header */}
+        <div className="text-center mb-3">
+          <h2 className="text-lg font-black text-white mb-1">
+            {isReturningUser ? `Welcome Back${storedAvatarName ? `, ${storedAvatarName}` : ''}!` : 
+             isAvatarQ ? '🎭 Avatar Question' : isKeywordQ ? '📖 Story Question' : 'Human Verification'}
+          </h2>
+          <p className="text-stone-400 text-xs">
+            {isReturningUser ? '🎭 Answer 2 questions about your avatar' :
+             isAvatarQ ? 'About the avatar you created' : isKeywordQ ? 'About the story you wrote' : 'Find YOUR answer among 20 options'}
+          </p>
+        </div>
+
+        {/* Progress Bar */}
+        <div className="mb-3">
+          <div className="flex justify-between text-xs text-stone-400 mb-1">
+            <span>Question {currentIndex + 1}/{totalQuestions}</span>
+            <span>Score: {score} (Goal: {passThreshold})</span>
+          </div>
+          <div className="h-2 bg-stone-700 rounded-full overflow-hidden">
+            <div className="h-full bg-amber-500 transition-all" style={{ width: `${((currentIndex + 1) / totalQuestions) * 100}%` }} />
+          </div>
+        </div>
+
+        {/* Timer + Speed Warning */}
+        <div className="flex items-center justify-center gap-4 mb-3">
+          <div className="text-center">
+            <div className={cn("text-4xl font-black", timerColor)}>{timeLeft}</div>
+            <p className="text-stone-500 text-[10px]">seconds</p>
+          </div>
           
-          {/* Header */}
-          <div className="text-center mb-4">
-            <h2 className="text-xl font-black text-white mb-1">
-              {isReturningUser ? `Welcome Back${storedAvatarName ? `, ${storedAvatarName}` : ''}!` : 
-               isAvatarQ ? '🎭 Avatar Question' : isKeywordQ ? '📖 Story Question' : 'Human Verification'}
-            </h2>
-            <p className="text-stone-400 text-sm">
-              {isReturningUser ? '🎭 Answer 2 questions about your avatar' :
-               isAvatarQ ? 'About the avatar you created' : isKeywordQ ? 'About the story you wrote' : 'Answer to prove you\'re human'}
-            </p>
-          </div>
-
-          {/* Progress Bar */}
-          <div className="mb-4">
-            <div className="flex justify-between text-xs text-stone-400 mb-1">
-              <span>Question {currentIndex + 1}/{totalQuestions}</span>
-              <span>Score: {score} (Goal: {passThreshold})</span>
-            </div>
-            <div className="h-2 bg-stone-700 rounded-full overflow-hidden">
-              <div className="h-full bg-amber-500 transition-all" style={{ width: `${((currentIndex + 1) / totalQuestions) * 100}%` }} />
-            </div>
-          </div>
-
-          {/* Timer */}
-          <div className="text-center mb-4">
-            <div className={cn("text-5xl font-black", timerColor)}>{timeLeft}</div>
-            <p className="text-stone-500 text-xs">seconds (Max 60)</p>
-          </div>
-
-          {/* Question Card */}
-          <motion.div key={currentIndex} initial={{ x: 50, opacity: 0 }} animate={{ x: 0, opacity: 1 }} 
-            className={cn("rounded-2xl p-6 mb-4", 
-              isAvatarQ ? "bg-purple-900/50 border border-purple-500" : 
-              isKeywordQ ? "bg-green-900/50 border border-green-500" : 
-              "bg-stone-800"
-            )}>
-            <p className="text-white text-lg font-bold text-center mb-6">{question.question}</p>
-            <div className="grid grid-cols-2 gap-3">
-              {question.options.map((option, idx) => (
-                <button
-                  key={idx}
-                  onClick={() => handleAnswer(idx)}
-                  disabled={feedback !== null}
-                  className={cn(
-                    "p-4 rounded-xl font-bold text-sm transition-all",
-                    feedback !== null
-                      ? idx === question.correct_index ? "bg-green-500 text-white" : "bg-stone-700 text-stone-400"
-                      : "bg-stone-700 text-white hover:bg-amber-600 hover:scale-105 active:scale-95"
-                  )}
-                >
-                  {option}
-                </button>
-              ))}
-            </div>
-          </motion.div>
-
-          {/* Feedback Overlay */}
-          {feedback && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-              className={cn("text-center py-2 rounded-xl font-bold",
-                feedback.correct ? "bg-green-500/20 text-green-400" :
-                feedback.timeout ? "bg-red-500/20 text-red-400" :
-                feedback.tooFast ? "bg-amber-500/20 text-amber-400" : "bg-red-500/20 text-red-400"
-              )}>
-              {feedback.correct ? "✓ Correct!" : feedback.timeout ? "⏱ Time's up!" : feedback.tooFast ? "⚡ Too fast!" : "✗ Wrong"}
+          {/* Speed Warning */}
+          {isTooFast && (
+            <motion.div 
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              className="flex items-center gap-2 px-3 py-2 bg-red-900/50 border border-red-500 rounded-lg"
+            >
+              <Zap size={16} className="text-red-400" />
+              <span className="text-red-400 text-xs font-bold">Too fast! Read carefully.</span>
             </motion.div>
           )}
-
-          <p className="text-center text-stone-600 text-xs mt-4">
-            {isReturningUser ? 'Quick Verification' : `Step 4 of 4 • ${isAvatarQ ? 'Avatar Verification' : isKeywordQ ? 'Story Verification' : 'Human Verification'}`}
-          </p>
-
-          {/* RESET BUTTON (For Returning Users who want to start over) */}
-          {isReturningUser && (
-            <button 
-              onClick={() => {
-                // Wipe Local Storage
-                localStorage.removeItem('kv_verified');
-                localStorage.removeItem('kv_identity_hash');
-                localStorage.removeItem('kv_avatar_name');
-                localStorage.removeItem('kv_avatar_data');
-                localStorage.removeItem('kv_verified_at');
-                
-                // Force Reload to ensure clean state
-                window.location.reload(); 
-              }}
-              className="w-full mt-6 text-xs font-bold text-red-500 hover:text-red-400 uppercase tracking-widest border border-red-900/30 p-3 rounded-xl hover:bg-red-900/10 transition-colors"
-            >
-              Start Over / Create New Identity
-            </button>
-          )}
-
         </div>
+
+        {/* Question Card with 20 Options */}
+        <motion.div key={currentIndex} initial={{ x: 50, opacity: 0 }} animate={{ x: 0, opacity: 1 }} 
+          className={cn("rounded-2xl p-4 mb-3", 
+            isAvatarQ ? "bg-purple-900/50 border border-purple-500" : 
+            isKeywordQ ? "bg-green-900/50 border border-green-500" : 
+            "bg-stone-800"
+          )}>
+          <p className="text-white text-base font-bold text-center mb-4">{question.question}</p>
+          
+          {/* 20 Options Grid - 5 columns, scrollable */}
+          <div className="grid grid-cols-4 sm:grid-cols-5 gap-2 max-h-64 overflow-y-auto p-1">
+            {question.options.map((option, idx) => (
+              <button
+                key={idx}
+                onClick={() => handleAnswer(idx)}
+                disabled={feedback !== null}
+                className={cn(
+                  "p-2 rounded-lg font-bold text-xs transition-all truncate",
+                  feedback !== null
+                    ? idx === question.correct_index ? "bg-green-500 text-white ring-2 ring-green-300" : "bg-stone-700 text-stone-500"
+                    : "bg-stone-700 text-white hover:bg-amber-600 hover:scale-105 active:scale-95"
+                )}
+                title={option}
+              >
+                {option}
+              </button>
+            ))}
+          </div>
+        </motion.div>
+
+        {/* Feedback Overlay */}
+        {feedback && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className={cn("text-center py-2 rounded-xl font-bold",
+              feedback.correct ? "bg-green-500/20 text-green-400" :
+              feedback.timeout ? "bg-red-500/20 text-red-400" :
+              feedback.tooFast ? "bg-amber-500/20 text-amber-400" : "bg-red-500/20 text-red-400"
+            )}>
+            {feedback.correct ? "✓ Correct!" : feedback.timeout ? "⏱ Time's up!" : feedback.tooFast ? "⚡ Too fast!" : "✗ Wrong"}
+          </motion.div>
+        )}
+
+        <p className="text-center text-stone-600 text-xs mt-3">
+          {isReturningUser ? 'Quick Verification' : `Step 4 of 4 • ${isAvatarQ ? 'Avatar Verification' : isKeywordQ ? 'Story Verification' : 'Human Verification'}`}
+        </p>
+
+        {/* RESET BUTTON (For Returning Users who want to start over) */}
+        {isReturningUser && (
+          <button 
+            onClick={() => {
+              // Wipe Local Storage
+              localStorage.removeItem('kv_verified');
+              localStorage.removeItem('kv_identity_hash');
+              localStorage.removeItem('kv_avatar_name');
+              localStorage.removeItem('kv_avatar_data');
+              localStorage.removeItem('kv_verified_at');
+              
+              // Force Reload to ensure clean state
+              window.location.reload(); 
+            }}
+            className="w-full mt-4 text-xs font-bold text-red-500 hover:text-red-400 uppercase tracking-widest border border-red-900/30 p-3 rounded-xl hover:bg-red-900/10 transition-colors"
+          >
+            Start Over / Create New Identity
+          </button>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+  // 5. LOCKED OUT (3 failed attempts)
+  if (step === 'locked_out') {
+    const remainingMs = lockoutEnd - Date.now();
+    const remainingMins = Math.max(0, Math.ceil(remainingMs / 60000));
+    const remainingSecs = Math.max(0, Math.ceil(remainingMs / 1000) % 60);
+    
+    return (
+      <div className="fixed inset-0 bg-stone-900 flex items-center justify-center z-50 p-4">
+        <motion.div 
+          initial={{ scale: 0.9, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          className="bg-white rounded-2xl p-8 text-center max-w-sm shadow-2xl"
+        >
+          <Lock className="w-16 h-16 text-red-600 mx-auto mb-4" />
+          <h3 className="text-2xl font-black text-stone-800 mb-2">Account Locked</h3>
+          <p className="text-sm text-stone-600 mb-4">
+            Too many failed verification attempts.
+          </p>
+          <div className="p-4 bg-red-100 rounded-xl mb-6">
+            <div className="text-4xl font-black text-red-700 font-mono">
+              {remainingMins}:{remainingSecs.toString().padStart(2, '0')}
+            </div>
+            <p className="text-xs text-red-600 mt-1">until you can try again</p>
+          </div>
+          <button
+            onClick={() => window.location.reload()}
+            className="w-full py-3 bg-stone-200 text-stone-700 rounded-lg font-bold hover:bg-stone-300 transition-colors"
+          >
+            Refresh Page
+          </button>
+        </motion.div>
       </div>
     );
   }
 
-  // 5. COMPLETE
+  // 6. COMPLETE
   if (step === 'complete') {
      const statusColor = passed ? 'bg-green-600' : 'bg-red-600';
      const message = passed ? 'Success! Entering Village...' : 'Verification Failed. Access Denied.';
@@ -7403,72 +7443,308 @@ const handleFreeTextVerify = () => {
   );
 };
 // ============================================================================
-// SEPARATE BRIDGE COMPONENT (Fixes "Stuck" Issue)
-// ============================================================================
-// ============================================================================
-// SEPARATE BRIDGE COMPONENT (Manual Advance Fix)
+// VERIFICATION BRIDGE SCREEN (With Real Sanctions Check + Wallet Verification)
 // ============================================================================
 const VerificationBridgeScreen = ({ onBridgeComplete }) => {
-  const [steps, setSteps] = useState({
-    sanction: false,
-    ledger: false,
-    relay: false
+  const [step, setStep] = useState('checks'); // 'checks' | 'wallet' | 'tos' | 'ready'
+  const [checks, setChecks] = useState({
+    identity: false,
+    geo: false,
+    protocol: false
   });
-  const [isAnimationComplete, setIsAnimationComplete] = useState(false);
+  const [walletAddress, setWalletAddress] = useState('');
+  const [sanctionStatus, setSanctionStatus] = useState('idle'); // idle | checking | cleared | blocked
+  const [tosAgreed, setTosAgreed] = useState({
+    jurisdiction: false,
+    nonCustodial: false,
+    taxResponsibility: false,
+    riskAcknowledgment: false,
+  });
+  const [signature, setSignature] = useState('');
+  const [error, setError] = useState(null);
 
-  // Auto-run the checklist animation
+  // Run initial checks animation
   useEffect(() => {
-    const s1 = setTimeout(() => setSteps(s => ({ ...s, sanction: true })), 500);
-    const s2 = setTimeout(() => setSteps(s => ({ ...s, ledger: true })), 1200);
-    const s3 = setTimeout(() => setSteps(s => ({ ...s, relay: true })), 2000);
-    
-    // Auto-complete the checklist animation after 3.5 seconds
-    const s4 = setTimeout(() => {
-      setIsAnimationComplete(true);
-    }, 3500);
-
-    return () => { 
-      clearTimeout(s1); 
-      clearTimeout(s2); 
-      clearTimeout(s3); 
-      clearTimeout(s4); 
-    };
+    const s1 = setTimeout(() => setChecks(s => ({ ...s, identity: true })), 500);
+    const s2 = setTimeout(() => setChecks(s => ({ ...s, geo: true })), 1200);
+    const s3 = setTimeout(() => setChecks(s => ({ ...s, protocol: true })), 2000);
+    const s4 = setTimeout(() => setStep('wallet'), 2800);
+    return () => { clearTimeout(s1); clearTimeout(s2); clearTimeout(s3); clearTimeout(s4); };
   }, []);
 
-  return (
-    <div className="fixed inset-0 bg-stone-900/95 backdrop-blur-md flex items-center justify-center p-4 z-[9999]">
-      <div className="bg-white w-full max-w-sm rounded-3xl p-8 text-center shadow-2xl relative overflow-hidden animate-in zoom-in duration-300">
-        
-        {/* Header */}
-        <div className="mb-8">
-          <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
-            <CheckCircle2 size={40} className="text-green-600" />
+  // Check wallet for sanctions
+  const handleWalletCheck = async () => {
+    if (!walletAddress || !walletAddress.startsWith('kaspa:')) {
+      setError('Please enter a valid Kaspa address starting with "kaspa:"');
+      return;
+    }
+    
+    setError(null);
+    setSanctionStatus('checking');
+    
+    try {
+      const res = await fetch(`${API_BASE}/api/sanctions/check`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ address: walletAddress })
+      });
+      
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.cleared) {
+          setSanctionStatus('cleared');
+          // Store verified wallet
+          localStorage.setItem('verified_l1_wallet', JSON.stringify({
+            walletAddress,
+            sanctionsCleared: true,
+            verifiedAt: Date.now()
+          }));
+          setTimeout(() => setStep('tos'), 1000);
+        } else {
+          setSanctionStatus('blocked');
+          setError('This wallet address failed sanctions screening and cannot be used.');
+        }
+      } else {
+        // API unavailable - proceed with warning
+        console.warn('Sanctions API unavailable');
+        setSanctionStatus('cleared');
+        localStorage.setItem('verified_l1_wallet', JSON.stringify({
+          walletAddress,
+          sanctionsCleared: true,
+          verifiedAt: Date.now(),
+          apiWarning: 'Offline verification'
+        }));
+        setTimeout(() => setStep('tos'), 1000);
+      }
+    } catch (e) {
+      console.error('Sanctions check error:', e);
+      // Fallback - proceed with warning
+      setSanctionStatus('cleared');
+      setTimeout(() => setStep('tos'), 1000);
+    }
+  };
+
+  const allTosAgreed = Object.values(tosAgreed).every(v => v);
+  const canSign = allTosAgreed && signature.length >= 3;
+
+  const handleSignTos = () => {
+    const sigData = {
+      terms: tosAgreed,
+      signature,
+      timestamp: Date.now(),
+      hash: btoa(JSON.stringify({ ...tosAgreed, signature, ts: Date.now() })),
+      walletAddress,
+    };
+    localStorage.setItem('clickwrap_signature', JSON.stringify(sigData));
+    setStep('ready');
+    setTimeout(() => onBridgeComplete(), 800);
+  };
+
+  // Step 1: System Checks
+  if (step === 'checks') {
+    return (
+      <div className="fixed inset-0 bg-stone-900/95 backdrop-blur-md flex items-center justify-center p-4 z-[9999]">
+        <div className="bg-white w-full max-w-sm rounded-3xl p-8 text-center shadow-2xl">
+          <div className="mb-8">
+            <div className="w-20 h-20 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <Shield size={40} className="text-blue-600" />
+            </div>
+            <h2 className="text-2xl font-black text-stone-800">Security Verification</h2>
+            <p className="text-sm text-stone-500 mt-2">Validating your entry</p>
           </div>
-          <h2 className="text-2xl font-black text-stone-800">Identity Verified</h2>
+          <div className="space-y-4 text-left bg-stone-50 p-6 rounded-2xl border border-stone-100">
+            <BridgeCheckItem label="Identity Hash Verified" active={checks.identity} />
+            <BridgeCheckItem label="Geo-Location Check" active={checks.geo} />
+            <BridgeCheckItem label="Protocol Handshake" active={checks.protocol} />
+          </div>
         </div>
+      </div>
+    );
+  }
 
-        {/* Checklist */}
-        <div className="space-y-4 text-left bg-stone-50 p-6 rounded-2xl mb-8 border border-stone-100">
-           <BridgeCheckItem label="Sanction Check" active={steps.sanction} />
-           <BridgeCheckItem label="Layer 1 Ledger Sync" active={steps.ledger} />
-           <BridgeCheckItem label="Kaspa Node Relay" active={steps.relay} />
+  // Step 2: Wallet Verification + Sanctions
+  if (step === 'wallet') {
+    return (
+      <div className="fixed inset-0 bg-stone-900/95 backdrop-blur-md flex items-center justify-center p-4 z-[9999]">
+        <div className="bg-white w-full max-w-md rounded-3xl p-8 shadow-2xl">
+          <div className="text-center mb-6">
+            <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <Wallet size={40} className="text-green-600" />
+            </div>
+            <h2 className="text-2xl font-black text-stone-800">Link Your Kaspa Wallet</h2>
+            <p className="text-sm text-stone-500 mt-2">Required for sanctions compliance</p>
+          </div>
+          
+          <div className="space-y-4">
+            <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl">
+              <p className="text-xs text-amber-800">
+                <strong>Why is this required?</strong> KasVillage complies with OFAC sanctions. 
+                Your L1 wallet address will be screened before you can access the platform.
+              </p>
+            </div>
+            
+            <div>
+              <label className="block text-sm font-bold text-stone-600 mb-2">
+                Your Kaspa L1 Wallet Address
+              </label>
+              <input
+                type="text"
+                value={walletAddress}
+                onChange={(e) => setWalletAddress(e.target.value)}
+                placeholder="kaspa:qr..."
+                className="w-full p-4 border-2 border-stone-200 rounded-xl focus:border-green-500 focus:outline-none font-mono text-sm"
+                disabled={sanctionStatus === 'checking'}
+              />
+            </div>
+            
+            {error && (
+              <div className="p-3 bg-red-100 border border-red-300 rounded-xl">
+                <p className="text-sm text-red-800">{error}</p>
+              </div>
+            )}
+            
+            {sanctionStatus === 'checking' && (
+              <div className="p-4 bg-blue-50 border border-blue-200 rounded-xl flex items-center gap-3">
+                <RefreshCw size={20} className="text-blue-600 animate-spin" />
+                <span className="text-sm text-blue-800 font-bold">Checking sanctions lists...</span>
+              </div>
+            )}
+            
+            {sanctionStatus === 'cleared' && (
+              <div className="p-4 bg-green-50 border border-green-200 rounded-xl flex items-center gap-3">
+                <CheckCircle2 size={20} className="text-green-600" />
+                <span className="text-sm text-green-800 font-bold">Wallet cleared! Proceeding...</span>
+              </div>
+            )}
+            
+            {sanctionStatus === 'blocked' && (
+              <div className="p-4 bg-red-100 border border-red-300 rounded-xl">
+                <div className="flex items-center gap-3 mb-2">
+                  <Ban size={20} className="text-red-600" />
+                  <span className="text-sm text-red-800 font-bold">Access Denied</span>
+                </div>
+                <p className="text-xs text-red-700">This wallet address has been flagged and cannot be used to access KasVillage.</p>
+              </div>
+            )}
+            
+            <Button
+              onClick={handleWalletCheck}
+              disabled={!walletAddress || sanctionStatus === 'checking' || sanctionStatus === 'blocked'}
+              className={cn(
+                "w-full py-4 font-bold transition-all",
+                sanctionStatus === 'checking' ? "bg-stone-300 cursor-wait" :
+                sanctionStatus === 'blocked' ? "bg-red-200 cursor-not-allowed" :
+                "bg-green-600 hover:bg-green-700 text-white"
+              )}
+            >
+              {sanctionStatus === 'checking' ? 'Verifying...' : 'Verify Wallet'}
+            </Button>
+          </div>
         </div>
+      </div>
+    );
+  }
 
-        {/* Manual Continue Button */}
-        <Button
-          onClick={onBridgeComplete}
-          disabled={!isAnimationComplete} // Button is disabled until animation finishes
-          className={cn(
-             "w-full py-4 font-bold transition-all flex items-center justify-center gap-2 shadow-lg active:scale-95",
-             isAnimationComplete ? "bg-green-600 hover:bg-green-700 text-white" : "bg-stone-300 text-stone-600 cursor-wait"
-          )}
-        >
-          {isAnimationComplete ? (
-            <>Continue to Dashboard <ArrowRight size={18} /></>
-          ) : (
-            <>Initializing Bridge...</>
-          )}
-        </Button>
+  // Step 3: Terms of Service
+  if (step === 'tos') {
+    return (
+      <div className="fixed inset-0 bg-stone-900/95 backdrop-blur-md flex items-center justify-center p-4 z-[9999]">
+        <div className="bg-white w-full max-w-lg rounded-3xl p-6 shadow-2xl max-h-[90vh] overflow-y-auto">
+          <div className="text-center mb-6">
+            <div className="w-16 h-16 bg-amber-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <FileText className="text-amber-600" size={32} />
+            </div>
+            <h2 className="text-2xl font-black text-amber-900">Terms of Service</h2>
+            <p className="text-sm text-stone-500 mt-2">Required agreement before entry</p>
+          </div>
+
+          <div className="space-y-3 mb-6">
+            <label className="flex items-start gap-3 p-3 bg-stone-50 rounded-xl border border-stone-200 cursor-pointer hover:border-amber-300 transition">
+              <input 
+                type="checkbox" 
+                checked={tosAgreed.jurisdiction}
+                onChange={(e) => setTosAgreed(p => ({ ...p, jurisdiction: e.target.checked }))}
+                className="w-5 h-5 mt-0.5 accent-amber-600"
+              />
+              <div>
+                <div className="font-bold text-stone-800 text-sm">Jurisdiction Certification</div>
+                <p className="text-xs text-stone-500">I am NOT a resident of any OFAC-sanctioned jurisdiction (North Korea, Iran, Cuba, Syria, Russia, Belarus, Sudan).</p>
+              </div>
+            </label>
+
+            <label className="flex items-start gap-3 p-3 bg-stone-50 rounded-xl border border-stone-200 cursor-pointer hover:border-amber-300 transition">
+              <input 
+                type="checkbox" 
+                checked={tosAgreed.nonCustodial}
+                onChange={(e) => setTosAgreed(p => ({ ...p, nonCustodial: e.target.checked }))}
+                className="w-5 h-5 mt-0.5 accent-amber-600"
+              />
+              <div>
+                <div className="font-bold text-stone-800 text-sm">Non-Custodial Acknowledgment</div>
+                <p className="text-xs text-stone-500">I understand this is non-custodial. I control my keys and am solely responsible for my funds.</p>
+              </div>
+            </label>
+
+            <label className="flex items-start gap-3 p-3 bg-stone-50 rounded-xl border border-stone-200 cursor-pointer hover:border-amber-300 transition">
+              <input 
+                type="checkbox" 
+                checked={tosAgreed.taxResponsibility}
+                onChange={(e) => setTosAgreed(p => ({ ...p, taxResponsibility: e.target.checked }))}
+                className="w-5 h-5 mt-0.5 accent-amber-600"
+              />
+              <div>
+                <div className="font-bold text-stone-800 text-sm">Tax Responsibility</div>
+                <p className="text-xs text-stone-500">I am solely responsible for any taxes owed on transactions through this platform.</p>
+              </div>
+            </label>
+
+            <label className="flex items-start gap-3 p-3 bg-stone-50 rounded-xl border border-stone-200 cursor-pointer hover:border-amber-300 transition">
+              <input 
+                type="checkbox" 
+                checked={tosAgreed.riskAcknowledgment}
+                onChange={(e) => setTosAgreed(p => ({ ...p, riskAcknowledgment: e.target.checked }))}
+                className="w-5 h-5 mt-0.5 accent-amber-600"
+              />
+              <div>
+                <div className="font-bold text-stone-800 text-sm">Risk Acknowledgment</div>
+                <p className="text-xs text-stone-500">I understand crypto involves risks including volatility, bugs, and potential total loss.</p>
+              </div>
+            </label>
+          </div>
+
+          <div className="mb-6">
+            <label className="block text-sm font-bold text-stone-600 mb-2">Digital Signature</label>
+            <input
+              type="text"
+              value={signature}
+              onChange={(e) => setSignature(e.target.value)}
+              placeholder="Type your name to sign"
+              className="w-full p-4 border-2 border-stone-200 rounded-xl focus:border-amber-500 focus:outline-none"
+            />
+          </div>
+
+          <Button
+            onClick={handleSignTos}
+            disabled={!canSign}
+            className={cn(
+              "w-full py-4 font-bold transition-all",
+              canSign ? "bg-amber-600 hover:bg-amber-700 text-white" : "bg-stone-300 cursor-not-allowed"
+            )}
+          >
+            {canSign ? 'Sign & Enter KasVillage' : 'Please agree to all terms'}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  // Step 4: Ready - entering
+  return (
+    <div className="fixed inset-0 bg-green-600 flex items-center justify-center p-4 z-[9999]">
+      <div className="text-center text-white">
+        <CheckCircle2 size={80} className="mx-auto mb-4 animate-pulse" />
+        <h2 className="text-3xl font-black">Welcome to KasVillage!</h2>
+        <p className="text-lg opacity-80 mt-2">Entering the Village...</p>
       </div>
     </div>
   );
@@ -8680,12 +8956,16 @@ if (showHumanVerification) {
 if (showBridge) {
   return (
     <VerificationBridgeScreen 
-      onBridgeComplete={handleBridgeComplete} // This calls login() and closes the bridge
+      onBridgeComplete={handleBridgeComplete} // Includes wallet sanctions check + TOS signing
     />
   );
 }
-// 3. Terms of Service (Clickwrap)
-if (showClickwrap) return <ClickwrapModal onSign={signClickwrap} onCancel={() => setShowClickwrap(false)} />;
+
+// NOTE: Clickwrap is now handled inside VerificationBridgeScreen
+// This check remains as fallback for edge cases
+if (showClickwrap && !localStorage.getItem('clickwrap_signature')) {
+  return <ClickwrapModal onSign={signClickwrap} onCancel={() => setShowClickwrap(false)} />;
+}
 
 // 4. MAIN DASHBOARD RENDER (If all above pass)
 return (

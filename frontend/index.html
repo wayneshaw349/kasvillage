@@ -1,26 +1,107 @@
 <!DOCTYPE html>
-<html lang="en"> 
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-    <meta name="theme-color" content="#f59e0b" />
-    <title>KasVillage - Layer 2</title>
-    <!-- Tailwind CDN -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-      body {
-        background-color: #fffbeb;
-        margin: 0;
-        padding: 0;
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KasVillage - L2 Privacy Payments</title>
+  
+  <!-- CACHE CONTROL - Prevent stale JS -->
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  
+  <!-- PWA / Mobile -->
+  <meta name="theme-color" content="#4F46E5" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  
+  <!-- Favicon -->
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  
+  <style>
+    /* Critical CSS - Loading state */
+    body { margin: 0; font-family: system-ui, sans-serif; background: #0f172a; }
+    #root { min-height: 100vh; }
+    .loading-screen {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      color: #e2e8f0;
+    }
+    .loading-spinner {
+      width: 48px;
+      height: 48px;
+      border: 4px solid #334155;
+      border-top-color: #6366f1;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .loading-text { margin-top: 16px; font-size: 14px; opacity: 0.7; }
+    .version-tag { position: fixed; bottom: 8px; right: 8px; font-size: 10px; opacity: 0.3; color: #64748b; }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div class="loading-screen">
+      <div class="loading-spinner"></div>
+      <div class="loading-text">Loading KasVillage...</div>
+    </div>
+  </div>
+  
+  <div class="version-tag" id="version-tag">v--</div>
+  
+  <script>
+    // ========================================
+    // CACHE BUSTER - Runs before React loads
+    // ========================================
+    const BUILD_VERSION = '2025.01.09.001';
+    
+    (function() {
+      const cachedVer = localStorage.getItem('kv_build_version');
+      
+      // Display version
+      document.getElementById('version-tag').textContent = 'v' + BUILD_VERSION;
+      
+      // If version changed, clear everything
+      if (cachedVer && cachedVer !== BUILD_VERSION) {
+        console.log('🧹 New version detected, clearing caches...');
+        
+        // Clear service workers
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.getRegistrations().then(regs => {
+            regs.forEach(reg => reg.unregister());
+          });
+        }
+        
+        // Clear cache storage
+        if ('caches' in window) {
+          caches.keys().then(names => {
+            names.forEach(name => caches.delete(name));
+          });
+        }
+        
+        // Clear localStorage app data (keep user prefs)
+        const keysToKeep = ['kv_avatar_data', 'kv_avatar_name', 'kv_identity_hash'];
+        const allKeys = Object.keys(localStorage).filter(k => k.startsWith('kv_'));
+        // Actually, for version change, clear avatar data too to force re-validation
+        localStorage.removeItem('kv_avatar_data');
+        localStorage.removeItem('kv_avatar_name');
+        
+        localStorage.setItem('kv_build_version', BUILD_VERSION);
+        
+        // Force reload bypassing cache
+        window.location.reload(true);
+        return;
       }
-      * {
-        box-sizing: border-box;
-      }
-    </style>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
+      
+      localStorage.setItem('kv_build_version', BUILD_VERSION);
+    })();
+  </script>
+  
+  <!-- Vite injects scripts here in dev, or use hashed bundle in prod -->
+  <script type="module" src="/src/App.jsx"></script>
+</body>
 </html>

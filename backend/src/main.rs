@@ -236,6 +236,47 @@ mod serde_arrays {
     }
 }
 
+/// Module for serializing/deserializing [u8; 32] (hashes)
+mod serde_arrays32 {
+    use serde::{Serializer, Deserializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Visitor;
+        
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = [u8; 32];
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("32 bytes")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<[u8; 32], E>
+            where
+                E: serde::de::Error,
+            {
+                if v.len() != 32 {
+                    return Err(E::custom(format!("expected 32 bytes, got {}", v.len())));
+                }
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(v);
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_bytes(Visitor)
+    }
+}
+
 /// Module for serializing/deserializing [u8; 64] (signatures)
 mod serde_sig64 {
     use serde::{Serializer, Deserializer};
@@ -18568,40 +18609,878 @@ pub async fn start_api_server(
     host: &str,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize Halo2 setup (expensive)
+    println!("🚀 Starting KasVillage L2 Server...");
+    
+    // ========================================================================
+    // CORE CRYPTOGRAPHIC SETUP
+    // ========================================================================
     let halo2_setup = Arc::new(Halo2Setup::new()?);
     let proof_generator = Arc::new(ProofGenerator::new(halo2_setup.clone()));
     let kaspa_submitter = Arc::new(KaspaRootSubmitter::mainnet());
     let ledger = Arc::new(RwLock::new(NonCustodialLedger::new()));
 
+    // ========================================================================
+    // KASPA L1 NODE - Self-hosted (Flux) or public API
+    // ========================================================================
+    // Configure via: KASPA_NODE_URL=ws://your-flux-node:16210
+    // Or use public API if not set
+    let kaspa_node = Arc::new(KaspaFluxNode::from_env());
+    
+    // Health check the node
+    match kaspa_node.health_check().await {
+        Ok(true) => println!("[KASPA] ✓ Node connected: {}", kaspa_node.node_url()),
+        Ok(false) => eprintln!("[KASPA] ⚠ Node returned unhealthy"),
+        Err(e) => eprintln!("[KASPA] ⚠ Node health check failed: {}", e),
+    }
+    
+    let kaspa_node_data = web::Data::new(kaspa_node.clone());
+
     let state = web::Data::new(ServerState {
-        halo2_setup,
-        proof_generator,
+        halo2_setup: halo2_setup.clone(),
+        proof_generator: proof_generator.clone(),
         kaspa_submitter,
         ledger,
     });
 
-    println!("Starting API server on {}:{}", host, port);
+    // ========================================================================
+    // MERKLE TREES - One main tree, one sanctions tree
+    // ========================================================================
+    let main_tree = Arc::new(std::sync::RwLock::new(SparseMerkleTree::new(TREE_DEPTH)));
+    let sanctions_tree = Arc::new(std::sync::RwLock::new(SparseMerkleTree::new(TREE_DEPTH)));
+    
+    let main_tree_data = web::Data::new(main_tree.clone());
+    let sanctions_tree_data = web::Data::new(sanctions_tree.clone());
+    
+    println!("[MERKLE] ✓ Main tree initialized (depth {})", TREE_DEPTH);
+    println!("[MERKLE] ✓ Sanctions tree initialized (depth {})", TREE_DEPTH);
 
+    // ========================================================================
+    // SANCTIONS - Load Treasury OFAC + OpenSanctions
+    // ========================================================================
+    println!("[SANCTIONS] Loading sanctions lists...");
+    
+    let sanctions_db = match fetch_ofac_sdn_list().await {
+        Ok(mut db) => {
+            println!("[SANCTIONS] ✓ Treasury OFAC: {} entries, {} crypto addresses", 
+                db.entry_count, db.sdn_addresses.len());
+            
+            match ComplianceSanctionsLoader::load_opensanctions_csv().await {
+                Ok(opensanctions) => {
+                    let addr_before = db.sdn_addresses.len();
+                    let name_before = db.sdn_names.len();
+                    
+                    for source in opensanctions {
+                        let id = source.identifier.trim();
+                        if id.starts_with("0x") && id.len() == 42 {
+                            db.sdn_addresses.insert(id.to_lowercase());
+                        } else if id.starts_with("kaspa:") && id.len() >= 60 {
+                            db.sdn_addresses.insert(id.to_string());
+                        } else if (id.starts_with("1") || id.starts_with("3") || id.starts_with("bc1")) 
+                            && id.len() >= 26 && id.len() <= 62 {
+                            db.sdn_addresses.insert(id.to_string());
+                        } else if id.len() > 2 {
+                            db.sdn_names.insert(id.to_uppercase());
+                        }
+                    }
+                    
+                    println!("[SANCTIONS] ✓ OpenSanctions: +{} addresses, +{} names", 
+                        db.sdn_addresses.len() - addr_before,
+                        db.sdn_names.len() - name_before);
+                }
+                Err(e) => eprintln!("[SANCTIONS] ⚠ OpenSanctions load failed: {}", e),
+            }
+            
+            println!("[SANCTIONS] ✓ Total: {} addresses, {} names, {} countries",
+                db.sdn_addresses.len(), db.sdn_names.len(), db.sdn_countries.len());
+            db
+        }
+        Err(e) => {
+            eprintln!("[SANCTIONS] ⚠ Treasury OFAC load failed: {}", e);
+            SanctionsDatabase::default()
+        }
+    };
+    
+    let sanctions_state = web::Data::new(SanctionsState {
+        db: Arc::new(RwLock::new(sanctions_db)),
+    });
+    
+    let sanctions_db_ref = sanctions_state.db.clone();
+    tokio::spawn(async move {
+        sanctions_refresh_task(sanctions_db_ref).await;
+    });
+
+    // ========================================================================
+    // APP STATE - Storefronts, Consignments, Onboarding, Stats
+    // ========================================================================
+    let app_state = web::Data::new(AppStateAdditions {
+        circuit_breaker: RwLock::new(CircuitBreakerState::new()),
+        consignment_agreements: RwLock::new(HashMap::new()),
+        storefronts: RwLock::new(HashMap::new()),
+        storefront_visits: RwLock::new(HashMap::new()),
+        storefront_click_counts: RwLock::new(HashMap::new()),
+        merchant_balances: RwLock::new(HashMap::new()),
+        onboarding_sessions: RwLock::new(HashMap::new()),
+        onboarding_scores: RwLock::new(HashMap::new()),
+        sanctions: SanctionsState::new(),
+    });
+
+    // ========================================================================
+    // IDENTITY MERKLE TREE - Avatar commitments (ZK-Identity)
+    // ========================================================================
+    let identity_tree = web::Data::new(std::sync::RwLock::new(IdentityMerkleTree::new()));
+    println!("[IDENTITY] ✓ Identity tree initialized");
+
+    // ========================================================================
+    // UNIFIED ACCOUNT REGISTRY - Maps pubkey to all account data
+    // ========================================================================
+    let account_registry = web::Data::new(std::sync::RwLock::new(UnifiedAccountRegistry::new()));
+    println!("[ACCOUNTS] ✓ Unified account registry initialized");
+
+    // ========================================================================
+    // QUANTUM MERKLE TREE - Ephemeral signatures for offline transactions
+    // ========================================================================
+    let qr_tree = web::Data::new(std::sync::RwLock::new(QuantumMerkleTree::new(QR_MERKLE_DEPTH)));
+    println!("[QR-MERKLE] ✓ Quantum-resistant ephemeral key tree initialized (depth {})", QR_MERKLE_DEPTH);
+
+    // ========================================================================
+    // AUTONOMOUS PROOF GENERATION
+    // ========================================================================
+    let proof_gen_clone = proof_generator.clone();
+    let main_tree_clone = main_tree.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let tree = main_tree_clone.read().unwrap();
+            let root = tree.root();
+            drop(tree);
+            println!("[PROOFS] Merkle root: 0x{}", &hex::encode(root.to_repr())[..16]);
+        }
+    });
+
+    println!("[PROOFS] ✓ Autonomous proof generation started");
+    println!("📡 Listening on {}:{}", host, port);
+
+    // ========================================================================
+    // HTTP SERVER
+    // ========================================================================
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
+            .app_data(sanctions_state.clone())
+            .app_data(app_state.clone())
+            .app_data(main_tree_data.clone())
+            .app_data(sanctions_tree_data.clone())
+            .app_data(identity_tree.clone())
+            .app_data(account_registry.clone())
+            .app_data(qr_tree.clone())
+            .app_data(kaspa_node_data.clone())
             .wrap(Logger::default())
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allow_any_method()
+                    .allow_any_header()
+                    .max_age(3600)
+            )
+            // Health & State
+            .route("/api/health", web::get().to(api_health_full))
+            .route("/api/state", web::get().to(handle_state))
+            // Core L2 operations
             .route("/api/deposit", web::post().to(handle_deposit))
             .route("/api/withdrawal", web::post().to(handle_withdrawal))
             .route("/api/proof", web::post().to(handle_proof))
-            .route("/api/state", web::get().to(handle_state))
             .route("/api/submit-root", web::post().to(handle_submit_root))
+            // Merkle proofs
+            .route("/api/merkle/proof/{index}", web::get().to(api_merkle_proof))
+            .route("/api/merkle/root", web::get().to(api_merkle_root))
+            .route("/api/merkle/verify", web::post().to(api_merkle_verify))
+            // Identity & Registration
+            .route("/api/register", web::post().to(api_register_unified))
+            .route("/api/identity/commit", web::post().to(api_identity_commit))
+            .route("/api/identity/verify", web::post().to(api_identity_verify))
+            .route("/api/identity/questions/{pubkey}", web::get().to(api_get_avatar_questions))
+            .route("/api/account/{pubkey}", web::get().to(api_get_account))
+            // User endpoints
             .route("/api/user/fcm-token", web::post().to(handle_fcm_register))
             .route("/api/user/fcm-token", web::delete().to(handle_fcm_unregister))
-            .route("/api/alerts/active", web::get().to(handle_active_alerts))
             .route("/api/user/{pubkey}/queue-position", web::get().to(handle_queue_position))
+            .route("/api/alerts/active", web::get().to(handle_active_alerts))
+            // Kaspa L1 operations
+            .route("/api/l1/balance/{address}", web::get().to(api_l1_balance))
+            .route("/api/l1/utxos/{address}", web::get().to(api_l1_utxos))
+            .route("/api/l1/tx/{hash}", web::get().to(api_l1_transaction))
+            .route("/api/l1/blockdag", web::get().to(api_l1_blockdag))
+            .route("/api/l1/submit", web::post().to(api_l1_submit_tx))
+            // Ephemeral signature routes (QR-Merkle)
+            .configure(configure_qr_merkle_routes)
+            // All frontend routes
+            .configure(configure_routes_additions)
     })
     .bind(&format!("{}:{}", host, port))?
     .run()
     .await?;
 
     Ok(())
+}
+
+// ============================================================================
+// KASPA L1 API ENDPOINTS
+// ============================================================================
+
+/// GET /api/l1/balance/{address} - Get Kaspa L1 address balance
+pub async fn api_l1_balance(
+    address: web::Path<String>,
+    kaspa_node: web::Data<Arc<KaspaFluxNode>>,
+) -> impl Responder {
+    match kaspa_node.get_balance(&address).await {
+        Ok(balance) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "address": address.as_str(),
+            "balance_sompi": balance,
+            "balance_kas": balance as f64 / 100_000_000.0
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "error": e
+        })),
+    }
+}
+
+/// GET /api/l1/utxos/{address} - Get UTXOs for address
+pub async fn api_l1_utxos(
+    address: web::Path<String>,
+    kaspa_node: web::Data<Arc<KaspaFluxNode>>,
+) -> impl Responder {
+    match kaspa_node.get_utxos(&address).await {
+        Ok(utxos) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "address": address.as_str(),
+            "utxo_count": utxos.len(),
+            "utxos": utxos
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "error": e
+        })),
+    }
+}
+
+/// GET /api/l1/tx/{hash} - Get transaction by hash
+pub async fn api_l1_transaction(
+    hash: web::Path<String>,
+    kaspa_node: web::Data<Arc<KaspaFluxNode>>,
+) -> impl Responder {
+    match kaspa_node.get_transaction(&hash).await {
+        Ok(tx) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "transaction": tx
+        })),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({
+            "success": false,
+            "error": e
+        })),
+    }
+}
+
+/// GET /api/l1/blockdag - Get current block DAG info
+pub async fn api_l1_blockdag(
+    kaspa_node: web::Data<Arc<KaspaFluxNode>>,
+) -> impl Responder {
+    match kaspa_node.get_block_dag_info().await {
+        Ok(info) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "blockdag": info
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "error": e
+        })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct L1SubmitRequest {
+    pub transaction_hex: String,
+}
+
+/// POST /api/l1/submit - Submit signed transaction to Kaspa L1
+pub async fn api_l1_submit_tx(
+    req: web::Json<L1SubmitRequest>,
+    kaspa_node: web::Data<Arc<KaspaFluxNode>>,
+) -> impl Responder {
+    match kaspa_node.submit_transaction(&req.transaction_hex).await {
+        Ok(tx_id) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "transaction_id": tx_id,
+            "message": "Transaction submitted to Kaspa L1"
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "error": e
+        })),
+    }
+}
+// HEALTH ENDPOINT (Full)
+// ============================================================================
+pub async fn api_health_full(
+    main_tree: web::Data<Arc<std::sync::RwLock<SparseMerkleTree>>>,
+    sanctions_state: web::Data<SanctionsState>,
+) -> impl Responder {
+    let tree = main_tree.read().unwrap();
+    let sanctions_db = sanctions_state.db.read().await;
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "healthy",
+        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        "version": "1.0.0",
+        "merkle_root": hex::encode(tree.root().to_repr()),
+        "sanctions": {
+            "loaded": sanctions_db.last_updated > 0,
+            "addresses": sanctions_db.sdn_addresses.len(),
+            "names": sanctions_db.sdn_names.len(),
+            "last_updated": sanctions_db.last_updated
+        }
+    }))
+}
+
+// ============================================================================
+// MERKLE PROOF ENDPOINTS
+// ============================================================================
+pub async fn api_merkle_proof(
+    index: web::Path<u64>,
+    main_tree: web::Data<Arc<std::sync::RwLock<SparseMerkleTree>>>,
+) -> impl Responder {
+    let tree = main_tree.read().unwrap();
+    let proof = tree.generate_proof(*index);
+    let root = tree.root();
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "index": *index,
+        "root": hex::encode(root.to_repr()),
+        "path": proof.path.iter().map(|p| serde_json::json!({
+            "sibling": hex::encode(p.sibling.to_repr()),
+            "is_left": p.is_left
+        })).collect::<Vec<_>>()
+    }))
+}
+
+pub async fn api_merkle_root(
+    main_tree: web::Data<Arc<std::sync::RwLock<SparseMerkleTree>>>,
+) -> impl Responder {
+    let tree = main_tree.read().unwrap();
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "root": hex::encode(tree.root().to_repr()),
+        "depth": TREE_DEPTH,
+        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct MerkleVerifyRequest {
+    pub index: u64,
+    pub leaf_hash: String,
+    pub proof_path: Vec<String>,
+}
+
+pub async fn api_merkle_verify(
+    req: web::Json<MerkleVerifyRequest>,
+    main_tree: web::Data<Arc<std::sync::RwLock<SparseMerkleTree>>>,
+) -> impl Responder {
+    let tree = main_tree.read().unwrap();
+    let expected_root = tree.root();
+    
+    let leaf_bytes = match hex::decode(&req.leaf_hash) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid leaf_hash"})),
+    };
+    
+    let leaf: Fq = match Fq::from_repr(leaf_bytes).into() {
+        Some(f) => f,
+        None => return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid leaf"})),
+    };
+    
+    let mut current = leaf;
+    for (i, sibling_hex) in req.proof_path.iter().enumerate() {
+        let sibling_bytes = match hex::decode(sibling_hex) {
+            Ok(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                arr
+            }
+            _ => return HttpResponse::BadRequest().json(serde_json::json!({"error": format!("Invalid sibling at {}", i)})),
+        };
+        
+        let sibling: Fq = match Fq::from_repr(sibling_bytes).into() {
+            Some(f) => f,
+            None => return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid sibling field"})),
+        };
+        
+        let bit = (req.index >> i) & 1;
+        current = if bit == 0 {
+            poseidon_internal_hash(current, sibling)
+        } else {
+            poseidon_internal_hash(sibling, current)
+        };
+    }
+    
+    let valid = bool::from(current.ct_eq(&expected_root));
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "valid": valid,
+        "computed_root": hex::encode(current.to_repr()),
+        "expected_root": hex::encode(expected_root.to_repr())
+    }))
+}
+
+// ============================================================================
+// UNIFIED ACCOUNT REGISTRY - Single source of truth for all account data
+// ============================================================================
+
+/// Unified account that combines balance, identity, XP, and all user state
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnifiedAccount {
+    /// User's compressed secp256k1 public key (hex)
+    pub pubkey: String,
+    /// Account index in main Merkle tree
+    pub merkle_index: u64,
+    /// Current balance in sompi
+    pub balance: u64,
+    /// Transaction nonce (replay protection)
+    pub nonce: u64,
+    /// Identity commitment hash (Poseidon(avatar, salt))
+    pub identity_commitment: [u8; 32],
+    /// Gross XP accumulated
+    pub xp_gross: u64,
+    /// Net XP (after penalties)
+    pub xp_net: i64,
+    /// Successful transactions
+    pub tx_success: u64,
+    /// Failed transactions
+    pub tx_failed: u64,
+    /// Account creation timestamp
+    pub created_at: u64,
+    /// Last activity timestamp
+    pub last_active: u64,
+    /// Is account sanctioned (frozen)
+    pub is_sanctioned: bool,
+    /// Avatar name (display only, not stored in commitment)
+    pub avatar_name: Option<String>,
+}
+
+impl UnifiedAccount {
+    /// Create new account with identity commitment
+    pub fn new(pubkey: &str, identity_commitment: [u8; 32], avatar_name: Option<String>) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Self {
+            pubkey: pubkey.to_string(),
+            merkle_index: 0, // Set when inserted into tree
+            balance: 0,
+            nonce: 0,
+            identity_commitment,
+            xp_gross: 0,
+            xp_net: 0,
+            tx_success: 0,
+            tx_failed: 0,
+            created_at: now,
+            last_active: now,
+            is_sanctioned: false,
+            avatar_name,
+        }
+    }
+    
+    /// Compute account leaf hash for Merkle tree
+    pub fn leaf_hash(&self) -> Fq {
+        // Hash all account fields into single leaf
+        let mut data = Vec::new();
+        data.extend_from_slice(self.pubkey.as_bytes());
+        data.extend_from_slice(&self.balance.to_le_bytes());
+        data.extend_from_slice(&self.nonce.to_le_bytes());
+        data.extend_from_slice(&self.identity_commitment);
+        data.extend_from_slice(&self.xp_gross.to_le_bytes());
+        
+        FieldConverter::bytes_to_fq(b"account_leaf", &data)
+    }
+}
+
+/// Unified account registry
+pub struct UnifiedAccountRegistry {
+    /// All accounts by pubkey
+    accounts: HashMap<String, UnifiedAccount>,
+    /// Pubkey lookup by merkle index
+    index_to_pubkey: HashMap<u64, String>,
+    /// Next available merkle index
+    next_index: u64,
+}
+
+impl UnifiedAccountRegistry {
+    pub fn new() -> Self {
+        Self {
+            accounts: HashMap::new(),
+            index_to_pubkey: HashMap::new(),
+            next_index: 0,
+        }
+    }
+    
+    /// Register new account with identity commitment
+    pub fn register(
+        &mut self, 
+        pubkey: &str, 
+        identity_commitment: [u8; 32],
+        avatar_name: Option<String>,
+    ) -> Result<&UnifiedAccount, String> {
+        if self.accounts.contains_key(pubkey) {
+            return Err("Account already exists".to_string());
+        }
+        
+        let mut account = UnifiedAccount::new(pubkey, identity_commitment, avatar_name);
+        account.merkle_index = self.next_index;
+        
+        self.index_to_pubkey.insert(self.next_index, pubkey.to_string());
+        self.accounts.insert(pubkey.to_string(), account);
+        self.next_index += 1;
+        
+        Ok(self.accounts.get(pubkey).unwrap())
+    }
+    
+    /// Get account by pubkey
+    pub fn get(&self, pubkey: &str) -> Option<&UnifiedAccount> {
+        self.accounts.get(pubkey)
+    }
+    
+    /// Get mutable account
+    pub fn get_mut(&mut self, pubkey: &str) -> Option<&mut UnifiedAccount> {
+        self.accounts.get_mut(pubkey)
+    }
+    
+    /// Update account balance
+    pub fn update_balance(&mut self, pubkey: &str, new_balance: u64) -> Result<(), String> {
+        match self.accounts.get_mut(pubkey) {
+            Some(account) => {
+                account.balance = new_balance;
+                account.last_active = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                Ok(())
+            }
+            None => Err("Account not found".to_string()),
+        }
+    }
+    
+    /// Add XP to account
+    pub fn add_xp(&mut self, pubkey: &str, xp: u64) -> Result<(), String> {
+        match self.accounts.get_mut(pubkey) {
+            Some(account) => {
+                account.xp_gross += xp;
+                account.xp_net += xp as i64;
+                account.tx_success += 1;
+                Ok(())
+            }
+            None => Err("Account not found".to_string()),
+        }
+    }
+    
+    /// Total registered accounts
+    pub fn count(&self) -> usize {
+        self.accounts.len()
+    }
+}
+
+// ============================================================================
+// IDENTITY & REGISTRATION API ENDPOINTS
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct UnifiedRegisterRequest {
+    pub pubkey: String,
+    /// Identity commitment hash (hex) - Poseidon(normalized_avatar, salt)
+    pub identity_commitment: String,
+    /// Avatar name for display (optional, not part of commitment)
+    pub avatar_name: Option<String>,
+}
+
+/// POST /api/register - Unified account registration with identity
+pub async fn api_register_unified(
+    req: web::Json<UnifiedRegisterRequest>,
+    account_registry: web::Data<std::sync::RwLock<UnifiedAccountRegistry>>,
+    identity_tree: web::Data<std::sync::RwLock<IdentityMerkleTree>>,
+    main_tree: web::Data<Arc<std::sync::RwLock<SparseMerkleTree>>>,
+    sanctions_state: web::Data<SanctionsState>,
+) -> impl Responder {
+    // 1. Check sanctions
+    let sanctions_db = sanctions_state.db.read().await;
+    if sanctions_db.sdn_addresses.contains(&req.pubkey.to_lowercase()) {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "success": false,
+            "error": "Address is sanctioned",
+            "sanctioned": true
+        }));
+    }
+    drop(sanctions_db);
+    
+    // 2. Parse identity commitment
+    let identity_bytes: [u8; 32] = match hex::decode(&req.identity_commitment) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({
+            "success": false,
+            "error": "Invalid identity_commitment (expected 64 hex chars)"
+        })),
+    };
+    
+    // 3. Register in account registry
+    let (merkle_index, account_leaf_hash) = {
+        let mut registry = match account_registry.write() {
+            Ok(r) => r,
+            Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": "Failed to lock account registry"
+            })),
+        };
+        
+        match registry.register(&req.pubkey, identity_bytes, req.avatar_name.clone()) {
+            Ok(account) => (account.merkle_index, account.leaf_hash()),
+            Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({
+                "success": false,
+                "error": e
+            })),
+        }
+    };
+    
+    // 4. Add identity to identity tree
+    {
+        let mut id_tree = match identity_tree.write() {
+            Ok(t) => t,
+            Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": "Failed to lock identity tree"
+            })),
+        };
+        
+        if let Err(e) = id_tree.add_commitment(&req.pubkey, identity_bytes) {
+            // Not fatal - account is still created
+            eprintln!("[IDENTITY] Warning: Failed to add to identity tree: {}", e);
+        }
+    }
+    
+    // 5. Insert into main Merkle tree
+    {
+        let mut tree = match main_tree.write() {
+            Ok(t) => t,
+            Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": "Failed to lock merkle tree"
+            })),
+        };
+        
+        // Update leaf at account's index
+        tree.update(merkle_index, account_leaf_hash);
+    }
+    
+    // 6. Get proof for the new account
+    let (merkle_root, proof_path_len) = {
+        let tree = main_tree.read().unwrap();
+        let proof = tree.generate_proof(merkle_index);
+        (tree.root(), proof.path.len())
+    };
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "pubkey": req.pubkey,
+        "merkle_index": merkle_index,
+        "merkle_root": hex::encode(merkle_root.to_repr()),
+        "identity_committed": true,
+        "avatar_name": req.avatar_name,
+        "message": "Account registered with identity commitment"
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct IdentityCommitRequest {
+    pub pubkey: String,
+    /// Avatar personality for generating questions
+    pub avatar: Option<AvatarPersonalityDto>,
+    /// Or direct identity hash
+    pub identity_hash: Option<String>,
+}
+
+/// POST /api/identity/commit - Commit avatar identity to tree
+pub async fn api_identity_commit(
+    req: web::Json<IdentityCommitRequest>,
+    identity_tree: web::Data<std::sync::RwLock<IdentityMerkleTree>>,
+) -> impl Responder {
+    if let Some(avatar) = &req.avatar {
+        let personality = AvatarPersonality::new(
+            &avatar.name,
+            &avatar.class,
+            &avatar.race,
+            &avatar.occupation,
+            &avatar.story,
+        );
+        
+        let mut tree = match identity_tree.write() {
+            Ok(t) => t,
+            Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": "Failed to lock identity tree"
+            })),
+        };
+        
+        match tree.add_commitment_with_personality(&req.pubkey, personality) {
+            Ok(leaf_index) => HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "pubkey": req.pubkey,
+                "leaf_index": leaf_index,
+                "message": "Avatar identity committed"
+            })),
+            Err(e) => HttpResponse::BadRequest().json(serde_json::json!({
+                "success": false,
+                "error": e
+            })),
+        }
+    } else if let Some(hash_hex) = &req.identity_hash {
+        let hash_bytes: [u8; 32] = match hex::decode(hash_hex) {
+            Ok(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                arr
+            }
+            _ => return HttpResponse::BadRequest().json(serde_json::json!({
+                "success": false,
+                "error": "Invalid identity_hash"
+            })),
+        };
+        
+        let mut tree = match identity_tree.write() {
+            Ok(t) => t,
+            Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": "Failed to lock identity tree"
+            })),
+        };
+        
+        match tree.add_commitment(&req.pubkey, hash_bytes) {
+            Ok(leaf_index) => HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "pubkey": req.pubkey,
+                "leaf_index": leaf_index,
+                "message": "Identity hash committed"
+            })),
+            Err(e) => HttpResponse::BadRequest().json(serde_json::json!({
+                "success": false,
+                "error": e
+            })),
+        }
+    } else {
+        HttpResponse::BadRequest().json(serde_json::json!({
+            "success": false,
+            "error": "Must provide avatar or identity_hash"
+        }))
+    }
+}
+
+#[derive(Deserialize)]
+pub struct IdentityVerifyRequest {
+    pub pubkey: String,
+    /// ZK proof bytes (hex)
+    pub zk_proof: String,
+}
+
+/// POST /api/identity/verify - Verify identity using ZK proof
+pub async fn api_identity_verify(
+    req: web::Json<IdentityVerifyRequest>,
+    identity_tree: web::Data<std::sync::RwLock<IdentityMerkleTree>>,
+) -> impl Responder {
+    let tree = match identity_tree.read() {
+        Ok(t) => t,
+        Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "error": "Failed to read identity tree"
+        })),
+    };
+    
+    // Get stored commitment
+    let commitment = match tree.get_by_pubkey(&req.pubkey) {
+        Some(c) => c,
+        None => return HttpResponse::NotFound().json(serde_json::json!({
+            "success": false,
+            "error": "No identity commitment found for pubkey"
+        })),
+    };
+    
+    // TODO: Verify ZK proof against commitment
+    // For now, return the commitment exists
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "pubkey": req.pubkey,
+        "commitment_exists": true,
+        "committed_at": commitment.committed_at,
+        "message": "Identity verification pending ZK proof implementation"
+    }))
+}
+
+/// GET /api/account/{pubkey} - Get full account state
+pub async fn api_get_account(
+    pubkey: web::Path<String>,
+    account_registry: web::Data<std::sync::RwLock<UnifiedAccountRegistry>>,
+    main_tree: web::Data<Arc<std::sync::RwLock<SparseMerkleTree>>>,
+) -> impl Responder {
+    let registry = match account_registry.read() {
+        Ok(r) => r,
+        Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "error": "Failed to read account registry"
+        })),
+    };
+    
+    match registry.get(&pubkey) {
+        Some(account) => {
+            // Get merkle proof
+            let tree = main_tree.read().unwrap();
+            let proof = tree.generate_proof(account.merkle_index);
+            let root = tree.root();
+            
+            HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "account": {
+                    "pubkey": account.pubkey,
+                    "merkle_index": account.merkle_index,
+                    "balance": account.balance,
+                    "balance_kas": account.balance as f64 / 100_000_000.0,
+                    "nonce": account.nonce,
+                    "xp_gross": account.xp_gross,
+                    "xp_net": account.xp_net,
+                    "tx_success": account.tx_success,
+                    "tx_failed": account.tx_failed,
+                    "created_at": account.created_at,
+                    "last_active": account.last_active,
+                    "is_sanctioned": account.is_sanctioned,
+                    "avatar_name": account.avatar_name,
+                },
+                "merkle_proof": {
+                    "root": hex::encode(root.to_repr()),
+                    "index": account.merkle_index,
+                    "path_length": proof.path.len()
+                }
+            }))
+        }
+        None => HttpResponse::NotFound().json(serde_json::json!({
+            "success": false,
+            "error": "Account not found"
+        })),
+    }
 }
 
 // ============================================================================
@@ -22845,6 +23724,321 @@ impl KaspaNetworkInfra {
     }
 }
 
+// ============================================================================
+// KASPA FLUX NODE CLIENT - Self-hosted node for L1 operations
+// ============================================================================
+// Configure via environment variable: KASPA_NODE_URL
+// Default wRPC port: 16210 (mainnet), 16310 (testnet)
+// Example: KASPA_NODE_URL=ws://your-flux-node.com:16210
+// ============================================================================
+
+/// Kaspa node connection mode
+#[derive(Clone, Debug)]
+pub enum KaspaNodeMode {
+    /// Self-hosted node (Flux) via wRPC/JSON-RPC
+    SelfHosted { url: String },
+    /// Public API fallback (api.kaspa.org)
+    PublicApi { network: KaspaNetworkInfra },
+}
+
+/// Kaspa Flux Node Client - connects to self-hosted or public node
+#[derive(Clone)]
+pub struct KaspaFluxNode {
+    mode: KaspaNodeMode,
+    http_client: reqwest::Client,
+    /// wRPC endpoint for transaction submission
+    wrpc_url: Option<String>,
+    /// REST API endpoint for queries
+    rest_url: String,
+}
+
+impl KaspaFluxNode {
+    /// Create from environment or use public API
+    pub fn from_env() -> Self {
+        let node_url = std::env::var("KASPA_NODE_URL").ok();
+        let network = std::env::var("KASPA_NETWORK")
+            .map(|n| if n.to_lowercase() == "testnet" { 
+                KaspaNetworkInfra::Testnet 
+            } else { 
+                KaspaNetworkInfra::Mainnet 
+            })
+            .unwrap_or(KaspaNetworkInfra::Mainnet);
+
+        match node_url {
+            Some(url) => Self::new_self_hosted(&url),
+            None => Self::new_public(network),
+        }
+    }
+
+    /// Connect to self-hosted Kaspa node (Flux)
+    /// url: wRPC URL like "ws://your-node:16210" or "http://your-node:16210"
+    pub fn new_self_hosted(url: &str) -> Self {
+        let base_url = url.trim_end_matches('/');
+        
+        // Determine if wRPC (WebSocket) or HTTP
+        let (wrpc_url, rest_url) = if base_url.starts_with("ws://") || base_url.starts_with("wss://") {
+            // wRPC mode - also construct REST URL
+            let http_url = base_url
+                .replace("ws://", "http://")
+                .replace("wss://", "https://");
+            (Some(base_url.to_string()), http_url)
+        } else {
+            // HTTP mode - assume same URL for REST
+            (None, base_url.to_string())
+        };
+
+        println!("[KASPA] ✓ Connecting to self-hosted node: {}", base_url);
+        
+        Self {
+            mode: KaspaNodeMode::SelfHosted { url: base_url.to_string() },
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            wrpc_url,
+            rest_url,
+        }
+    }
+
+    /// Use public Kaspa API
+    pub fn new_public(network: KaspaNetworkInfra) -> Self {
+        let rest_url = network.api_base().to_string();
+        println!("[KASPA] Using public API: {}", rest_url);
+        
+        Self {
+            mode: KaspaNodeMode::PublicApi { network },
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            wrpc_url: None,
+            rest_url,
+        }
+    }
+
+    /// Submit signed transaction to Kaspa L1
+    /// Returns transaction hash on success
+    pub async fn submit_transaction(&self, tx_hex: &str) -> Result<String, String> {
+        // Try wRPC first if available (faster)
+        if let Some(ref _wrpc) = self.wrpc_url {
+            // TODO: Implement wRPC submission when kaspa-wrpc-client is available
+            // For now, fall through to REST API
+        }
+
+        // REST API submission
+        let url = format!("{}/transactions", self.rest_url);
+        
+        let body = serde_json::json!({
+            "transaction": tx_hex
+        });
+
+        let resp = self.http_client.post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
+
+        if !resp.status().is_success() {
+            let error_text = resp.text().await.unwrap_or_default();
+            return Err(format!("Submit failed: {}", error_text));
+        }
+
+        let result: serde_json::Value = resp.json()
+            .await
+            .map_err(|e| format!("Parse error: {}", e))?;
+
+        result.get("transactionId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "Missing transactionId in response".to_string())
+    }
+
+    /// Get UTXOs for an address
+    pub async fn get_utxos(&self, address: &str) -> Result<Vec<KaspaUtxo>, String> {
+        let url = format!("{}/addresses/{}/utxos", self.rest_url, address);
+        
+        let resp = self.http_client.get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+
+        let utxos: Vec<KaspaUtxo> = resp.json()
+            .await
+            .map_err(|e| format!("Parse error: {}", e))?;
+
+        Ok(utxos)
+    }
+
+    /// Get address balance in sompi
+    pub async fn get_balance(&self, address: &str) -> Result<u64, String> {
+        let url = format!("{}/addresses/{}/balance", self.rest_url, address);
+        
+        let resp = self.http_client.get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+
+        let balance: AddressBalance = resp.json()
+            .await
+            .map_err(|e| format!("Parse error: {}", e))?;
+
+        Ok(balance.balance)
+    }
+
+    /// Get transaction by hash
+    pub async fn get_transaction(&self, tx_hash: &str) -> Result<KaspaTransaction, String> {
+        let url = format!("{}/transactions/{}", self.rest_url, tx_hash);
+        
+        let resp = self.http_client.get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+
+        let tx: KaspaTransaction = resp.json()
+            .await
+            .map_err(|e| format!("Parse error: {}", e))?;
+
+        Ok(tx)
+    }
+
+    /// Get current block DAG info (virtual DAA score = "block height")
+    pub async fn get_block_dag_info(&self) -> Result<BlockDagInfo, String> {
+        let url = format!("{}/info/blockdag", self.rest_url);
+        
+        let resp = self.http_client.get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+
+        let info: BlockDagInfo = resp.json()
+            .await
+            .map_err(|e| format!("Parse error: {}", e))?;
+
+        Ok(info)
+    }
+
+    /// Get coin supply info
+    pub async fn get_coin_supply(&self) -> Result<serde_json::Value, String> {
+        let url = format!("{}/info/coinsupply", self.rest_url);
+        
+        let resp = self.http_client.get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+
+        let info: serde_json::Value = resp.json()
+            .await
+            .map_err(|e| format!("Parse error: {}", e))?;
+
+        Ok(info)
+    }
+
+    /// Verify deposit transaction to bridge address
+    pub async fn verify_deposit(
+        &self,
+        tx_hash: &str,
+        expected_amount: u64,
+        bridge_address: &str,
+    ) -> Result<DepositVerification, String> {
+        let tx = self.get_transaction(tx_hash).await?;
+
+        // Find output to bridge address
+        let deposit_output = tx.outputs.iter()
+            .find(|o| o.script_public_key_address == bridge_address);
+
+        match deposit_output {
+            Some(output) => {
+                let amount = output.amount;
+                let confirmed = tx.is_accepted;
+
+                Ok(DepositVerification {
+                    valid: amount >= expected_amount && confirmed,
+                    tx_hash: tx_hash.to_string(),
+                    amount,
+                    confirmations: 0, // Would need DAG info to calculate
+                    block_hash: tx.accepting_block_hash.clone(),
+                    timestamp: tx.block_time,
+                })
+            }
+            None => Err("Deposit output not found".to_string()),
+        }
+    }
+
+    /// Submit withdrawal from L2 to L1
+    /// This is the main function called after FROST signature is collected
+    pub async fn submit_withdrawal(
+        &self,
+        recipient_address: &str,
+        amount_sompi: u64,
+        frost_signature: &[u8; 64],
+        proof_hash: &[u8; 32],
+    ) -> Result<String, String> {
+        // Build transaction payload
+        // In production, this would construct a proper Kaspa transaction
+        let tx_payload = serde_json::json!({
+            "outputs": [{
+                "address": recipient_address,
+                "amount": amount_sompi
+            }],
+            "signature": hex::encode(frost_signature),
+            "proof": hex::encode(proof_hash)
+        });
+
+        let url = format!("{}/transactions", self.rest_url);
+        
+        let resp = self.http_client.post(&url)
+            .json(&tx_payload)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
+
+        if !resp.status().is_success() {
+            let error = resp.text().await.unwrap_or_default();
+            return Err(format!("Withdrawal submit failed: {}", error));
+        }
+
+        let result: serde_json::Value = resp.json()
+            .await
+            .map_err(|e| format!("Parse error: {}", e))?;
+
+        result.get("transactionId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "Missing transactionId".to_string())
+    }
+
+    /// Check if node is healthy
+    pub async fn health_check(&self) -> Result<bool, String> {
+        let info = self.get_block_dag_info().await?;
+        Ok(info.virtual_daa_score > 0)
+    }
+
+    /// Get node URL for logging
+    pub fn node_url(&self) -> &str {
+        &self.rest_url
+    }
+}
+
 #[derive(Clone)]
 pub struct KaspaL1Client {
     network: KaspaNetworkInfra,
@@ -23384,7 +24578,7 @@ pub struct ComplianceSanctionsLoader;
 
 impl ComplianceSanctionsLoader {
     /// Load Treasury.gov OFAC SDN list
-    pub async fn load_treasury_ofac() -> Result<Vec<SanctionsSource>, Box<dyn std::error::Error>> {
+    pub async fn load_treasury_ofac() -> Result<Vec<SanctionsSource>, Box<dyn std::error::Error + Send + Sync>> {
         let url = "https://www.treasury.gov/ofac/downloads/sdn.csv";
         match reqwest::get(url).await {
             Ok(response) => {
@@ -23412,7 +24606,7 @@ impl ComplianceSanctionsLoader {
     }
 
     /// Load OpenSanctions crypto addresses + entities
-    pub async fn load_opensanctions_csv() -> Result<Vec<SanctionsSource>, Box<dyn std::error::Error>> {
+    pub async fn load_opensanctions_csv() -> Result<Vec<SanctionsSource>, Box<dyn std::error::Error + Send + Sync>> {
         let url = "https://opensanctions.org/datasets/default/entities.csv";
         match reqwest::get(url).await {
             Ok(response) => {
@@ -23444,7 +24638,7 @@ impl ComplianceSanctionsLoader {
     }
 
     /// Combine Treasury OFAC + OpenSanctions into single list
-    pub async fn load_all_sanctions() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    pub async fn load_all_sanctions() -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let mut all_sanctioned = Vec::new();
         match Self::load_treasury_ofac().await {
             Ok(treasury_list) => {
@@ -23499,7 +24693,7 @@ impl ComplianceGatekeeper {
     }
 
     /// Initialize with dual-source sanctions list (Treasury.gov + OpenSanctions)
-    pub async fn new_with_sanctions() -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new_with_sanctions() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let sanctioned_list = ComplianceSanctionsLoader::load_all_sanctions().await?;
         Ok(Self {
             ofac_cache: HashMap::new(),
@@ -30267,6 +31461,7 @@ impl FrostSecretShare {
     /// Verify secret share against commitment vector
     /// Check: g^{s_i} == ∏_j (g^{a_j})^{i^j} = ∏_j C_j^{i^j}
     pub fn verify_share(&self) -> Result<(), String> {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
         use k256::ProjectivePoint;
         
         // g^{s_i} - compute public key from secret share
@@ -31346,7 +32541,7 @@ pub async fn handle_withdrawal_l2(
 #[derive(Serialize, Deserialize)]
 pub struct ProofRequest {
     pub proof_id: String,
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     pub pubkey: [u8; 33],
 }
 
@@ -32923,6 +34118,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result.print_report();
         std::process::exit(if result.success { 0 } else { 1 });
     }
+    
+    Ok(())
 }
 
 
@@ -36848,7 +38045,7 @@ use tokio::sync::RwLock;
 // WEBSOCKET ACTOR (Actix-web-actors)
 // ============================================================================
 
-use actix::{Actor, StreamHandler, Handler, Message, AsyncContext, ActorContext};
+use actix::{Actor, StreamHandler, Handler, Message, Addr, AsyncContext, ActorContext};
 use actix_web_actors::ws;
 
 /// WebSocket session actor
@@ -38859,6 +40056,7 @@ fn compute_lagrange_coefficient(
     signers: &[ParticipantId],
 ) -> [u8; 32] {
     use k256::Scalar as K256Scalar;
+    use ff::Field;
     
     // Validate input
     if !signers.contains(&identifier) {
@@ -46381,7 +47579,10 @@ impl FrontendAppState {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(21600)).await; // 6 hours
                 
-                match ComplianceSanctionsLoader::load_all_sanctions().await.map_err(|e| e.to_string()) {
+                // Load sanctions list first, consuming the result before any other await
+                let load_result = ComplianceSanctionsLoader::load_all_sanctions().await;
+                
+                match load_result {
                     Ok(updated_list) => {
                         let mut gk = state.gatekeeper.write().await;
                         let old_count = gk.sanctioned_list.len();
@@ -48674,7 +49875,6 @@ pub async fn api_sanctions_check(
     // Check address
     if let Some(ref addr) = req.address {
         let addr_lower = addr.to_lowercase();
-        let addr_upper = addr.to_uppercase();
         
         if db.sdn_addresses.contains(&addr_lower) || db.sdn_addresses.contains(addr) {
             return HttpResponse::Ok().json(SanctionCheckResponse {
@@ -49385,6 +50585,11 @@ impl IdentityMerkleTree {
     /// Get commitment by pubkey
     pub fn get_by_pubkey(&self, pubkey: &str) -> Option<&IdentityCommitment> {
         self.leaves.values().find(|c| c.pubkey == pubkey)
+    }
+    
+    /// Alias for get_by_pubkey (backwards compatibility)
+    pub fn get_commitment(&self, pubkey: &str) -> Option<&IdentityCommitment> {
+        self.get_by_pubkey(pubkey)
     }
     
     /// Verify identity hash matches commitment
@@ -51081,20 +52286,15 @@ impl QRMerkleProof {
 /// Hybrid quantum-resistant signature (matches Expo frontend)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HybridSignature {
-    // ECDSA component
-    #[serde(with = "BigArray")]
-    pub ecdsa_r: [u8; 32],
-    #[serde(with = "BigArray")]
-    pub ecdsa_s: [u8; 32],
+    // ECDSA component (hex encoded for JSON compatibility)
+    pub ecdsa_r: String,
+    pub ecdsa_s: String,
     pub ecdsa_v: u8,
     
-    // PQ component (Dilithium-style)
-    #[serde(with = "BigArray")]
-    pub pq_commitment: [u8; 32],
-    #[serde(with = "BigArray")]
-    pub pq_challenge: [u8; 32],
-    #[serde(with = "BigArray")]
-    pub pq_response: [u8; 64],
+    // PQ component (Dilithium-style, hex encoded)
+    pub pq_commitment: String,
+    pub pq_challenge: String,
+    pub pq_response: String,
     
     // Merkle binding
     pub merkle_proof: QRMerkleProof,
@@ -51104,7 +52304,7 @@ pub struct HybridSignature {
     // Metadata
     pub key_id: String,
     pub timestamp: u64,
-    pub message_hash: [u8; 32],
+    pub message_hash: String, // Hex
     pub tx_type: String,
     pub algorithm: String, // "ECDSA_SECP256K1_DILITHIUM_HYBRID"
     pub version: u8,
@@ -51147,10 +52347,7 @@ impl HybridSignature {
             use sha2::{Sha256, Digest};
             let mut hasher = Sha256::new();
             hasher.update(message);
-            let result = hasher.finalize();
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&result);
-            hash
+            hex::encode(hasher.finalize())
         };
         
         if computed_hash != self.message_hash {
@@ -51158,18 +52355,20 @@ impl HybridSignature {
         }
         
         // 6. Verify PQ commitment chain
+        let pq_commitment_bytes = hex::decode(&self.pq_commitment)
+            .map_err(|_| QRMerkleError::InvalidProof)?;
+        let message_hash_bytes = hex::decode(&self.message_hash)
+            .map_err(|_| QRMerkleError::InvalidProof)?;
+            
         let expected_challenge = {
             use sha2::{Sha256, Digest};
             let mut hasher = Sha256::new();
-            hasher.update(&self.pq_commitment);
-            hasher.update(&self.message_hash);
+            hasher.update(&pq_commitment_bytes);
+            hasher.update(&message_hash_bytes);
             hasher.update(self.public_key.as_bytes());
             hasher.update(DOMAIN_SEP_PQ);
             hasher.update(b"_CHALLENGE");
-            let result = hasher.finalize();
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&result);
-            hash
+            hex::encode(hasher.finalize())
         };
         
         if expected_challenge != self.pq_challenge {

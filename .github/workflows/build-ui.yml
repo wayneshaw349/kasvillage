@@ -7,6 +7,10 @@ on:
       - 'frontend/public/**'
       - 'frontend/package.json'
       - 'frontend/docker/Dockerfile.ui'
+      - 'frontend/postcss.config.js'
+      - 'frontend/tailwind.config.js'
+      - 'frontend/vite.config.js'
+      - 'frontend/index.html'
 jobs:
   build-ui:
     runs-on: ubuntu-latest
@@ -22,6 +26,6 @@ jobs:
           file: ./frontend/docker/Dockerfile.ui
           push: true
           tags: |
-            wayneshaw349/kasvillage-ui:v2
+            wayneshaw349/kasvillage-ui:v3
             wayneshaw349/kasvillage-ui:latest
             wayneshaw349/kasvillage-ui:${{ github.sha }}

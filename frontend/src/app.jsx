@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion"; 
 import {  
   Search, Wallet, QrCode, X, Zap, 
   ShieldCheck, AlertTriangle, User, Lock, Activity,

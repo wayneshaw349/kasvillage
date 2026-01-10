@@ -6,7 +6,7 @@
 //
 // SECTION A: CORE (Lines ~70-36,280)
 //   - Canonical constants & domain separators
-//   - Field type definitions (Fr/Fq) and conversions
+//   - Field type definitions (Fr/Fq) and conversions 
 //   - Poseidon hashing (Neptune on Pallas)
 //   - Sparse Merkle tree
 //   - Account/Transaction structures

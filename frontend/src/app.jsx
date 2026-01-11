@@ -22,7 +22,7 @@ function cn(...inputs) {
 // Akash Network Backend
 const API_BASE = typeof window !== 'undefined' && window.KASVILLAGE_API_URL 
   ? window.KASVILLAGE_API_URL 
-  : 'https://proc9muli1dl9d335oos6k9d60.ingress.computeforge.com';
+  : 'https://134ucrb1rpek78b8ev55521u78.ingress.akash-palmito.org';
 
 
 // CoinGecko API (free, no key needed) for live KAS price

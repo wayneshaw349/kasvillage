@@ -3,7 +3,7 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - 'frontend/src/**'
+      - 'frontend/src/**' 
       - 'frontend/public/**'
       - 'frontend/package.json'
       - 'frontend/docker/Dockerfile.ui'

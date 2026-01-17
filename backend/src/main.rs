@@ -668,7 +668,7 @@ pub const D_NULL_WITHDRAWAL: u64 = 4;
 /// Entry: Maximum withdrawal/deposit per user (100K KAS in sompi)
 
 /// FROST threshold for multi-signature
-pub const FROST_THRESHOLD: usize = 2;
+pub const FROST_THRESHOLD: usize = 8;
 
 /// Domain separator for FROST keygen
 pub const DOM_FROST_KEYGEN_SECP: &[u8] = b"KASPA_L2_FROST_KEYGEN_SECP256K1_v1";
@@ -34680,10 +34680,27 @@ impl Coupon {
         })
     }
 
+    /// Check if coupon is currently valid
+    /// Coupons are invalid if:
+    /// - Not active
+    /// - Past expiration date
+    /// - Max uses reached
+    /// - Host subscription expired (checked separately via is_valid_with_subscription)
     pub fn is_valid(&self) -> bool {
         self.active 
             && current_timestamp() < self.expires_at
             && (self.max_uses == 0 || self.uses < self.max_uses)
+    }
+    
+    /// Check if coupon is valid AND host subscription is active
+    /// This is the full validation for coupon use
+    pub fn is_valid_with_subscription(&self, host_subscription_expires_at: u64) -> bool {
+        self.is_valid() && current_timestamp() < host_subscription_expires_at
+    }
+    
+    /// Check if coupon should be auto-disabled due to subscription lapse
+    pub fn should_disable_for_subscription(&self, host_subscription_expires_at: u64) -> bool {
+        self.active && current_timestamp() >= host_subscription_expires_at
     }
 
     pub fn use_coupon(&mut self) -> ProductionResult<()> {
@@ -37851,7 +37868,7 @@ pub struct AppState {
     // Inventory
     pub inventory: Arc<std::sync::RwLock<Vec<InventoryItem>>>,
     // Account Registry (for profile updates)
-    pub account_registry: Arc<std::sync::RwLock<HashMap<String, AccountState>>>,
+    pub account_registry: Arc<std::sync::RwLock<HashMap<String, AccountData>>>,
 }
 
 
@@ -39282,7 +39299,7 @@ pub async fn start_server(config: ApiServerConfig) -> std::io::Result<()> {
     let db: Arc<dyn DatabaseStore> = Arc::new(FirestoreDb::new("kasvillage-l2", "prod"));
     let relay = Arc::new(RwLock::new(WebSocketRelay::new("relay-001", true)));
     let rate_limiter = Arc::new(RwLock::new(RedisRateLimiter::new(false)));
-    let frost = FrostCoordinator::new(FrostConfig::new(2, 3).expect("valid config"));
+    let frost = FrostCoordinator::new(FrostConfig::new(8, 14).expect("valid config"));
 
     let app_state = web::Data::new(AppState {
         db,
@@ -39304,21 +39321,6 @@ pub async fn start_server(config: ApiServerConfig) -> std::io::Result<()> {
         total_user_ledger: Arc::new(std::sync::RwLock::new(0)),
         protocol_reserves: Arc::new(std::sync::RwLock::new(0)),
         xp_registry: Arc::new(std::sync::RwLock::new(XPRegistry::new())),
-        // Bridge Ticket System
-        bridge_manager: Arc::new(std::sync::RwLock::new(BridgeTicketManager::new("kaspa:vault_placeholder".to_string()))),
-        // Validators
-        validators: Arc::new(std::sync::RwLock::new(Vec::new())),
-        validator_rewards: Arc::new(std::sync::RwLock::new(Vec::new())),
-        fee_distributions: Arc::new(std::sync::RwLock::new(Vec::new())),
-        // Transaction & Withdrawal History
-        transaction_history: Arc::new(std::sync::RwLock::new(Vec::new())),
-        withdrawal_history: Arc::new(std::sync::RwLock::new(Vec::new())),
-        // Notifications
-        notifications: Arc::new(std::sync::RwLock::new(Vec::new())),
-        // Inventory
-        inventory: Arc::new(std::sync::RwLock::new(Vec::new())),
-        // Account Registry
-        account_registry: Arc::new(std::sync::RwLock::new(HashMap::new())),
     });
 
     println!("Starting KasVillage L2 API server on {}:{}", config.host, config.port);
@@ -39416,8 +39418,8 @@ pub struct FrostConfigReal {
 impl Default for FrostConfigReal {
     fn default() -> Self {
         Self {
-            min_signers: 2,
-            max_signers: 3,
+            min_signers: 8,
+            max_signers: 14,
             signing_timeout_secs: 300,
             dkg_timeout_secs: 600,
         }
@@ -47281,6 +47283,57 @@ impl SubscriptionTracker {
             false
         }
     }
+    
+    /// Get subscription expiration timestamp for coupon validation
+    pub fn get_expires_at(&self, pubkey: &str) -> Option<u64> {
+        self.subscriptions.get(pubkey).map(|r| r.expires_at)
+    }
+    
+    /// Get all expired subscriptions (for coupon cleanup)
+    pub fn get_expired_subscriptions(&self) -> Vec<String> {
+        let now = current_timestamp();
+        self.subscriptions
+            .iter()
+            .filter(|(_, record)| now >= record.expires_at)
+            .map(|(pubkey, _)| pubkey.clone())
+            .collect()
+    }
+}
+
+// ============================================================================
+// COUPON-SUBSCRIPTION SYNC: Background cleanup
+// ============================================================================
+
+/// Disable coupons for hosts with expired subscriptions
+/// Call this periodically (e.g., hourly) or on coupon access
+pub fn cleanup_expired_subscription_coupons(
+    coupons: &mut HashMap<u64, Coupon>,
+    subscription_tracker: &SubscriptionTracker,
+    host_to_store: &HashMap<String, u64>, // pubkey -> store_id mapping
+) -> u32 {
+    let expired_hosts = subscription_tracker.get_expired_subscriptions();
+    let mut disabled_count = 0;
+    
+    for host_pubkey in expired_hosts {
+        // Find store_id for this host
+        if let Some(&store_id) = host_to_store.get(&host_pubkey) {
+            // Disable all coupons for this store
+            for coupon in coupons.values_mut() {
+                if coupon.store_id == store_id && coupon.active {
+                    coupon.active = false;
+                    disabled_count += 1;
+                    log::info!("[COUPON] Disabled coupon {} for store {} (subscription expired)", 
+                        coupon.coupon_id, store_id);
+                }
+            }
+        }
+    }
+    
+    if disabled_count > 0 {
+        log::info!("[COUPON] Disabled {} coupons due to expired subscriptions", disabled_count);
+    }
+    
+    disabled_count
 }
 
 impl FrontendApiState {
@@ -48375,7 +48428,59 @@ pub async fn api_subscription_pay(
         user.subscription_expires_at = Some(response.expires_at);
     }
     
-    HttpResponse::Ok().json(response)
+    // ============================================================================
+    // COUPON RENEWAL: Re-enable host's coupons on subscription payment
+    // ============================================================================
+    // When merchant pays monthly subscription, their coupons are renewed
+    // Expired coupons get new 30-day expiration from NOW
+    // This ties coupon validity to active subscription
+    let coupons_renewed = renew_host_coupons(&req.user_pubkey, response.expires_at);
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": response.success,
+        "tier": response.tier,
+        "fee_type": response.fee_type,
+        "fee_sompi": response.fee_sompi,
+        "fee_kas": response.fee_kas,
+        "paid_at": response.paid_at,
+        "expires_at": response.expires_at,
+        "coupons_renewed": coupons_renewed
+    }))
+}
+
+/// Renew host's coupons when subscription is paid
+/// Returns count of coupons renewed
+fn renew_host_coupons(host_pubkey: &str, new_expires_at: u64) -> u32 {
+    // In production, this would update the coupon store
+    // Coupons owned by this host get new expiration matching subscription
+    // 
+    // Logic:
+    // 1. Find all coupons where store owner = host_pubkey
+    // 2. For each coupon:
+    //    - If expired or expiring within 7 days: extend to new_expires_at
+    //    - If active=false due to expiration: set active=true
+    // 3. Return count of renewed coupons
+    //
+    // This ensures:
+    // - Coupons auto-expire when subscription lapses
+    // - Coupons auto-renew when subscription is paid
+    // - No manual coupon management needed
+    
+    log::info!("[COUPON] Renewing coupons for host {} until {}", host_pubkey, new_expires_at);
+    
+    // Placeholder - actual implementation updates coupon database
+    // In the real implementation:
+    // let mut count = 0;
+    // for coupon in coupons.iter_mut().filter(|c| c.owner == host_pubkey) {
+    //     if coupon.expires_at < current_timestamp() + 7*24*60*60 {
+    //         coupon.expires_at = new_expires_at;
+    //         coupon.active = true;
+    //         count += 1;
+    //     }
+    // }
+    // count
+    
+    0 // Placeholder until coupon store is wired
 }
 
 /// POST /api/consignment/create - Create consignment agreement
@@ -54572,7 +54677,7 @@ pub struct BridgeTicket {
     #[serde(with = "serde_arrays")]
     pub user_pubkey: [u8; 33],
     pub ephemeral_address: String,
-    #[serde(with = "serde_arrays32")]
+    #[serde(with = "serde_arrays")]
     pub ephemeral_privkey: [u8; 32],
     pub expected_amount_usd: f64,
     pub expected_amount_sompi: u64,
@@ -54917,8 +55022,8 @@ pub async fn api_bridge_request(
             
             HttpResponse::Ok().json(BridgeRequestResponse {
                 success: true,
-                ticket_id: Some(ticket.ticket_id.clone()),
-                temp_l1_address: Some(ticket.ephemeral_address.clone()),
+                ticket_id: Some(ticket.ticket_id),
+                temp_l1_address: Some(ticket.ephemeral_address),
                 expected_amount_kas: Some(expected_kas),
                 kas_price: Some(kas_price),
                 expires_at: Some(ticket.expires_at),
@@ -55018,24 +55123,17 @@ pub async fn bridge_sweeper_loop(
     loop {
         interval.tick().await;
         
-        // 1. Check pending addresses for deposits
-        let pending = {
-            let mgr = bridge_manager.read().unwrap();
-            mgr.get_pending_addresses()
-        };
+        let mgr = bridge_manager.read().unwrap();
         
+        // 1. Check pending addresses for deposits
+        let pending = mgr.get_pending_addresses();
         for address in pending {
             // Query L1 balance via kas.fyi
             match query_l1_balance(&address).await {
                 Ok(balance) if balance > 0 => {
                     log::info!("[SWEEPER] Deposit detected: {} sompi at {}", balance, address);
                     
-                    let ticket_opt = {
-                        let mgr = bridge_manager.read().unwrap();
-                        mgr.find_by_address(&address)
-                    };
-                    
-                    if let Some(mut ticket) = ticket_opt {
+                    if let Some(mut ticket) = mgr.find_by_address(&address) {
                         let kas_price = fetch_kas_price_coingecko().await.unwrap_or(0.10);
                         
                         // Re-check sanctions on the sender (if we can identify)
@@ -55049,9 +55147,9 @@ pub async fn bridge_sweeper_loop(
                                 log::warn!("[SWEEPER] Ticket {} over limit: {}", ticket.ticket_id, e);
                             }
                         }
-                        let ticket_id = ticket.ticket_id.clone();
+                        drop(mgr);
                         let mgr_w = bridge_manager.read().unwrap();
-                        mgr_w.update_ticket(&ticket_id, ticket);
+                        mgr_w.update_ticket(&ticket.ticket_id, ticket);
                     }
                 }
                 _ => {}
@@ -55059,11 +55157,7 @@ pub async fn bridge_sweeper_loop(
         }
         
         // 2. Sweep funded tickets to vault
-        let funded = {
-            let mgr = bridge_manager.read().unwrap();
-            mgr.get_funded_tickets()
-        };
-        
+        let funded = mgr.get_funded_tickets();
         for mut ticket in funded {
             log::info!("[SWEEPER] Sweeping ticket {} to vault", ticket.ticket_id);
             
@@ -55072,36 +55166,29 @@ pub async fn bridge_sweeper_loop(
             let txid = format!("sweep_{}", ticket.ticket_id);
             ticket.mark_swept(txid);
             
-            let ticket_id = ticket.ticket_id.clone();
+            drop(mgr);
             let mgr_w = bridge_manager.read().unwrap();
-            mgr_w.update_ticket(&ticket_id, ticket);
+            mgr_w.update_ticket(&ticket.ticket_id, ticket.clone());
             
             // Credit user's L2 balance
             // state.merkle_tree.credit_user(ticket.user_pubkey, ticket.actual_amount_sompi.unwrap_or(0));
         }
         
         // 3. Handle over-limit tickets (auto-refund queue)
-        let overlimit = {
-            let mgr = bridge_manager.read().unwrap();
-            mgr.get_overlimit_tickets()
-        };
-        
+        let overlimit = mgr.get_overlimit_tickets();
         for mut ticket in overlimit {
             log::warn!("[SWEEPER] Auto-refunding over-limit ticket {}", ticket.ticket_id);
             
             // TODO: Initiate FROST refund to original sender
             ticket.mark_refunded("Exceeded $1000 USD limit".to_string(), None);
             
-            let ticket_id = ticket.ticket_id.clone();
+            drop(mgr);
             let mgr_w = bridge_manager.read().unwrap();
-            mgr_w.update_ticket(&ticket_id, ticket);
+            mgr_w.update_ticket(&ticket.ticket_id, ticket);
         }
         
         // 4. Expire old tickets
-        let expired = {
-            let mgr = bridge_manager.read().unwrap();
-            mgr.expire_old_tickets()
-        };
+        let expired = mgr.expire_old_tickets();
         if !expired.is_empty() {
             log::info!("[SWEEPER] Expired {} tickets", expired.len());
         }
@@ -55163,8 +55250,21 @@ async fn query_l1_balance(address: &str) -> Result<u64, String> {
 }
 
 // ============================================================================
-// HELPER: Fetch KAS price (defined earlier in file)
+// HELPER: Fetch KAS price
 // ============================================================================
+
+async fn fetch_kas_price_coingecko() -> Result<f64, String> {
+    let url = "https://api.coingecko.com/api/v3/simple/price?ids=kaspa&vs_currencies=usd";
+    let client = reqwest::Client::new();
+    
+    match client.get(url).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(resp) => {
+            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            data["kaspa"]["usd"].as_f64().ok_or_else(|| "Price not found".to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
 
 // ============================================================================
 // ROUTE CONFIGURATION - ADD TO configure_routes_additions()

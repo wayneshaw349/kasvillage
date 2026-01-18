@@ -343,7 +343,7 @@ const checkNetworkHealth = async () => {
 };
 
 // Legacy API_BASE for backwards compatibility (uses current active endpoint)
-const API_BASE = getActiveEndpoint();
+const API_BASE = process.env.REACT_APP_API_URL || "https://api.kasvillage.com";
 
 // Resilient fetch wrapper - drop-in replacement for fetch() with hopping
 const resilientFetch = async (url, options = {}) => {

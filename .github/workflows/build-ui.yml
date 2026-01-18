@@ -26,6 +26,6 @@ jobs:
           file: ./frontend/docker/Dockerfile.ui
           push: true
           tags: |
-            wayneshaw349/kasvillage-ui:v4
+            wayneshaw349/kasvillage-ui:v5
             wayneshaw349/kasvillage-ui:latest
             wayneshaw349/kasvillage-ui:${{ github.sha }}

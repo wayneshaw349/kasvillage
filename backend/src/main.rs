@@ -1,7 +1,7 @@
 // ============================================================================
 // KASVILLAGE L2 - COMPLETE PRODUCTION IMPLEMENTATION
 // ============================================================================
-//
+// 
 // Single-file merged implementation containing:
 //
 // SECTION A: CORE (Lines ~70-36,280)

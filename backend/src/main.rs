@@ -37868,7 +37868,7 @@ pub struct AppState {
     // Inventory
     pub inventory: Arc<std::sync::RwLock<Vec<InventoryItem>>>,
     // Account Registry (for profile updates)
-    pub account_registry: Arc<std::sync::RwLock<HashMap<String, AccountData>>>,
+    pub account_registry: Arc<std::sync::RwLock<HashMap<String, AccountState>>>,
 }
 
 
@@ -39321,6 +39321,21 @@ pub async fn start_server(config: ApiServerConfig) -> std::io::Result<()> {
         total_user_ledger: Arc::new(std::sync::RwLock::new(0)),
         protocol_reserves: Arc::new(std::sync::RwLock::new(0)),
         xp_registry: Arc::new(std::sync::RwLock::new(XPRegistry::new())),
+        // Bridge Ticket System
+        bridge_manager: Arc::new(std::sync::RwLock::new(BridgeTicketManager::new("kaspa:vault_address_placeholder".to_string()))),
+        // Validators
+        validators: Arc::new(std::sync::RwLock::new(Vec::new())),
+        validator_rewards: Arc::new(std::sync::RwLock::new(Vec::new())),
+        fee_distributions: Arc::new(std::sync::RwLock::new(Vec::new())),
+        // Transaction & Withdrawal History
+        transaction_history: Arc::new(std::sync::RwLock::new(Vec::new())),
+        withdrawal_history: Arc::new(std::sync::RwLock::new(Vec::new())),
+        // Notifications
+        notifications: Arc::new(std::sync::RwLock::new(Vec::new())),
+        // Inventory
+        inventory: Arc::new(std::sync::RwLock::new(Vec::new())),
+        // Account Registry
+        account_registry: Arc::new(std::sync::RwLock::new(HashMap::new())),
     });
 
     println!("Starting KasVillage L2 API server on {}:{}", config.host, config.port);
@@ -54677,7 +54692,7 @@ pub struct BridgeTicket {
     #[serde(with = "serde_arrays")]
     pub user_pubkey: [u8; 33],
     pub ephemeral_address: String,
-    #[serde(with = "serde_arrays")]
+    #[serde(with = "serde_arrays32")]
     pub ephemeral_privkey: [u8; 32],
     pub expected_amount_usd: f64,
     pub expected_amount_sompi: u64,
@@ -55018,19 +55033,24 @@ pub async fn api_bridge_request(
     ) {
         Ok(ticket) => {
             let expected_kas = req.amount_usd / kas_price;
-            log::info!("[BRIDGE] Created ticket {} for {} (${:.2})", ticket.ticket_id, req.pubkey, req.amount_usd);
+            let ticket_id = ticket.ticket_id.clone();
+            let ephemeral_address = ticket.ephemeral_address.clone();
+            let expires_at = ticket.expires_at;
+            let seconds_remaining = ticket.seconds_remaining();
+            
+            log::info!("[BRIDGE] Created ticket {} for {} (${:.2})", ticket_id, req.pubkey, req.amount_usd);
             
             HttpResponse::Ok().json(BridgeRequestResponse {
                 success: true,
-                ticket_id: Some(ticket.ticket_id),
-                temp_l1_address: Some(ticket.ephemeral_address),
+                ticket_id: Some(ticket_id),
+                temp_l1_address: Some(ephemeral_address),
                 expected_amount_kas: Some(expected_kas),
                 kas_price: Some(kas_price),
-                expires_at: Some(ticket.expires_at),
-                seconds_remaining: Some(ticket.seconds_remaining()),
+                expires_at: Some(expires_at),
+                seconds_remaining: Some(seconds_remaining),
                 warning: Some(format!(
                     "Send EXACTLY {:.4} KAS within {} seconds. DO NOT send from exchange. Deposits over ${:.0} will NOT be credited.",
-                    expected_kas, ticket.seconds_remaining(), BRIDGE_MAX_DEPOSIT_USD
+                    expected_kas, seconds_remaining, BRIDGE_MAX_DEPOSIT_USD
                 )),
                 error: None,
                 sanctions_cleared: true,
@@ -55115,7 +55135,7 @@ pub async fn api_bridge_list_tickets(
 
 pub async fn bridge_sweeper_loop(
     bridge_manager: Arc<std::sync::RwLock<BridgeTicketManager>>,
-    sanctions_state: Arc<SanctionsState>,
+    _sanctions_state: Arc<SanctionsState>,
     // frost_coordinator: Arc<FrostCoordinator>,
 ) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
@@ -55123,33 +55143,35 @@ pub async fn bridge_sweeper_loop(
     loop {
         interval.tick().await;
         
+        // BridgeTicketManager uses internal RwLock, so we just need read access to the outer Arc<RwLock>
         let mgr = bridge_manager.read().unwrap();
         
         // 1. Check pending addresses for deposits
         let pending = mgr.get_pending_addresses();
+        drop(mgr); // Release outer lock before async work
+        
         for address in pending {
             // Query L1 balance via kas.fyi
             match query_l1_balance(&address).await {
                 Ok(balance) if balance > 0 => {
                     log::info!("[SWEEPER] Deposit detected: {} sompi at {}", balance, address);
                     
+                    let mgr = bridge_manager.read().unwrap();
                     if let Some(mut ticket) = mgr.find_by_address(&address) {
                         let kas_price = fetch_kas_price_coingecko().await.unwrap_or(0.10);
-                        
-                        // Re-check sanctions on the sender (if we can identify)
-                        // For now, trust the initial screening
+                        let ticket_id = ticket.ticket_id.clone();
                         
                         match ticket.mark_funded(balance, kas_price) {
                             Ok(_) => {
-                                log::info!("[SWEEPER] Ticket {} funded", ticket.ticket_id);
+                                log::info!("[SWEEPER] Ticket {} funded", ticket_id);
                             }
                             Err(e) => {
-                                log::warn!("[SWEEPER] Ticket {} over limit: {}", ticket.ticket_id, e);
+                                log::warn!("[SWEEPER] Ticket {} over limit: {}", ticket_id, e);
                             }
                         }
-                        drop(mgr);
-                        let mgr_w = bridge_manager.read().unwrap();
-                        mgr_w.update_ticket(&ticket.ticket_id, ticket);
+                        
+                        // Update ticket (BridgeTicketManager does internal locking)
+                        mgr.update_ticket(&ticket_id, ticket);
                     }
                 }
                 _ => {}
@@ -55157,18 +55179,20 @@ pub async fn bridge_sweeper_loop(
         }
         
         // 2. Sweep funded tickets to vault
+        let mgr = bridge_manager.read().unwrap();
         let funded = mgr.get_funded_tickets();
+        
         for mut ticket in funded {
-            log::info!("[SWEEPER] Sweeping ticket {} to vault", ticket.ticket_id);
+            let ticket_id = ticket.ticket_id.clone();
+            log::info!("[SWEEPER] Sweeping ticket {} to vault", ticket_id);
             
             // TODO: Initiate FROST threshold signature
             // For now, mark as swept with placeholder txid
-            let txid = format!("sweep_{}", ticket.ticket_id);
+            let txid = format!("sweep_{}", ticket_id);
             ticket.mark_swept(txid);
             
-            drop(mgr);
-            let mgr_w = bridge_manager.read().unwrap();
-            mgr_w.update_ticket(&ticket.ticket_id, ticket.clone());
+            // Update ticket
+            mgr.update_ticket(&ticket_id, ticket);
             
             // Credit user's L2 balance
             // state.merkle_tree.credit_user(ticket.user_pubkey, ticket.actual_amount_sompi.unwrap_or(0));
@@ -55176,15 +55200,16 @@ pub async fn bridge_sweeper_loop(
         
         // 3. Handle over-limit tickets (auto-refund queue)
         let overlimit = mgr.get_overlimit_tickets();
+        
         for mut ticket in overlimit {
-            log::warn!("[SWEEPER] Auto-refunding over-limit ticket {}", ticket.ticket_id);
+            let ticket_id = ticket.ticket_id.clone();
+            log::warn!("[SWEEPER] Auto-refunding over-limit ticket {}", ticket_id);
             
             // TODO: Initiate FROST refund to original sender
             ticket.mark_refunded("Exceeded $1000 USD limit".to_string(), None);
             
-            drop(mgr);
-            let mgr_w = bridge_manager.read().unwrap();
-            mgr_w.update_ticket(&ticket.ticket_id, ticket);
+            // Update ticket
+            mgr.update_ticket(&ticket_id, ticket);
         }
         
         // 4. Expire old tickets
@@ -55192,6 +55217,8 @@ pub async fn bridge_sweeper_loop(
         if !expired.is_empty() {
             log::info!("[SWEEPER] Expired {} tickets", expired.len());
         }
+        
+        drop(mgr); // Release lock before next iteration
     }
 }
 
@@ -55250,22 +55277,6 @@ async fn query_l1_balance(address: &str) -> Result<u64, String> {
 }
 
 // ============================================================================
-// HELPER: Fetch KAS price
-// ============================================================================
-
-async fn fetch_kas_price_coingecko() -> Result<f64, String> {
-    let url = "https://api.coingecko.com/api/v3/simple/price?ids=kaspa&vs_currencies=usd";
-    let client = reqwest::Client::new();
-    
-    match client.get(url).timeout(std::time::Duration::from_secs(5)).send().await {
-        Ok(resp) => {
-            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            data["kaspa"]["usd"].as_f64().ok_or_else(|| "Price not found".to_string())
-        }
-        Err(e) => Err(e.to_string()),
-    }
-}
-
 // ============================================================================
 // ROUTE CONFIGURATION - ADD TO configure_routes_additions()
 // ============================================================================

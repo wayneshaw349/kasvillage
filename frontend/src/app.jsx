@@ -19,7 +19,7 @@ import Countdown from "react-countdown";
 // ============================================================================
 // ERROR BOUNDARY - Production Crash Recovery
 // ============================================================================
-class ErrorBoundary extends React.Component {
+class ErrorBoundary extends React.Component { 
   constructor(props) {
     super(props);
     this.state = { hasError: false, error: null, errorInfo: null };

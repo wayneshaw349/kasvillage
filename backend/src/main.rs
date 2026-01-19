@@ -10187,6 +10187,16 @@ pub struct KaspaUtxo {
     pub block_daa_score: u64,
 }
 
+/// Kaspa UTXO for production validation (different fields for L1 bridge)
+#[derive(Clone, Debug)]
+pub struct KaspaUTXO {
+    pub tx_hash: [u8; 32],
+    pub output_idx: u32,
+    pub amount: u64,
+    pub script: Vec<u8>,
+    pub block_height: u64,
+}
+
 impl KaspaUTXO {
     pub fn validate_deposit(&self) -> ProductionResult<()> {
         if self.amount == 0 {
@@ -24010,14 +24020,13 @@ impl KaspaFluxNode {
             transaction_id: tx_hash.to_string(),
             inputs: vec![],
             outputs: vec![],
-            subnetwork_id: String::new(),
-            payload: String::new(),
-            block_hash: vec![],
             block_time: result.get("blockTime").and_then(|v| v.as_u64()).unwrap_or(0),
             is_accepted: result.get("isAccepted").and_then(|v| v.as_bool()).unwrap_or(false),
             accepting_block_hash: result.get("acceptingBlockHash")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            accepting_block_blue_score: result.get("acceptingBlockBlueScore")
+                .and_then(|v| v.as_u64()),
         })
     }
 
@@ -30741,16 +30750,6 @@ impl ValidatorSetManager {
     }
 }
 
-/// UTXO from Kaspa L1
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct KaspaUtxo {
-    pub tx_id: String,
-    pub output_index: u32,
-    pub amount: u64,  // in sompi
-    pub script_pubkey: Vec<u8>,
-    pub confirmations: u32,
-}
-
 /// Merkle root inscription on Kaspa L1
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MerkleRootInscription {
@@ -37249,8 +37248,12 @@ pub struct BlockDagInfo {
     pub network_name: String,
     pub block_count: u64,
     pub header_count: u64,
+    pub tip_hashes: Vec<String>,
     pub virtual_daa_score: u64,
+    pub pruning_point_hash: String,
+    pub virtual_parent_hashes: Vec<String>,
     pub difficulty: f64,
+    pub past_median_time: u64,
 }
 
 // REMOVED DUPLICATE (line 39554): /// UTXO response

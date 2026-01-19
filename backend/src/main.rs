@@ -18687,10 +18687,8 @@ pub async fn start_api_server(
     let ledger = Arc::new(RwLock::new(NonCustodialLedger::new()));
 
     // ========================================================================
-    // KASPA L1 NODE - Self-hosted (Flux) or public API
+    // KASPA L1 NODE
     // ========================================================================
-    // Configure via: KASPA_NODE_URL=ws://your-flux-node:16210
-    // Or use public API if not set
     let kaspa_node = Arc::new(KaspaFluxNode::from_env());
     
     // Health check the node
@@ -18710,7 +18708,7 @@ pub async fn start_api_server(
     });
 
     // ========================================================================
-    // MERKLE TREES - One main tree, one sanctions tree
+    // MERKLE TREES
     // ========================================================================
     let main_tree = Arc::new(std::sync::RwLock::new(SparseMerkleTree::new(TREE_DEPTH)));
     let sanctions_tree = Arc::new(std::sync::RwLock::new(SparseMerkleTree::new(TREE_DEPTH)));
@@ -18719,7 +18717,6 @@ pub async fn start_api_server(
     let sanctions_tree_data = web::Data::new(sanctions_tree.clone());
     
     println!("[MERKLE] ✓ Main tree initialized (depth {})", TREE_DEPTH);
-    println!("[MERKLE] ✓ Sanctions tree initialized (depth {})", TREE_DEPTH);
 
     // ========================================================================
     // SANCTIONS - Load Treasury OFAC + OpenSanctions
@@ -18728,37 +18725,21 @@ pub async fn start_api_server(
     
     let sanctions_db = match fetch_ofac_sdn_list().await {
         Ok(mut db) => {
-            println!("[SANCTIONS] ✓ Treasury OFAC: {} entries, {} crypto addresses", 
-                db.entry_count, db.sdn_addresses.len());
-            
+            println!("[SANCTIONS] ✓ Treasury OFAC: {} entries", db.entry_count);
+            // Attempt to load OpenSanctions augmentation
             match ComplianceSanctionsLoader::load_opensanctions_csv().await {
                 Ok(opensanctions) => {
-                    let addr_before = db.sdn_addresses.len();
-                    let name_before = db.sdn_names.len();
-                    
                     for source in opensanctions {
                         let id = source.identifier.trim();
-                        if id.starts_with("0x") && id.len() == 42 {
+                        // Basic filtering for crypto addresses
+                        if (id.starts_with("0x") && id.len() == 42) || 
+                           (id.starts_with("kaspa:") && id.len() >= 60) {
                             db.sdn_addresses.insert(id.to_lowercase());
-                        } else if id.starts_with("kaspa:") && id.len() >= 60 {
-                            db.sdn_addresses.insert(id.to_string());
-                        } else if (id.starts_with("1") || id.starts_with("3") || id.starts_with("bc1")) 
-                            && id.len() >= 26 && id.len() <= 62 {
-                            db.sdn_addresses.insert(id.to_string());
-                        } else if id.len() > 2 {
-                            db.sdn_names.insert(id.to_uppercase());
                         }
                     }
-                    
-                    println!("[SANCTIONS] ✓ OpenSanctions: +{} addresses, +{} names", 
-                        db.sdn_addresses.len() - addr_before,
-                        db.sdn_names.len() - name_before);
                 }
-                Err(e) => eprintln!("[SANCTIONS] ⚠ OpenSanctions load failed: {}", e),
+                Err(e) => eprintln!("[SANCTIONS] ⚠ OpenSanctions load failed (non-fatal): {}", e),
             }
-            
-            println!("[SANCTIONS] ✓ Total: {} addresses, {} names, {} countries",
-                db.sdn_addresses.len(), db.sdn_names.len(), db.sdn_countries.len());
             db
         }
         Err(e) => {
@@ -18792,27 +18773,15 @@ pub async fn start_api_server(
     });
 
     // ========================================================================
-    // IDENTITY MERKLE TREE - Avatar commitments (ZK-Identity)
+    // IDENTITY & ACCOUNTS
     // ========================================================================
     let identity_tree = web::Data::new(std::sync::RwLock::new(IdentityMerkleTree::new()));
-    println!("[IDENTITY] ✓ Identity tree initialized");
-
-    // ========================================================================
-    // UNIFIED ACCOUNT REGISTRY - Maps pubkey to all account data
-    // ========================================================================
     let account_registry = web::Data::new(std::sync::RwLock::new(UnifiedAccountRegistry::new()));
-    println!("[ACCOUNTS] ✓ Unified account registry initialized");
-
-    // ========================================================================
-    // QUANTUM MERKLE TREE - Ephemeral signatures for offline transactions
-    // ========================================================================
     let qr_tree = web::Data::new(std::sync::RwLock::new(QuantumMerkleTree::new(QR_MERKLE_DEPTH)));
-    println!("[QR-MERKLE] ✓ Quantum-resistant ephemeral key tree initialized (depth {})", QR_MERKLE_DEPTH);
 
     // ========================================================================
-    // AUTONOMOUS PROOF GENERATION
+    // AUTONOMOUS PROOF GENERATION TASK
     // ========================================================================
-    let proof_gen_clone = proof_generator.clone();
     let main_tree_clone = main_tree.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -18821,7 +18790,8 @@ pub async fn start_api_server(
             let tree = main_tree_clone.read().unwrap();
             let root = tree.root();
             drop(tree);
-            println!("[PROOFS] Merkle root: 0x{}", &hex::encode(root.to_repr())[..16]);
+            // Minimal logging to keep console clean
+            // println!("[PROOFS] Merkle root: 0x{}", &hex::encode(root.to_repr())[..16]);
         }
     });
 
@@ -18829,10 +18799,25 @@ pub async fn start_api_server(
     println!("📡 Listening on {}:{}", host, port);
 
     // ========================================================================
-    // HTTP SERVER
+    // HTTP SERVER CONFIGURATION
     // ========================================================================
     HttpServer::new(move || {
+        // 1. Configure CORS - Explicitly allow frontend origins
+        let cors = Cors::default()
+            .allowed_origin("https://www.kasvillage.com") // Production
+            .allowed_origin("https://api.kasvillage.com") // Self
+            .allowed_origin("http://localhost:5173")      // Local Dev
+            .allowed_origin("http://localhost:3000")      // Local Dev
+            .allowed_origin_fn(|origin, _req_head| {
+                origin.as_bytes().ends_with(b".kasvillage.com") // Subdomains
+            })
+            .allow_any_method()
+            .allow_any_header()
+            .supports_credentials()
+            .max_age(3600);
+
         App::new()
+            // --- STATE INJECTION ---
             .app_data(state.clone())
             .app_data(sanctions_state.clone())
             .app_data(app_state.clone())
@@ -18842,47 +18827,59 @@ pub async fn start_api_server(
             .app_data(account_registry.clone())
             .app_data(qr_tree.clone())
             .app_data(kaspa_node_data.clone())
+            
+            // --- MIDDLEWARE ---
+            .wrap(cors) // <--- CORS must wrap the app
             .wrap(Logger::default())
-            .wrap(
-                Cors::default()
-                    .allow_any_origin()
-                    .allow_any_method()
-                    .allow_any_header()
-                    .max_age(3600)
-            )
-            // Health & State
+
+            // --- ROUTE MODULES (Fixes 404s) ---
+            
+            // 1. Frontend API (Registration, Auth, basic Withdrawals)
+            .configure(configure_frontend_api)
+            
+            // 2. Additions (Onboarding, Circuit Breaker, Stats)
+            .configure(configure_routes_additions)
+            
+            // 3. Supply Chain / Marketplace
+            .configure(configure_supply_chain_routes)
+            
+            // 4. Identity V2
+            .configure(configure_identity_routes_v2)
+            
+            // 5. Arweave Archival
+            .configure(configure_archive_routes)
+            
+            // 6. Bridge Ticket System
+            .configure(configure_bridge_routes)
+            
+            // 7. Ephemeral Signature Routes (QR-Merkle)
+            .configure(configure_qr_merkle_routes)
+
+            // --- MANUAL ROUTE OVERRIDES (Core L2) ---
             .route("/api/health", web::get().to(api_health_full))
             .route("/api/state", web::get().to(handle_state))
-            // Core L2 operations
             .route("/api/deposit", web::post().to(handle_deposit))
             .route("/api/withdrawal", web::post().to(handle_withdrawal))
             .route("/api/proof", web::post().to(handle_proof))
             .route("/api/submit-root", web::post().to(handle_submit_root))
-            // Merkle proofs
+            
+            // Merkle Specific
             .route("/api/merkle/proof/{index}", web::get().to(api_merkle_proof))
             .route("/api/merkle/root", web::get().to(api_merkle_root))
             .route("/api/merkle/verify", web::post().to(api_merkle_verify))
-            // Identity & Registration
-            .route("/api/register", web::post().to(api_register_unified))
-            .route("/api/identity/commit", web::post().to(api_identity_commit))
-            .route("/api/identity/verify", web::post().to(api_identity_verify))
-            .route("/api/identity/questions/{pubkey}", web::get().to(api_get_avatar_questions))
-            .route("/api/account/{pubkey}", web::get().to(api_get_account))
-            // User endpoints
+            
+            // User Specific
             .route("/api/user/fcm-token", web::post().to(handle_fcm_register))
             .route("/api/user/fcm-token", web::delete().to(handle_fcm_unregister))
             .route("/api/user/{pubkey}/queue-position", web::get().to(handle_queue_position))
             .route("/api/alerts/active", web::get().to(handle_active_alerts))
-            // Kaspa L1 operations
+            
+            // L1 Proxy
             .route("/api/l1/balance/{address}", web::get().to(api_l1_balance))
             .route("/api/l1/utxos/{address}", web::get().to(api_l1_utxos))
             .route("/api/l1/tx/{hash}", web::get().to(api_l1_transaction))
             .route("/api/l1/blockdag", web::get().to(api_l1_blockdag))
             .route("/api/l1/submit", web::post().to(api_l1_submit_tx))
-            // Ephemeral signature routes (QR-Merkle)
-            .configure(configure_qr_merkle_routes)
-            // All frontend routes
-            .configure(configure_routes_additions)
     })
     .bind(&format!("{}:{}", host, port))?
     .run()

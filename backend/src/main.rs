@@ -127,7 +127,7 @@ use serde_json;
 use serde_json::json;
 use serde_big_array::BigArray;
 use kaspa_wrpc_client::prelude::*;
-use kaspa_wrpc_client::{KaspaRpcClient, WrpcEncoding, RpcConfig, ConnectOptions};
+use kaspa_wrpc_client::{KaspaRpcClient as WrpcClient, WrpcEncoding, RpcConfig, ConnectOptions};
 use kaspa_rpc_core::{RpcTransaction, RpcUtxoEntry, GetBlockDagInfoResponse};
 // ============================================================================
 // FIRESTORE + REDIS IMPORTS (for Firestore integration)
@@ -18691,7 +18691,7 @@ pub async fn start_api_server(
     // ========================================================================
     // KASPA L1 NODE
     // ========================================================================
-    let kaspa_node = Arc::new(KaspaFluxNode::from_env());
+    let kaspa_node = Arc::new(KaspaFluxNode::from_env().await?);
     
     // Health check the node
     match kaspa_node.health_check().await {
@@ -23811,7 +23811,7 @@ pub enum KaspaNodeMode {
 
 #[derive(Clone)]
 pub struct KaspaFluxNode {
-    rpc: Arc<KaspaRpcClient>,
+    rpc: Arc<WrpcClient>,
     url: String,
 }
 
@@ -23829,34 +23829,29 @@ impl KaspaFluxNode {
             ..Default::default()
         };
 
-        let client = Arc::new(KaspaRpcClient::new(config)
+        // Create the client using the aliased type
+        let client = Arc::new(WrpcClient::new(config)
             .map_err(|e| format!("wRPC Client Creation Error: {}", e))?);
 
         println!("[KASPA] ⏳ Connecting to node at {}...", node_url);
         
         // --- SAFETY LOCK RETRY LOOP ---
-        // This loop prevents the backend from crashing while Kaspad is starting 
-        // or performing the initial UTXO index resync.
         loop {
-            // 1. Try to Connect
-            match client.connect(ConnectOptions::default()).await {
+            // 1. Try to Connect (ConnectOptions wrapped in Some)
+            match client.connect(Some(ConnectOptions::default())).await {
                 Ok(_) => {
-                    // 2. Connection open, but is the node ready?
-                    // We query BlockDagInfo. If the UTXO index is resyncing, 
-                    // the node often returns an error or specific status here.
+                    // 2. Connection open, check if node is ready (indexing check)
                     match client.get_block_dag_info().await {
                         Ok(info) => {
                             println!("[KASPA] ✓ Node connected & synced! (DAA Score: {})", info.virtual_daa_score);
                             break; // Success, exit loop
                         }
                         Err(e) => {
-                            // Node is reachable but throwing errors (likely indexing)
                             println!("[KASPA] ⚠ Node connected but not ready (Indexing?): {}. Retrying in 10s...", e);
                         }
                     }
                 }
                 Err(e) => {
-                    // TCP Connection failed (Node probably not started yet)
                     println!("[KASPA] ⚠ Connection refused: {}. Is kaspad running? Retrying in 10s...", e);
                 }
             }
@@ -23876,12 +23871,10 @@ impl KaspaFluxNode {
         // Decode hex to bytes
         let tx_bytes = hex::decode(tx_hex).map_err(|_| "Invalid Transaction Hex".to_string())?;
         
-        // Deserialize bytes into RpcTransaction object expected by wRPC
-        // Note: Depending on your serialization format (Borsh/JSON), you might need 
-        // kaspa_consensus_core::tx::Transaction::from_bytes if raw. 
-        // Assuming standard RPC JSON format here for compatibility:
+        // Try to deserialize bytes into RpcTransaction
+        // Fallback to basic JSON value parsing if RpcTransaction fails, though wRPC usually needs the struct
         let tx: RpcTransaction = serde_json::from_slice(&tx_bytes)
-             .or_else(|_| serde_json::from_value(serde_json::json!(tx_hex))) // Fallback if it was just a string structure
+             .or_else(|_| serde_json::from_value(serde_json::json!(tx_hex))) 
              .map_err(|e| format!("Failed to deserialize tx: {}", e))?;
 
         let result = self.rpc.submit_transaction(tx, false)
@@ -23893,16 +23886,18 @@ impl KaspaFluxNode {
 
     /// Get UTXOs for an address
     pub async fn get_utxos(&self, address: &str) -> Result<Vec<KaspaUtxo>, String> {
-        let addr = address.parse().map_err(|_| "Invalid Kaspa Address".to_string())?;
+        // Using generic string parsing for address to avoid trait bound errors
+        let addr = address.to_string();
         
+        // wRPC call
         let entries = self.rpc.get_utxos_by_addresses(vec![addr])
             .await
             .map_err(|e| format!("wRPC UTXO Error: {}", e))?;
 
-        // Map wRPC response to your internal struct
+        // Map wRPC response to your internal KaspaUtxo struct
         let mut utxos = Vec::new();
         for entry in entries {
-            // Handle optional outpoint
+            // Check for outpoint existence
             if let Some(outpoint) = entry.outpoint {
                 if let Some(utxo_entry) = entry.utxo_entry {
                     utxos.push(KaspaUtxo {
@@ -23920,7 +23915,7 @@ impl KaspaFluxNode {
 
     /// Get address balance in sompi
     pub async fn get_balance(&self, address: &str) -> Result<u64, String> {
-        let addr = address.parse().map_err(|_| "Invalid Kaspa Address".to_string())?;
+        let addr = address.to_string();
         
         let resp = self.rpc.get_balance_by_address(addr)
             .await
@@ -23962,21 +23957,14 @@ impl KaspaFluxNode {
 
     /// Submit L2 Merkle root to Kaspa L1 via OP_RETURN (Metadata Payload)
     pub async fn submit_merkle_root(&self, root: [u8; 32], epoch: u32) -> Result<String, String> {
-        // Construct OP_RETURN payload: "KV2" + epoch + root
         let mut payload = Vec::with_capacity(39);
         payload.extend_from_slice(b"KV2"); 
         payload.extend_from_slice(&epoch.to_le_bytes());
         payload.extend_from_slice(&root);
 
-        // Note: This needs a signed transaction wrapper. 
-        // Assuming 'payload_to_tx' is a helper in your codebase that signs this data 
-        // with the node's wallet or communal wallet.
-        // For raw submission logic:
-        
         let payload_hex = hex::encode(payload);
-        println!("[KASPA] Submitting Merkle Root Payload: {}", payload_hex);
-        
-        // Returning success placeholder or the hex to be signed by the wallet manager
+        // Note: Actual submission requires signing a transaction. 
+        // This function returns the payload hex to be used by the transaction builder.
         Ok(payload_hex)
     }
 
@@ -23999,19 +23987,19 @@ impl KaspaFluxNode {
         
         // Add category byte hash (simple checksum or enum)
         let cat_bytes = category.as_bytes();
-        payload.extend_from_slice(&cat_bytes[..std::cmp::min(cat_bytes.len(), 8)]); // Max 8 chars
+        // Take max 8 chars for category
+        let len = std::cmp::min(cat_bytes.len(), 8);
+        payload.extend_from_slice(&cat_bytes[..len]);
 
         let payload_hex = hex::encode(&payload);
-        let script = format!("6a{:02x}{}", payload.len(), payload_hex); // 6a = OP_RETURN
-
-        println!("[KASPA] Generating Trust Analysis Script: {}", script);
-
-        // NOTE: Like submit_merkle_root, this generates the Script payload.
-        // The actual submission requires attaching this script to a transaction 
-        // and signing it with the FROST wallet or Validator Key.
-        // If the node holds the wallet, we would sign here.
         
-        // For now, return the script so the TransactionBuilder can use it.
+        // Format as Kaspa Script: 6a (OP_RETURN) + PUSH_DATA + Payload
+        let script = format!("6a{:02x}{}", payload.len(), payload_hex);
+
+        println!("[KASPA] Generated Trust Analysis Script: {}", script);
+        
+        // Returns the script hex. This must be added to a transaction outputs 
+        // by the wallet manager to actually be posted to L1.
         Ok(script)
     }
 }

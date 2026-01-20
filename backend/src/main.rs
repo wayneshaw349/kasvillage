@@ -23809,7 +23809,6 @@ pub enum KaspaNodeMode {
 
 /// Kaspa Flux Node Client - connects to self-hosted or public node
 
-/// Kaspa Flux Node Client - connects via wRPC (WebSocket JSON-RPC)
 #[derive(Clone)]
 pub struct KaspaFluxNode {
     rpc: Arc<KaspaRpcClient>,

@@ -31136,7 +31136,18 @@ impl L2L1Bridge {
         root_fr: Fr,
         block_height: u64,
     ) -> Result<(), String> {
-        self.l1_settlement.queue_inscription(epoch, root_fr, block_height);
+        // Compute aggregate stats from pending withdrawals
+        let total_completed = self.pending_withdrawals.values()
+            .filter(|w| w.status == WithdrawalStatus::L2Verified || w.status == WithdrawalStatus::Finalized)
+            .count() as u64;
+        let total_disputed = self.pending_withdrawals.values()
+            .filter(|w| matches!(w.status, WithdrawalStatus::Failed(_)))
+            .count() as u64;
+        let completion_rate = if total_completed + total_disputed > 0 {
+            (total_completed * 100) / (total_completed + total_disputed)
+        } else { 100 };
+        
+        self.l1_settlement.queue_inscription(epoch, root_fr, completion_rate, total_disputed, block_height);
         
         // Settle pending inscriptions
         self.l1_settlement.settle_pending()?;

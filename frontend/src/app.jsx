@@ -19,7 +19,7 @@ import Countdown from "react-countdown";
 // ============================================================================
 // ERROR BOUNDARY - Production Crash Recovery
 // ============================================================================
-class ErrorBoundary extends React.Component { 
+class ErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
     this.state = { hasError: false, error: null, errorInfo: null };
@@ -90,9 +90,9 @@ function cn(...inputs) {
   return twMerge(clsx(inputs));
 }
 // Akash Network Backend
-// Akash Network Backend - Connected to Production API
-// Akash Network Backend - Hardcoded for Production
-const API_BASE = 'https://api.kasvillage.com';
+const API_BASE = typeof window !== 'undefined' && window.KASVILLAGE_API_URL 
+  ? window.KASVILLAGE_API_URL 
+  : 'https://134ucrb1rpek78b8ev55521u78.ingress.akash-palmito.org';
 
 
 // CoinGecko API (free, no key needed) for live KASPA price
@@ -5501,79 +5501,77 @@ function StorefrontViewer({ hostName, hostId, onClose }) {
 
 
 // ============================================================================
-// ACADEMIC VIEWER (Display Academic Service Details from Mailbox)
+// ACADEMIC VIEWER (Privacy-Preserving)
 // ============================================================================
 function AcademicViewer({ item, onClose }) {
   if (!item) return null;
+  const [questionText, setQuestionText] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [disclaimerAccepted, setDisclaimerAccepted] = useState(false);
+
+  const handleAskQuestion = async () => {
+    if (!questionText.trim()) return;
+    setIsSubmitting(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/academic/ask-question`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ abstract_id: item.abstract_id, asker_id: 'anon', question_text: questionText })
+      });
+      const data = await res.json();
+      if (data.success) { alert('Question submitted!'); setQuestionText(''); }
+      else alert(data.error || 'Failed');
+    } catch (e) { alert('Network error'); }
+    finally { setIsSubmitting(false); }
+  };
 
   return (
-    <motion.div 
-      initial={{ opacity: 0, y: 20 }} 
-      animate={{ opacity: 1, y: 0 }} 
-      exit={{ opacity: 0, y: 20 }}
-      className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[90] flex items-center justify-center p-4"
-      onClick={onClose}
-    >
-      <motion.div 
-        className="bg-white rounded-3xl w-full max-w-lg max-h-[90vh] overflow-y-auto shadow-2xl"
-        onClick={e => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="sticky top-0 flex justify-between items-center p-6 bg-gradient-to-r from-indigo-50 to-purple-50 border-b border-indigo-200 z-10">
-          <div>
-            <h2 className="text-xl font-black text-indigo-900">{item.title}</h2>
-            <p className="text-xs text-indigo-700 mt-1">{item.type}</p>
-          </div>
-          <button onClick={onClose} className="text-stone-400 hover:text-stone-600 transition">
-            <X size={24} />
-          </button>
+    <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }} className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[90] flex items-center justify-center p-4" onClick={onClose}>
+      <motion.div className="bg-white rounded-3xl w-full max-w-lg max-h-[90vh] overflow-y-auto shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="sticky top-0 flex justify-between items-center p-6 bg-gradient-to-r from-amber-50 to-orange-50 border-b border-amber-200 z-10">
+          <div><h2 className="text-xl font-black text-amber-900">{item.title}</h2><p className="text-xs text-amber-700 mt-1">Research Abstract</p></div>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-600 transition"><X size={24} /></button>
         </div>
-
-        {/* Content */}
         <div className="p-6 space-y-6">
-          {/* Author Info */}
-          <div className="p-4 bg-indigo-50 rounded-xl border border-indigo-200">
-            <p className="text-xs text-indigo-700 uppercase font-bold mb-1">Author</p>
-            <p className="font-bold text-lg text-indigo-900">{item.author}</p>
-            <p className="text-xs text-stone-600 mt-2">Apartment {item.apt}</p>
-          </div>
-
-          {/* Type & Cost */}
-          <div className="grid grid-cols-2 gap-4">
-            <div className="p-3 bg-purple-50 rounded-xl border border-purple-200">
-              <p className="text-[10px] text-purple-700 uppercase font-bold mb-1">Service Type</p>
-              <p className="font-bold text-purple-900">{item.type}</p>
+          {!disclaimerAccepted ? (
+            <div className="space-y-4">
+              <div className="p-4 bg-amber-50 rounded-xl border-2 border-amber-400">
+                <h3 className="font-bold text-amber-900 mb-3 flex items-center gap-2"><AlertTriangle size={18} /> Disclaimer</h3>
+                <ul className="text-xs text-amber-800 space-y-2">
+                  <li>• <strong>Cannot guarantee author authenticity</strong></li>
+                  <li>• <strong>Cannot verify researcher identity</strong></li>
+                  <li>• <strong>Cannot guarantee research validity</strong></li>
+                  <li>• Always verify through official channels</li>
+                </ul>
+              </div>
+              <Button onClick={() => setDisclaimerAccepted(true)} className="w-full bg-amber-600 hover:bg-amber-500">I Understand — View Research</Button>
             </div>
-            <div className="p-3 bg-green-50 rounded-xl border border-green-200">
-              <p className="text-[10px] text-green-700 uppercase font-bold mb-1">Price</p>
-              <p className={cn("font-bold", item.cost === 0 ? "text-green-700" : "text-red-800")}>
-                {item.cost} KASPA               </p>
-            </div>
-          </div>
-
-          {/* Pricing Model */}
-          <div className="p-3 bg-stone-100 rounded-xl">
-            <p className="text-xs text-stone-600 uppercase font-bold mb-1">Pricing Model</p>
-            <p className="font-bold text-stone-900">{item.flat_rate ? "Flat Rate" : "Hourly"}</p>
-          </div>
-
-          {/* Contact CTA */}
-          <div className="space-y-3 pt-6 border-t border-stone-200">
-            <Button 
-              className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold h-12"
-              onClick={() => {
-                alert(`📧 Contact ${item.author} at Apartment ${item.apt}\n\nYou can now initiate a private message or payment to request this service.`);
-              }}
-            >
-              Contact Author
-            </Button>
-            <button 
-              onClick={onClose}
-              className="w-full py-3 border-2 border-stone-300 rounded-xl font-bold text-stone-700 hover:bg-stone-50 transition"
-            >
-              Close
-            </button>
-          </div>
+          ) : (
+            <>
+              <div className="p-2 bg-amber-100 rounded-lg border border-amber-200 text-center">
+                <p className="text-[10px] text-amber-700">⚠️ Platform does not verify author identity or research validity</p>
+              </div>
+              <div className="p-4 bg-amber-50 rounded-xl border border-amber-200">
+                <p className="text-xs text-amber-700 uppercase font-bold mb-1">Researcher</p>
+                <p className="font-mono text-sm text-amber-900 break-all">{item.researcher_id?.slice(0, 24)}...</p>
+                <p className="text-xs text-stone-500 mt-1">Pseudonymous ID • Self-Attested</p>
+              </div>
+              <div><p className="text-xs text-stone-600 uppercase font-bold mb-2">Abstract</p><p className="text-sm text-stone-700 leading-relaxed">{item.abstract_text}</p></div>
+              {item.repository_url && (
+                <div className="p-4 bg-blue-50 rounded-xl border border-blue-200">
+                  <p className="text-xs text-blue-700 uppercase font-bold mb-2">Full Paper</p>
+                  <a href={item.repository_url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 text-blue-600 text-sm hover:underline"><ExternalLink size={14} /> {item.repository_url}</a>
+                </div>
+              )}
+              {item.keywords?.length > 0 && <div className="flex flex-wrap gap-2">{item.keywords.map(k => <span key={k} className="text-xs bg-stone-100 text-stone-600 px-2 py-1 rounded">{k}</span>)}</div>}
+              <div className="pt-6 border-t border-stone-200">
+                <h4 className="font-bold text-stone-800 mb-2 flex items-center gap-2"><Mail size={16} /> Ask a Question</h4>
+                <p className="text-xs text-stone-500 mb-3">First question FREE. Hash-committed to Merkle tree.</p>
+                <textarea value={questionText} onChange={(e) => setQuestionText(e.target.value)} placeholder="Your question..." className="w-full p-3 border border-stone-300 rounded-xl text-sm" rows={3} />
+                <Button onClick={handleAskQuestion} disabled={!questionText.trim() || isSubmitting} className="w-full mt-3 bg-amber-600 hover:bg-amber-500 text-white font-bold h-12">{isSubmitting ? 'Submitting...' : 'Submit Question'}</Button>
+              </div>
+              <button onClick={onClose} className="w-full py-3 border-2 border-stone-300 rounded-xl font-bold text-stone-700 hover:bg-stone-50 transition">Close</button>
+            </>
+          )}
         </div>
       </motion.div>
     </motion.div>
@@ -6212,151 +6210,475 @@ function DropAgreementModule({ onClose, onTransactionComplete }) {
 }
 
 // --- 13. ACADEMIC MODULE ---
+// ============================================================================
+// PRIVACY-PRESERVING ACADEMIC RESEARCH WORKSPACE
+// ============================================================================
+
 function AcademicResearchPreview({ onClose }) {
   const { user } = useContext(GlobalContext);
-  const [verified, setVerified] = useState(false);
-  const [universityEmail, setUniversityEmail] = useState("");
-  const [advisorEmail, setAdvisorEmail] = useState("");
-  const [donationAmount, setDonationAmount] = useState(10);
+  const [activeTab, setActiveTab] = useState('browse');
+  const [researcherProfile, setResearcherProfile] = useState(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [verificationStep, setVerificationStep] = useState(0);
+  const [eduEmail, setEduEmail] = useState('');
+  const [verificationCode, setVerificationCode] = useState('');
+  const [verificationError, setVerificationError] = useState('');
+  const [abstractTitle, setAbstractTitle] = useState('');
+  const [abstractText, setAbstractText] = useState('');
+  const [repositoryUrl, setRepositoryUrl] = useState('');
+  const [keywords, setKeywords] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [abstracts, setAbstracts] = useState([]);
+  const [selectedAbstract, setSelectedAbstract] = useState(null);
+  const [questionText, setQuestionText] = useState('');
+  const [questionPrice, setQuestionPrice] = useState(0);
   const [tutoringPrice, setTutoringPrice] = useState(0);
   const [flatRatePrice, setFlatRatePrice] = useState(0);
-  
-  const [professorName, setProfessorName] = useState("Dr. Anya Sharma");
-  const [abstractLink, setAbstractLink] = useState("https://kasresearch.com/publication_id_123");
-  const [abstractSummary, setAbstractSummary] = useState("Proving a new consensus mechanism for Layer 2 based on Kaspa's BlockDAG, focusing on transaction finality speed and multi-sig contract latency. The findings suggest a 45% reduction in confirmation time.");
-  const [aiInterpretation, setAiInterpretation] = useState("Imagine sending money faster than a blink! This research basically turbo-charged a digital cash system (Kaspa) to make special agreements (like 'I pay if you deliver') super-duper quick, making online trade way less scary for the average person.");
-  
-  const [studentAbstract, setStudentAbstract] = useState("");
-  const [studentAbstractUrl, setStudentAbstractUrl] = useState("");
-  const [studentAiInterpretation, setStudentAiInterpretation] = useState("");
+  const [studentAbstract, setStudentAbstract] = useState('');
+  const [studentAbstractUrl, setStudentAbstractUrl] = useState('');
+  const [studentAiInterpretation, setStudentAiInterpretation] = useState('');
+  const [attestation1, setAttestation1] = useState(false);
+  const [attestation2, setAttestation2] = useState(false);
+  const [viewerDisclaimerAccepted, setViewerDisclaimerAccepted] = useState(() => {
+    return sessionStorage.getItem('kv_research_disclaimer_accepted') === 'true';
+  });
 
+  const handleAcceptDisclaimer = () => {
+    setViewerDisclaimerAccepted(true);
+    sessionStorage.setItem('kv_research_disclaimer_accepted', 'true');
+  };
 
-  function requestVerification() {
-    if (universityEmail.endsWith(".edu") && advisorEmail.includes("@") && professorName.length > 3) { setVerified(true); } else { alert("Please provide valid university email, advisor email, and professor name."); }
-  }
+  useEffect(() => {
+    const savedId = localStorage.getItem('kv_researcher_id');
+    if (savedId) { loadProfile(savedId); setVerificationStep(2); }
+    handleSearch();
+  }, []);
 
-  const handleDonation = () => {
-    if (donationAmount > 0) {
-        alert(`Simulating a ${donationAmount} KASPA donation to the researcher's address. Broadcast transaction...`);
-    } else {
-        alert("Donation amount must be greater than 0 KASPA.");
-    }
+  const loadProfile = async (id) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/academic/profile/${id}`);
+      if (res.ok) { const data = await res.json(); setResearcherProfile(data.data); }
+    } catch (e) { console.error(e); }
+  };
+
+  const handleRequestVerification = async () => {
+    if (!eduEmail.endsWith('.edu')) { setVerificationError('Only .edu emails accepted'); return; }
+    setIsLoading(true); setVerificationError('');
+    try {
+      const res = await fetch(`${API_BASE}/api/academic/verify-email`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: eduEmail })
+      });
+      const data = await res.json();
+      if (data.success) setVerificationStep(1);
+      else setVerificationError(data.error || 'Failed');
+    } catch (e) { setVerificationError('Network error'); }
+    finally { setIsLoading(false); }
+  };
+
+  const handleConfirmVerification = async () => {
+    if (verificationCode.length !== 6) { setVerificationError('Enter 6-digit code'); return; }
+    setIsLoading(true); setVerificationError('');
+    try {
+      const res = await fetch(`${API_BASE}/api/academic/confirm-verification`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: eduEmail, code: verificationCode })
+      });
+      const data = await res.json();
+      if (data.success && data.researcher_id) {
+        localStorage.setItem('kv_researcher_id', data.researcher_id);
+        setVerificationStep(2);
+        loadProfile(data.researcher_id);
+      } else setVerificationError(data.error || 'Invalid code');
+    } catch (e) { setVerificationError('Network error'); }
+    finally { setIsLoading(false); }
+  };
+
+  const handleSubmitAbstract = async () => {
+    if (!researcherProfile) { alert('Verify email first'); return; }
+    if (!repositoryUrl.startsWith('http')) { alert('Repository URL required'); return; }
+    setIsLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/academic/submit-abstract`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          researcher_id: researcherProfile.researcher_id,
+          title: abstractTitle, abstract_text: abstractText,
+          repository_url: repositoryUrl,
+          keywords: keywords.split(',').map(k => k.trim()).filter(k => k)
+        })
+      });
+      const data = await res.json();
+      if (data.success) {
+        alert(`Submitted! ID: ${data.abstract_id}`);
+        setAbstractTitle(''); setAbstractText(''); setRepositoryUrl(''); setKeywords('');
+        setStudentAiInterpretation(''); setAttestation1(false); setAttestation2(false);
+        setActiveTab('browse');
+      } else alert(data.error || 'Failed');
+    } catch (e) { alert('Network error'); }
+    finally { setIsLoading(false); }
+  };
+
+  const handleSearch = async () => {
+    setIsLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (searchQuery) params.append('search', searchQuery);
+      params.append('limit', '50');
+      const res = await fetch(`${API_BASE}/api/academic/abstracts?${params}`);
+      const data = await res.json();
+      if (data.success) setAbstracts(data.data || []);
+    } catch (e) { console.error(e); }
+    finally { setIsLoading(false); }
+  };
+
+  const handleAskQuestion = async () => {
+    if (!selectedAbstract || !questionText.trim()) return;
+    setIsLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/academic/ask-question`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          abstract_id: selectedAbstract.abstract_id,
+          asker_id: user.pubkey || 'anon',
+          question_text: questionText
+        })
+      });
+      const data = await res.json();
+      if (data.success) { alert(`Submitted! Hash: ${data.question_hash?.slice(0,16)}...`); setQuestionText(''); }
+      else if (res.status === 402) alert(data.error || 'Payment required');
+      else alert(data.error || 'Failed');
+    } catch (e) { alert('Network error'); }
+    finally { setIsLoading(false); }
+  };
+
+  const handleSetQuestionPrice = async () => {
+    if (!researcherProfile) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/academic/set-price`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          researcher_id: researcherProfile.researcher_id,
+          price_sompi: Math.floor(questionPrice * 100000000)
+        })
+      });
+      const data = await res.json();
+      if (data.success) alert('Price updated!');
+      else alert(data.error || 'Failed');
+    } catch (e) { alert('Network error'); }
   };
 
   return (
     <div className="fixed inset-0 bg-amber-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-[70]">
-      <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="bg-white rounded-3xl p-6 w-full max-w-md shadow-2xl overflow-y-auto max-h-[90vh]">
-        <div className="flex justify-between items-center mb-6"><h1 className="text-2xl font-black text-amber-900">Book Shelf</h1><Button variant="outline" onClick={onClose} className="rounded-full h-8 w-8 p-0"><X className="w-5 h-5" /></Button></div>
+      <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="bg-white rounded-3xl w-full max-w-lg shadow-2xl overflow-hidden max-h-[90vh] flex flex-col">
+        <div className="flex justify-between items-center p-6 bg-gradient-to-r from-amber-50 to-orange-50 border-b border-amber-200">
+          <div>
+            <h1 className="text-2xl font-black text-amber-900">📚 Research Shelf</h1>
+            <p className="text-xs text-amber-700 mt-1">Privacy-Preserving Academic Exchange</p>
+          </div>
+          <Button variant="outline" onClick={onClose} className="rounded-full h-8 w-8 p-0"><X className="w-5 h-5" /></Button>
+        </div>
 
-        <section className="mb-4 p-4 border border-amber-300 rounded-2xl bg-amber-50">
-            <h3 className="font-bold text-amber-900 mb-3">Identity & Verification</h3>
-            
-            <label className="block mt-2 text-sm text-amber-800">Verification Professor/Advisor</label>
-            <input className="w-full p-2 border border-amber-300 rounded-xl bg-white mb-2" placeholder="Professor Name" value={professorName} onChange={(e)=>setProfessorName(e.target.value)} />
+        <div className="flex border-b border-amber-200 bg-amber-50/50">
+          {['browse', 'submit', 'services', 'profile'].map(tab => (
+            <button key={tab} onClick={() => setActiveTab(tab)} className={cn("flex-1 py-3 text-sm font-bold transition-colors", activeTab === tab ? "text-amber-900 border-b-2 border-amber-600 bg-white" : "text-amber-600 hover:text-amber-800")}>
+              {tab === 'browse' && '🔍 Browse'}{tab === 'submit' && '📝 Submit'}{tab === 'services' && '💼 Services'}{tab === 'profile' && '👤 Profile'}
+            </button>
+          ))}
+        </div>
 
-            <label className="block mt-2 text-sm text-amber-800">University Email</label>
-            <input className="w-full p-2 border border-amber-300 rounded-xl bg-white mb-2" placeholder="University Email" value={universityEmail} onChange={(e)=>setUniversityEmail(e.target.value)} />
-            
-            <label className="block mt-2 text-sm text-amber-800">Advisor Email</label>
-            <input className="w-full p-2 border border-amber-300 rounded-xl bg-white mb-2" placeholder="Advisor Email" value={advisorEmail} onChange={(e)=>setAdvisorEmail(e.target.value)} />
+        <div className="flex-1 overflow-y-auto p-6">
+          {activeTab === 'browse' && (
+            <div className="space-y-4">
+              {/* Viewer Disclaimer */}
+              {!viewerDisclaimerAccepted ? (
+                <div className="space-y-4">
+                  <div className="p-4 bg-amber-50 rounded-xl border-2 border-amber-400">
+                    <h3 className="font-bold text-amber-900 text-lg mb-3 flex items-center gap-2">
+                      <AlertTriangle size={20} /> Important Disclaimer
+                    </h3>
+                    <div className="space-y-3 text-sm text-amber-800">
+                      <p><strong>Before browsing research on this platform, please understand:</strong></p>
+                      <ul className="space-y-2 ml-4">
+                        <li className="flex items-start gap-2">
+                          <span className="text-red-600 font-bold">•</span>
+                          <span><strong>We cannot guarantee the authenticity of any author.</strong> Researcher identities are self-attested and verified only via .edu email domain.</span>
+                        </li>
+                        <li className="flex items-start gap-2">
+                          <span className="text-red-600 font-bold">•</span>
+                          <span><strong>We cannot verify the true identity of researchers.</strong> Pseudonymous IDs protect privacy but do not confirm real-world identity.</span>
+                        </li>
+                        <li className="flex items-start gap-2">
+                          <span className="text-red-600 font-bold">•</span>
+                          <span><strong>We cannot guarantee the validity of any research.</strong> Content is user-submitted and not peer-reviewed by this platform.</span>
+                        </li>
+                        <li className="flex items-start gap-2">
+                          <span className="text-red-600 font-bold">•</span>
+                          <span><strong>Always verify through official channels.</strong> Cross-reference with institutional repositories and published sources.</span>
+                        </li>
+                      </ul>
+                    </div>
+                  </div>
+                  <Button 
+                    onClick={handleAcceptDisclaimer} 
+                    className="w-full bg-amber-600 hover:bg-amber-500 h-12"
+                  >
+                    I Understand — Continue to Browse
+                  </Button>
+                </div>
+              ) : (
+                <>
+                  <div className="flex gap-2">
+                    <input type="text" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Search abstracts..." className="flex-1 p-3 border border-amber-300 rounded-xl text-sm" onKeyPress={(e) => e.key === 'Enter' && handleSearch()} />
+                    <Button onClick={handleSearch} className="bg-amber-600 hover:bg-amber-500"><Search size={18} /></Button>
+                  </div>
+                  
+                  {/* Persistent mini-disclaimer */}
+                  <div className="p-2 bg-amber-100 rounded-lg border border-amber-300">
+                    <p className="text-[10px] text-amber-700 text-center">
+                      ⚠️ Platform does not verify author identity or research validity. <button onClick={() => { setViewerDisclaimerAccepted(false); sessionStorage.removeItem('kv_research_disclaimer_accepted'); }} className="underline hover:text-amber-900">Review disclaimer</button>
+                    </p>
+                  </div>
 
-            <div className="flex gap-2 mt-3 items-center">
-                <Button variant="secondary" onClick={requestVerification} className="bg-amber-800">Request Co-sign</Button>
-                <span className={cn("ml-2 self-center font-bold text-sm", verified ? 'text-green-700' : 'text-red-700')}>{verified ? 'Verified' : 'Unverified'}</span>
+                  <div className="space-y-3">
+                    {abstracts.length === 0 ? (
+                      <p className="text-center py-8 text-amber-600 text-sm">No abstracts found</p>
+                    ) : abstracts.map(a => (
+                      <div key={a.abstract_id} onClick={() => setSelectedAbstract(a)} className={cn("p-4 rounded-xl border cursor-pointer transition-all", selectedAbstract?.abstract_id === a.abstract_id ? "border-amber-500 bg-amber-50" : "border-stone-200 hover:border-amber-300")}>
+                        <h4 className="font-bold text-stone-900 text-sm">{a.title}</h4>
+                        <p className="text-xs text-stone-600 mt-1 line-clamp-2">{a.abstract_text}</p>
+                        <div className="flex items-center gap-2 mt-2">
+                          <span className="text-[10px] text-amber-700 bg-amber-100 px-2 py-0.5 rounded">{a.researcher_id?.slice(0,16)}...</span>
+                          {a.keywords?.slice(0,3).map(k => <span key={k} className="text-[10px] text-stone-500 bg-stone-100 px-2 py-0.5 rounded">{k}</span>)}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {selectedAbstract && (
+                    <div className="mt-4 p-4 bg-gradient-to-r from-amber-50 to-orange-50 rounded-xl border border-amber-200">
+                      <h4 className="font-bold text-amber-900">{selectedAbstract.title}</h4>
+                      <p className="text-sm text-stone-700 mt-2">{selectedAbstract.abstract_text}</p>
+                      <a href={selectedAbstract.repository_url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 text-blue-600 text-sm mt-3 hover:underline"><ExternalLink size={14} /> View Full Paper</a>
+                      <div className="mt-4 pt-4 border-t border-amber-200">
+                        <p className="text-xs text-amber-800 font-bold mb-2">💬 Ask a Question (First is FREE)</p>
+                        <textarea value={questionText} onChange={(e) => setQuestionText(e.target.value)} placeholder="Your question..." className="w-full p-3 border border-amber-300 rounded-xl text-sm" rows={3} />
+                        <Button onClick={handleAskQuestion} disabled={!questionText.trim() || isLoading} className="w-full mt-2 bg-amber-600 hover:bg-amber-500">{isLoading ? 'Submitting...' : 'Submit Question'}</Button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
-        </section>
+          )}
 
-        <section className="mb-4 p-4 border border-amber-300 rounded-2xl bg-white">
-            <h3 className="font-bold text-xl text-amber-900 mb-3">Research & Publication</h3>
-            
-            <h4 className="font-bold text-amber-900 mb-1 flex items-center gap-2"><FileText size={16}/> Abstract Summary</h4>
-            <p className="text-sm text-amber-700 p-3 bg-amber-50 rounded-lg border border-amber-200">{abstractSummary}</p>
-            
-            <h4 className="font-bold text-amber-900 mt-3 mb-1 flex items-center gap-2"><Link size={16}/> Full Abstract Link</h4>
-            <a href={abstractLink} target="_blank" rel="noopener noreferrer" className="block text-sm text-blue-600 underline truncate p-3 bg-blue-50 border border-blue-200 rounded-lg">{abstractLink}</a>
+          {activeTab === 'submit' && (
+            <div className="space-y-4">
+              {verificationStep < 2 ? (
+                <div className="space-y-4">
+                  {/* Privacy Notice */}
+                  <div className="p-4 bg-green-50 rounded-xl border border-green-200">
+                    <h3 className="font-bold text-green-900 flex items-center gap-2"><ShieldCheck size={18} /> Your Privacy is Protected</h3>
+                    <ul className="text-xs text-green-800 mt-2 space-y-1">
+                      <li>✓ <strong>We do NOT store your email address</strong></li>
+                      <li>✓ Only a cryptographic hash is saved for verification</li>
+                      <li>✓ Your email is used ONLY to send a one-time verification code</li>
+                      <li>✓ After verification, your email is immediately discarded</li>
+                    </ul>
+                  </div>
 
-            <h4 className="font-bold text-amber-900 mt-4 mb-1 flex items-center gap-2"><HeartHandshake size={16}/> AI Interpretation (Freshman in High School)</h4>
-            <p className="text-sm text-red-800 font-medium p-3 bg-red-50 rounded-lg border border-red-200">"{aiInterpretation}"</p>
-            
-            <div className="p-3 bg-amber-50 rounded-lg border border-amber-200 mt-2">
-              <p className="text-xs text-amber-700 font-semibold">📝 Example Only</p>
-              <p className="text-xs text-amber-700 mt-1">The abstract summary and interpretation above are provided as examples to help you understand how to explain complex research in simple terms. Your submission should be based on your own research and original work, not copied from these examples.</p>
+                  {/* Free Posting Notice */}
+                  <div className="p-4 bg-blue-50 rounded-xl border border-blue-200">
+                    <h3 className="font-bold text-blue-900 flex items-center gap-2"><Zap size={18} /> 100% FREE to Post Research</h3>
+                    <ul className="text-xs text-blue-800 mt-2 space-y-1">
+                      <li>✓ No monthly fees</li>
+                      <li>✓ No subscription required</li>
+                      <li>✓ Unlimited abstract submissions</li>
+                      <li>✓ Only requirement: verified .edu email</li>
+                    </ul>
+                  </div>
+
+                  <div className="p-4 bg-amber-50 rounded-xl border border-amber-200">
+                    <h3 className="font-bold text-amber-900 flex items-center gap-2"><Lock size={18} /> One-Time .edu Email Verification</h3>
+                    <p className="text-xs text-amber-700 mt-2">Verify your institutional email to start posting. This confirms you're affiliated with an academic institution.</p>
+                  </div>
+
+                  {verificationStep === 0 && (
+                    <>
+                      <div>
+                        <label className="block text-xs text-amber-800 font-bold mb-1">University Email (.edu only)</label>
+                        <input type="email" value={eduEmail} onChange={(e) => setEduEmail(e.target.value)} placeholder="you@university.edu" className="w-full p-3 border border-amber-300 rounded-xl text-sm" />
+                        <p className="text-[10px] text-stone-500 mt-1">A 6-digit verification code will be sent to this email.</p>
+                      </div>
+                      {verificationError && <p className="text-xs text-red-600">{verificationError}</p>}
+                      <Button onClick={handleRequestVerification} disabled={isLoading || !eduEmail.endsWith('.edu')} className="w-full bg-amber-600 hover:bg-amber-500">{isLoading ? 'Sending Code...' : 'Send Verification Code'}</Button>
+                    </>
+                  )}
+
+                  {verificationStep === 1 && (
+                    <>
+                      <div className="p-3 bg-green-50 rounded-xl border border-green-200">
+                        <p className="text-xs text-green-800 font-bold">✓ Verification code sent!</p>
+                        <p className="text-xs text-green-700 mt-1">Check your inbox at <strong>{eduEmail}</strong></p>
+                        <p className="text-[10px] text-green-600 mt-1">Code expires in 15 minutes. Check spam folder if not received.</p>
+                      </div>
+                      <div>
+                        <label className="block text-xs text-amber-800 font-bold mb-1">Enter 6-Digit Verification Code</label>
+                        <input type="text" value={verificationCode} onChange={(e) => setVerificationCode(e.target.value.replace(/\D/g, '').slice(0, 6))} placeholder="000000" className="w-full p-3 border border-amber-300 rounded-xl text-sm text-center text-2xl font-mono tracking-widest" maxLength={6} />
+                      </div>
+                      {verificationError && <p className="text-xs text-red-600">{verificationError}</p>}
+                      <Button onClick={handleConfirmVerification} disabled={isLoading || verificationCode.length !== 6} className="w-full bg-green-600 hover:bg-green-500">{isLoading ? 'Verifying...' : 'Verify & Create Researcher ID'}</Button>
+                      <button onClick={() => { setVerificationStep(0); setVerificationCode(''); }} className="w-full text-center text-xs text-amber-600 hover:text-amber-800 underline">
+                        ← Use different email
+                      </button>
+                    </>
+                  )}
+                </div>
+              ) : (
+                <>
+                  <div className="p-3 bg-green-50 rounded-xl border border-green-200 mb-4">
+                    <p className="text-xs text-green-800 flex items-center gap-2"><CheckCircle size={14} /> <strong>Verified Researcher</strong></p>
+                    <p className="text-[10px] text-green-700 mt-1 font-mono break-all">ID: {researcherProfile?.researcher_id?.slice(0,24)}...</p>
+                  </div>
+
+                  <div className="p-3 bg-blue-50 rounded-xl border border-blue-200 mb-4">
+                    <p className="text-xs text-blue-800 flex items-center gap-2"><Zap size={14} /> <strong>Posting is 100% FREE</strong> — No fees, no limits!</p>
+                  </div>
+                  
+                  {/* Example Section */}
+                  <section className="p-4 border border-amber-300 rounded-2xl bg-white mb-4">
+                    <h3 className="font-bold text-xl text-amber-900 mb-3">Research & Publication Example</h3>
+                    <h4 className="font-bold text-amber-900 mb-1 flex items-center gap-2"><FileText size={16}/> Abstract Summary</h4>
+                    <p className="text-sm text-amber-700 p-3 bg-amber-50 rounded-lg border border-amber-200">Proving a new consensus mechanism for Layer 2 based on Kaspa's BlockDAG, focusing on transaction finality speed and multi-sig contract latency. The findings suggest a 45% reduction in confirmation time.</p>
+                    <h4 className="font-bold text-amber-900 mt-3 mb-1 flex items-center gap-2"><Link size={16}/> Full Abstract Link</h4>
+                    <a href="https://kasresearch.com/publication_id_123" target="_blank" rel="noopener noreferrer" className="block text-sm text-blue-600 underline truncate p-3 bg-blue-50 border border-blue-200 rounded-lg">https://kasresearch.com/publication_id_123</a>
+                    <h4 className="font-bold text-amber-900 mt-4 mb-1 flex items-center gap-2"><HeartHandshake size={16}/> AI Interpretation (9th Grade)</h4>
+                    <p className="text-sm text-red-800 font-medium p-3 bg-red-50 rounded-lg border border-red-200">"Imagine sending money faster than a blink! This research basically turbo-charged a digital cash system (Kaspa) to make special agreements super-duper quick, making online trade way less scary."</p>
+                    <div className="p-3 bg-amber-50 rounded-lg border border-amber-200 mt-2">
+                      <p className="text-xs text-amber-700 font-semibold">📝 Example Only</p>
+                      <p className="text-xs text-amber-700 mt-1">The above is an example. Your submission should be based on your own research.</p>
+                    </div>
+                  </section>
+
+                  {/* Your Abstract Section */}
+                  <div className="border-t-2 border-amber-200 pt-4">
+                    <h4 className="font-bold text-amber-900 mb-3 text-base">✏️ Your Abstract</h4>
+                    <div><label className="block text-xs text-amber-800 font-bold mb-1">Title *</label><input type="text" value={abstractTitle} onChange={(e) => setAbstractTitle(e.target.value)} className="w-full p-3 border border-amber-300 rounded-xl text-sm" /></div>
+                    <div className="mt-3"><label className="block text-xs text-amber-800 font-bold mb-1">Abstract Summary *</label><textarea value={abstractText} onChange={(e) => setAbstractText(e.target.value)} placeholder="Your research summary..." className="w-full p-3 border border-amber-300 rounded-xl text-sm" rows={4} /></div>
+                    <div className="mt-3"><label className="block text-xs text-amber-800 font-bold mb-1">9th Grade AI Interpretation</label><textarea value={studentAiInterpretation} onChange={(e) => setStudentAiInterpretation(e.target.value)} placeholder="Explain your research in simple terms..." className="w-full p-3 border border-amber-300 rounded-xl bg-blue-50 text-sm" rows={3} /></div>
+                    <div className="mt-3"><label className="block text-xs text-amber-800 font-bold mb-1">Repository URL * (MANDATORY)</label><input type="url" value={repositoryUrl} onChange={(e) => setRepositoryUrl(e.target.value)} placeholder="https://arxiv.org/abs/..." className="w-full p-3 border border-amber-300 rounded-xl text-sm" /><p className="text-[10px] text-amber-600 mt-1">Must be publicly accessible.</p></div>
+                    <div className="mt-3"><label className="block text-xs text-amber-800 font-bold mb-1">Keywords</label><input type="text" value={keywords} onChange={(e) => setKeywords(e.target.value)} placeholder="blockchain, cryptography" className="w-full p-3 border border-amber-300 rounded-xl text-sm" /></div>
+                    
+                    {/* Researcher Attestation */}
+                    <div className="mt-4 p-4 bg-red-50 rounded-xl border-2 border-red-300">
+                      <h4 className="font-bold text-red-900 text-sm mb-3">⚠️ Researcher Attestation (Required)</h4>
+                      <div className="space-y-3">
+                        <label className="flex items-start gap-3 cursor-pointer">
+                          <input 
+                            type="checkbox" 
+                            checked={attestation1} 
+                            onChange={(e) => setAttestation1(e.target.checked)}
+                            className="mt-1 w-5 h-5 rounded border-red-300 text-red-600 focus:ring-red-500"
+                          />
+                          <span className="text-xs text-red-800">
+                            <strong>I attest that I personally contributed to this research project.</strong> I am either the author, co-author, or a verified contributor to this work.
+                          </span>
+                        </label>
+                        <label className="flex items-start gap-3 cursor-pointer">
+                          <input 
+                            type="checkbox" 
+                            checked={attestation2} 
+                            onChange={(e) => setAttestation2(e.target.checked)}
+                            className="mt-1 w-5 h-5 rounded border-red-300 text-red-600 focus:ring-red-500"
+                          />
+                          <span className="text-xs text-red-800">
+                            <strong>I understand this is my sole representation.</strong> The platform relies on my attestation and .edu verification; misrepresentation may result in account termination and XP forfeiture.
+                          </span>
+                        </label>
+                      </div>
+                    </div>
+
+                    <Button onClick={handleSubmitAbstract} disabled={isLoading || !abstractTitle || !abstractText || !repositoryUrl || !attestation1 || !attestation2} className="w-full mt-4 bg-amber-700 hover:bg-amber-600">{isLoading ? 'Submitting...' : 'Submit Your Abstract'}</Button>
+                  </div>
+                </>
+              )}
             </div>
-            
-            <div className="border-t-2 border-amber-200 mt-4 pt-4">
-              <h4 className="font-bold text-amber-900 mb-3 text-base">✏️ Your Abstract</h4>
-              
-              <label className="block text-xs text-amber-800 font-bold mb-1">Abstract Summary</label>
-              <textarea 
-                className="w-full p-3 border border-amber-300 rounded-xl bg-white mb-3 text-sm" 
-                placeholder="Copy and base your abstract from the example above..." 
-                value={studentAbstract} 
-                onChange={(e) => setStudentAbstract(e.target.value)}
-                rows={4}
-              />
-              
-              <label className="block text-xs text-amber-800 font-bold mb-1">9th Grade AI Interpretation (Copy & Paste)</label>
-              <textarea 
-                className="w-full p-3 border border-amber-300 rounded-xl bg-blue-50 mb-3 text-sm font-mono text-xs" 
-                placeholder="Copy this interpretation into your submission..." 
-                value={studentAiInterpretation}
-                onChange={(e) => setStudentAiInterpretation(e.target.value)}
-                defaultValue="Imagine sending money faster than a blink! This research basically turbo-charged a digital cash system (Kaspa) to make special agreements (like 'I pay if you deliver') super-duper quick, making online trade way less scary for the average person."
-                rows={5}
-              />
-              <p className="text-[10px] text-blue-600 mb-3 font-semibold">↑ Click above to select & copy this interpretation</p>
-              
-              <label className="block text-xs text-amber-800 font-bold mb-1">Published Abstract URL</label>
-              <input 
-                type="url"
-                className="w-full p-2 border border-amber-300 rounded-xl bg-white mb-3 text-sm" 
-                placeholder="https://example.com/your-abstract" 
-                value={studentAbstractUrl} 
-                onChange={(e) => setStudentAbstractUrl(e.target.value)}
-              />
-              
-              <button className="w-full p-2 bg-amber-700 hover:bg-amber-600 text-white font-bold rounded-lg text-sm">
-                Submit Your Abstract
-              </button>
+          )}
+
+          {activeTab === 'services' && (
+            <div className="space-y-4">
+              {/* KASPA Rate Per Question */}
+              <section className="p-4 border border-red-300 rounded-2xl bg-red-50">
+                <h3 className="font-black text-xl text-red-800 mb-3 flex items-center gap-2"><Wallet size={18}/> KASPA Rate Per Question</h3>
+                <p className="text-xs text-red-700 mb-3">Set your price for follow-up questions. First question is always FREE.</p>
+                <label className="block text-sm text-red-800 font-bold">Price per Question (KASPA)</label>
+                <div className="flex gap-2 mt-1">
+                  <input type="number" className="w-full p-2 border border-red-300 rounded-xl bg-white" value={questionPrice} onChange={(e) => setQuestionPrice(Number(e.target.value))} min="0" step="0.1" />
+                  <Button onClick={handleSetQuestionPrice} disabled={!researcherProfile} className="bg-red-800 hover:bg-red-900">Set Price</Button>
+                </div>
+                <p className="text-xs text-red-700 mt-2">100% of KASPA goes directly to your wallet.</p>
+              </section>
+
+              {/* Tutoring Services */}
+              <section className="p-4 border border-amber-300 rounded-2xl bg-amber-50">
+                <h3 className="font-bold text-amber-900">Tutoring, Auditing, & Consulting Services</h3>
+                <p className="text-sm text-amber-700">Full publication is publicly available. Tutoring is a business option paid in KASPA.</p>
+                <h4 className="font-bold text-amber-900 mt-3 flex items-center gap-2"><Clock size={16}/> Tutoring/Classes/Consulting</h4>
+                <p className="text-xs text-amber-700 mb-2">Available for code auditing, accounting/company auditing, statistics, analytics, private classes, counseling, and legal consulting (see disclaimer).</p>
+                <div className="p-2 bg-red-100 border border-red-200 rounded-lg text-[10px] text-red-800 mb-3 font-bold">
+                  ⚠️ DISCLAIMER: "Legal Consulting" refers to regulatory compliance guidance and research only. It does NOT constitute an attorney-client relationship or formal legal advice.
+                </div>
+                <label className="block mt-2 text-sm text-amber-800">Price per hour (KASPA)</label>
+                <input type="number" className="w-full p-2 border border-amber-300 rounded-xl bg-white" value={tutoringPrice} onChange={(e) => setTutoringPrice(Number(e.target.value))} />
+                <label className="block mt-2 text-sm text-amber-800">Flat Rate Project Fee (KASPA)</label>
+                <input type="number" className="w-full p-2 border border-amber-300 rounded-xl bg-white" value={flatRatePrice} onChange={(e) => setFlatRatePrice(Number(e.target.value))} />
+                <a href="https://zoom.us/join" target="_blank" rel="noopener noreferrer" className="mt-3 block">
+                  <Button className="w-full bg-indigo-600">Link to Zoom / Class</Button>
+                </a>
+              </section>
             </div>
-        </section>
+          )}
 
-        <section className="mb-4 p-4 border border-red-300 rounded-2xl bg-red-50">
-            <h3 className="font-black text-xl text-red-800 mb-3 flex items-center gap-2"><Wallet size={18}/> Support Research: Kaspa Donation</h3>
-            
-            <label className="block mt-2 text-sm text-red-800 font-bold">Donation Amount (KASPA)</label>
-            <div className="flex gap-2">
-                <input type="number" className="w-full p-2 border border-red-300 rounded-xl bg-white" value={donationAmount} onChange={(e)=>setDonationAmount(Number(e.target.value))} min="1" />
-                <Button onClick={handleDonation} variant="secondary" className="bg-red-800 hover:bg-red-900">Donate KASPA</Button>
+          {activeTab === 'profile' && (
+            <div className="space-y-4">
+              {!researcherProfile ? (
+                <div className="text-center py-8"><Lock size={32} className="mx-auto mb-2 text-amber-400" /><p className="text-stone-600 text-sm">Verify .edu email in Submit tab to create your researcher profile.</p></div>
+              ) : (
+                <>
+                  <div className="p-4 bg-gradient-to-r from-green-100 to-emerald-100 rounded-xl border border-green-200">
+                    <div className="flex items-center gap-2 mb-2">
+                      <ShieldCheck size={20} className="text-green-700" />
+                      <h4 className="font-bold text-green-900">Verified Researcher</h4>
+                    </div>
+                    <p className="text-xs text-green-700 font-mono break-all">ID: {researcherProfile.researcher_id}</p>
+                    <p className="text-[10px] text-green-600 mt-2">Institution: {researcherProfile.institution_domain || 'Verified .edu'}</p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="p-4 bg-green-50 rounded-xl border border-green-200 text-center"><p className="text-2xl font-black text-green-700">{researcherProfile.xp || 0}</p><p className="text-xs text-green-600 font-bold">XP Earned</p></div>
+                    <div className="p-4 bg-blue-50 rounded-xl border border-blue-200 text-center"><p className="text-2xl font-black text-blue-700">{researcherProfile.abstract_count || 0}</p><p className="text-xs text-blue-600 font-bold">Abstracts</p></div>
+                  </div>
+                  <div className="p-4 bg-amber-50 rounded-xl border border-amber-200">
+                    <h4 className="font-bold text-amber-800 text-sm mb-2">🔒 Privacy Guarantee</h4>
+                    <ul className="text-xs text-amber-700 space-y-1">
+                      <li>✓ <strong>Your email was NOT stored</strong> — only a hash</li>
+                      <li>✓ Pseudonymous researcher ID (not linked to real identity)</li>
+                      <li>✓ Questions/answers are hash-committed to Merkle tree</li>
+                      <li>✓ No tracking, no ads, no data selling</li>
+                    </ul>
+                  </div>
+                  <div className="p-4 bg-blue-50 rounded-xl border border-blue-200">
+                    <h4 className="font-bold text-blue-800 text-sm mb-2">💰 Pricing Model</h4>
+                    <ul className="text-xs text-blue-700 space-y-1">
+                      <li>✓ <strong>Posting research: FREE</strong> (no monthly fee)</li>
+                      <li>✓ First question from readers: FREE</li>
+                      <li>✓ Follow-up questions: You set the KASPA price</li>
+                      <li>✓ 100% of payments go directly to you</li>
+                    </ul>
+                  </div>
+                </>
+              )}
             </div>
-            <p className="text-xs text-red-700 mt-2">100% of KASPA goes to the researcher's wallet.</p>
-        </section>
-
-        <section className="mb-4 p-4 border border-amber-300 rounded-2xl bg-amber-50">
-            <h3 className="font-bold text-amber-900">Tutoring, Auditing, & Consulting Services</h3>
-            <p className="text-sm text-amber-700">Full publication is publicly available. Tutoring is a business option paid in KASPA.</p>
-            <h4 className="font-bold text-amber-900 mt-3 flex items-center gap-2"><Clock size={16}/> Tutoring/Classes/Consulting</h4> 
-            <p className="text-xs text-amber-700 mb-2">Available for code auditing, accounting/company auditing, statistics, analytics, and private classes, counseling, and legal consulting (see disclaimer).</p> 
-            
-            <div className="p-2 bg-red-100 border border-red-200 rounded-lg text-[10px] text-red-800 mb-3 font-bold">
-               ⚠️ DISCLAIMER: "Legal Consulting" listed here refers to regulatory compliance guidance and research only. It does NOT constitute an attorney-client relationship or formal legal advice.
-            </div>
-
-            <label className="block mt-2 text-sm text-amber-800">Price per hour (KASPA)</label>
-            <input type="number" className="w-full p-2 border border-amber-300 rounded-xl bg-white" value={tutoringPrice} onChange={(e)=>setTutoringPrice(Number(e.target.value))} />
-
-            <label className="block mt-2 text-sm text-amber-800">Flat Rate Project Fee (KASPA)</label>
-            <input 
-                type="number" 
-                className="w-full p-2 border border-amber-300 rounded-xl bg-white" 
-                value={flatRatePrice} 
-                onChange={(e)=>setFlatRatePrice(Number(e.target.value))} 
-            />
-
-            <a href="https://zoom.us/join" target="_blank" rel="noopener noreferrer" className="mt-3 block">
-                <Button className="w-full bg-indigo-600">Link to Zoom / Class</Button>
-            </a>
-        </section>
+          )}
+        </div>
       </motion.div>
     </div>
   );

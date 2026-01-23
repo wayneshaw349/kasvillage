@@ -17,7 +17,7 @@ import Countdown from "react-countdown";
 // --- 1. UTILITIES & CONFIGURATION ---
 
 // ============================================================================
-// ERROR BOUNDARY - Production Crash Recovery
+// ERROR BOUNDARY - Production Crash Recovery-hopefully this works
 // ============================================================================
 class ErrorBoundary extends React.Component {
   constructor(props) {

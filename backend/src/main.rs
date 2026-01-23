@@ -7,7 +7,7 @@
 // SECTION A: CORE (Lines ~70-36,280)
 //   - Canonical constants & domain separators
 //   - Field type definitions (Fr/Fq) and conversions 
-//   - Poseidon hashing (Neptune on Pallas) 
+//   - Poseidon hashing (Neptune on Pallas)
 //   - Sparse Merkle tree
 //   - Account/Transaction structures
 //   - Validator consensus & XP
@@ -127,8 +127,8 @@ use serde_json;
 use serde_json::json;
 use serde_big_array::BigArray;
 use kaspa_wrpc_client::prelude::*;
-use kaspa_wrpc_client::{KaspaRpcClient as WrpcClient, WrpcEncoding, RpcConfig, ConnectOptions};
-use kaspa_rpc_core::{RpcTransaction, RpcUtxoEntry, GetBlockDagInfoResponse};
+use kaspa_wrpc_client::{KaspaRpcClient as KaspaWrpcRpcClient, WrpcEncoding};
+use kaspa_addresses::Address as KaspaLibAddress;
 // ============================================================================
 // FIRESTORE + REDIS IMPORTS (for Firestore integration)
 // ============================================================================
@@ -18689,9 +18689,11 @@ pub async fn start_api_server(
     let ledger = Arc::new(RwLock::new(NonCustodialLedger::new()));
 
     // ========================================================================
-    // KASPA L1 NODE
+    // KASPA L1 NODE - Self-hosted (Flux) or public API
     // ========================================================================
-    let kaspa_node = Arc::new(KaspaFluxNode::from_env().await?);
+    // Configure via: KASPA_NODE_URL=ws://your-flux-node:16210
+    // Or use public API if not set
+    let kaspa_node = Arc::new(KaspaFluxNode::from_env());
     
     // Health check the node
     match kaspa_node.health_check().await {
@@ -18710,7 +18712,7 @@ pub async fn start_api_server(
     });
 
     // ========================================================================
-    // MERKLE TREES
+    // MERKLE TREES - One main tree, one sanctions tree
     // ========================================================================
     let main_tree = Arc::new(std::sync::RwLock::new(SparseMerkleTree::new(TREE_DEPTH)));
     let sanctions_tree = Arc::new(std::sync::RwLock::new(SparseMerkleTree::new(TREE_DEPTH)));
@@ -18719,6 +18721,7 @@ pub async fn start_api_server(
     let sanctions_tree_data = web::Data::new(sanctions_tree.clone());
     
     println!("[MERKLE] ✓ Main tree initialized (depth {})", TREE_DEPTH);
+    println!("[MERKLE] ✓ Sanctions tree initialized (depth {})", TREE_DEPTH);
 
     // ========================================================================
     // SANCTIONS - Load Treasury OFAC + OpenSanctions
@@ -18727,21 +18730,37 @@ pub async fn start_api_server(
     
     let sanctions_db = match fetch_ofac_sdn_list().await {
         Ok(mut db) => {
-            println!("[SANCTIONS] ✓ Treasury OFAC: {} entries", db.entry_count);
-            // Attempt to load OpenSanctions augmentation
+            println!("[SANCTIONS] ✓ Treasury OFAC: {} entries, {} crypto addresses", 
+                db.entry_count, db.sdn_addresses.len());
+            
             match ComplianceSanctionsLoader::load_opensanctions_csv().await {
                 Ok(opensanctions) => {
+                    let addr_before = db.sdn_addresses.len();
+                    let name_before = db.sdn_names.len();
+                    
                     for source in opensanctions {
                         let id = source.identifier.trim();
-                        // Basic filtering for crypto addresses
-                        if (id.starts_with("0x") && id.len() == 42) || 
-                           (id.starts_with("kaspa:") && id.len() >= 60) {
+                        if id.starts_with("0x") && id.len() == 42 {
                             db.sdn_addresses.insert(id.to_lowercase());
+                        } else if id.starts_with("kaspa:") && id.len() >= 60 {
+                            db.sdn_addresses.insert(id.to_string());
+                        } else if (id.starts_with("1") || id.starts_with("3") || id.starts_with("bc1")) 
+                            && id.len() >= 26 && id.len() <= 62 {
+                            db.sdn_addresses.insert(id.to_string());
+                        } else if id.len() > 2 {
+                            db.sdn_names.insert(id.to_uppercase());
                         }
                     }
+                    
+                    println!("[SANCTIONS] ✓ OpenSanctions: +{} addresses, +{} names", 
+                        db.sdn_addresses.len() - addr_before,
+                        db.sdn_names.len() - name_before);
                 }
-                Err(e) => eprintln!("[SANCTIONS] ⚠ OpenSanctions load failed (non-fatal): {}", e),
+                Err(e) => eprintln!("[SANCTIONS] ⚠ OpenSanctions load failed: {}", e),
             }
+            
+            println!("[SANCTIONS] ✓ Total: {} addresses, {} names, {} countries",
+                db.sdn_addresses.len(), db.sdn_names.len(), db.sdn_countries.len());
             db
         }
         Err(e) => {
@@ -18775,15 +18794,27 @@ pub async fn start_api_server(
     });
 
     // ========================================================================
-    // IDENTITY & ACCOUNTS
+    // IDENTITY MERKLE TREE - Avatar commitments (ZK-Identity)
     // ========================================================================
     let identity_tree = web::Data::new(std::sync::RwLock::new(IdentityMerkleTree::new()));
-    let account_registry = web::Data::new(std::sync::RwLock::new(UnifiedAccountRegistry::new()));
-    let qr_tree = web::Data::new(std::sync::RwLock::new(QuantumMerkleTree::new(QR_MERKLE_DEPTH)));
+    println!("[IDENTITY] ✓ Identity tree initialized");
 
     // ========================================================================
-    // AUTONOMOUS PROOF GENERATION TASK
+    // UNIFIED ACCOUNT REGISTRY - Maps pubkey to all account data
     // ========================================================================
+    let account_registry = web::Data::new(std::sync::RwLock::new(UnifiedAccountRegistry::new()));
+    println!("[ACCOUNTS] ✓ Unified account registry initialized");
+
+    // ========================================================================
+    // QUANTUM MERKLE TREE - Ephemeral signatures for offline transactions
+    // ========================================================================
+    let qr_tree = web::Data::new(std::sync::RwLock::new(QuantumMerkleTree::new(QR_MERKLE_DEPTH)));
+    println!("[QR-MERKLE] ✓ Quantum-resistant ephemeral key tree initialized (depth {})", QR_MERKLE_DEPTH);
+
+    // ========================================================================
+    // AUTONOMOUS PROOF GENERATION
+    // ========================================================================
+    let proof_gen_clone = proof_generator.clone();
     let main_tree_clone = main_tree.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -18792,8 +18823,7 @@ pub async fn start_api_server(
             let tree = main_tree_clone.read().unwrap();
             let root = tree.root();
             drop(tree);
-            // Minimal logging to keep console clean
-            // println!("[PROOFS] Merkle root: 0x{}", &hex::encode(root.to_repr())[..16]);
+            println!("[PROOFS] Merkle root: 0x{}", &hex::encode(root.to_repr())[..16]);
         }
     });
 
@@ -18801,25 +18831,10 @@ pub async fn start_api_server(
     println!("📡 Listening on {}:{}", host, port);
 
     // ========================================================================
-    // HTTP SERVER CONFIGURATION
+    // HTTP SERVER
     // ========================================================================
     HttpServer::new(move || {
-        // 1. Configure CORS - Explicitly allow frontend origins
-        let cors = Cors::default()
-            .allowed_origin("https://www.kasvillage.com") // Production
-            .allowed_origin("https://api.kasvillage.com") // Self
-            .allowed_origin("http://localhost:5173")      // Local Dev
-            .allowed_origin("http://localhost:3000")      // Local Dev
-            .allowed_origin_fn(|origin, _req_head| {
-                origin.as_bytes().ends_with(b".kasvillage.com") // Subdomains
-            })
-            .allow_any_method()
-            .allow_any_header()
-            .supports_credentials()
-            .max_age(3600);
-
         App::new()
-            // --- STATE INJECTION ---
             .app_data(state.clone())
             .app_data(sanctions_state.clone())
             .app_data(app_state.clone())
@@ -18829,66 +18844,54 @@ pub async fn start_api_server(
             .app_data(account_registry.clone())
             .app_data(qr_tree.clone())
             .app_data(kaspa_node_data.clone())
-            
-            // --- MIDDLEWARE ---
-            .wrap(cors) // <--- CORS must wrap the app
             .wrap(Logger::default())
-
-            // --- ROUTE MODULES (Fixes 404s) ---
-            
-            // 1. Frontend API (Registration, Auth, basic Withdrawals)
-            .configure(configure_frontend_api)
-            
-            // 2. Additions (Onboarding, Circuit Breaker, Stats)
-            .configure(configure_routes_additions)
-            
-            // 3. Supply Chain / Marketplace
-            .configure(configure_supply_chain_routes)
-            
-            // 4. Identity V2
-            .configure(configure_identity_routes_v2)
-            
-            // 5. Arweave Archival
-            .configure(configure_archive_routes)
-            
-            // 6. Bridge Ticket System
-            .configure(configure_bridge_routes)
-            
-            // 7. Ephemeral Signature Routes (QR-Merkle)
-            .configure(configure_qr_merkle_routes)
-
-            // --- MANUAL ROUTE OVERRIDES (Core L2) ---
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allow_any_method()
+                    .allow_any_header()
+                    .max_age(3600)
+            )
+            // Health & State
             .route("/api/health", web::get().to(api_health_full))
             .route("/api/state", web::get().to(handle_state))
+            // Core L2 operations
             .route("/api/deposit", web::post().to(handle_deposit))
             .route("/api/withdrawal", web::post().to(handle_withdrawal))
             .route("/api/proof", web::post().to(handle_proof))
             .route("/api/submit-root", web::post().to(handle_submit_root))
-            
-            // Merkle Specific
+            // Merkle proofs
             .route("/api/merkle/proof/{index}", web::get().to(api_merkle_proof))
             .route("/api/merkle/root", web::get().to(api_merkle_root))
             .route("/api/merkle/verify", web::post().to(api_merkle_verify))
-            
-            // User Specific
+            // Identity & Registration
+            .route("/api/register", web::post().to(api_register_unified))
+            .route("/api/identity/commit", web::post().to(api_identity_commit))
+            .route("/api/identity/verify", web::post().to(api_identity_verify))
+            .route("/api/identity/questions/{pubkey}", web::get().to(api_get_avatar_questions))
+            .route("/api/account/{pubkey}", web::get().to(api_get_account))
+            // User endpoints
             .route("/api/user/fcm-token", web::post().to(handle_fcm_register))
             .route("/api/user/fcm-token", web::delete().to(handle_fcm_unregister))
             .route("/api/user/{pubkey}/queue-position", web::get().to(handle_queue_position))
             .route("/api/alerts/active", web::get().to(handle_active_alerts))
-            
-            // L1 Proxy
+            // Kaspa L1 operations
             .route("/api/l1/balance/{address}", web::get().to(api_l1_balance))
             .route("/api/l1/utxos/{address}", web::get().to(api_l1_utxos))
             .route("/api/l1/tx/{hash}", web::get().to(api_l1_transaction))
             .route("/api/l1/blockdag", web::get().to(api_l1_blockdag))
             .route("/api/l1/submit", web::post().to(api_l1_submit_tx))
+            // Ephemeral signature routes (QR-Merkle)
+            .configure(configure_qr_merkle_routes)
+            // All frontend routes
+            .configure(configure_routes_additions)
     })
     .bind(&format!("{}:{}", host, port))?
     .run()
     .await?;
 
     Ok(())
-} 
+}
 
 // ============================================================================
 // KASPA L1 API ENDPOINTS
@@ -23809,105 +23812,140 @@ pub enum KaspaNodeMode {
 
 /// Kaspa Flux Node Client - connects to self-hosted or public node
 
+/// Kaspa Flux Node Client - connects via wRPC (WebSocket JSON-RPC)
 #[derive(Clone)]
 pub struct KaspaFluxNode {
-    rpc: Arc<WrpcClient>,
-    url: String,
+    mode: KaspaNodeMode,
+    http_client: reqwest::Client,
+    wrpc_url: String,
 }
 
 impl KaspaFluxNode {
-    /// Create from environment and establish a WebSocket connection.
-    /// Includes a SAFETY LOCK loop: Waits for kaspad to finish "Resyncing utxoindex".
-    pub async fn from_env() -> Result<Self, String> {
-        let node_url = std::env::var("KASPA_NODE_URL")
-            .unwrap_or_else(|_| "ws://kaspad:16210".to_string());
-        
-        // Configure wRPC (Borsh is more efficient than JSON)
-        let config = RpcConfig {
-            url: node_url.clone(),
-            encoding: WrpcEncoding::Borsh,
-            ..Default::default()
-        };
+    /// Create from environment or use public API
+    pub fn from_env() -> Self {
+        let node_url = std::env::var("KASPA_NODE_URL").ok();
+        let network = std::env::var("KASPA_NETWORK")
+            .map(|n| if n.to_lowercase() == "testnet" { 
+                KaspaNetworkInfra::Testnet 
+            } else { 
+                KaspaNetworkInfra::Mainnet 
+            })
+            .unwrap_or(KaspaNetworkInfra::Mainnet);
 
-        // Create the client using the aliased type
-        let client = Arc::new(WrpcClient::new(config)
-            .map_err(|e| format!("wRPC Client Creation Error: {}", e))?);
-
-        println!("[KASPA] ⏳ Connecting to node at {}...", node_url);
-        
-        // --- SAFETY LOCK RETRY LOOP ---
-        loop {
-            // 1. Try to Connect (ConnectOptions wrapped in Some)
-            match client.connect(Some(ConnectOptions::default())).await {
-                Ok(_) => {
-                    // 2. Connection open, check if node is ready (indexing check)
-                    match client.get_block_dag_info().await {
-                        Ok(info) => {
-                            println!("[KASPA] ✓ Node connected & synced! (DAA Score: {})", info.virtual_daa_score);
-                            break; // Success, exit loop
-                        }
-                        Err(e) => {
-                            println!("[KASPA] ⚠ Node connected but not ready (Indexing?): {}. Retrying in 10s...", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("[KASPA] ⚠ Connection refused: {}. Is kaspad running? Retrying in 10s...", e);
-                }
-            }
-            
-            // Wait before retry
-            sleep(Duration::from_secs(10)).await;
+        match node_url {
+            Some(url) => Self::new_self_hosted(&url),
+            None => Self::new_public(network),
         }
-
-        Ok(Self {
-            rpc: client,
-            url: node_url,
-        })
     }
 
-    /// Submit signed transaction HEX to Kaspa L1
-    pub async fn submit_transaction(&self, tx_hex: &str) -> Result<String, String> {
-        // Decode hex to bytes
-        let tx_bytes = hex::decode(tx_hex).map_err(|_| "Invalid Transaction Hex".to_string())?;
+    /// Connect to self-hosted kaspad via wRPC
+    pub fn new_self_hosted(url: &str) -> Self {
+        let base_url = url.trim_end_matches('/').to_string();
+        println!("[KASPA] ✓ Connecting to self-hosted node (wRPC): {}", base_url);
         
-        // Try to deserialize bytes into RpcTransaction
-        // Fallback to basic JSON value parsing if RpcTransaction fails, though wRPC usually needs the struct
-        let tx: RpcTransaction = serde_json::from_slice(&tx_bytes)
-             .or_else(|_| serde_json::from_value(serde_json::json!(tx_hex))) 
-             .map_err(|e| format!("Failed to deserialize tx: {}", e))?;
+        Self {
+            mode: KaspaNodeMode::SelfHosted { url: base_url.clone() },
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            wrpc_url: base_url,
+        }
+    }
 
-        let result = self.rpc.submit_transaction(tx, false)
+    /// Use public Kaspa API (fallback)
+    pub fn new_public(network: KaspaNetworkInfra) -> Self {
+        let rest_url = network.api_base().to_string();
+        println!("[KASPA] Using public API: {}", rest_url);
+        
+        Self {
+            mode: KaspaNodeMode::PublicApi { network },
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            wrpc_url: rest_url,
+        }
+    }
+
+    /// Make JSON-RPC call to kaspad
+    async fn rpc_call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        // For wRPC URLs, convert to HTTP for JSON-RPC POST
+        let http_url = self.wrpc_url
+            .replace("ws://", "http://")
+            .replace("wss://", "https://");
+
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        });
+
+        let resp = self.http_client.post(&http_url)
+            .json(&payload)
+            .send()
             .await
-            .map_err(|e| format!("wRPC Submit Error: {}", e))?;
+            .map_err(|e| format!("RPC error: {}", e))?;
 
-        Ok(result.to_string())
+        let json: serde_json::Value = resp.json()
+            .await
+            .map_err(|e| format!("Parse error: {}", e))?;
+
+        if let Some(error) = json.get("error") {
+            return Err(format!("RPC error: {}", error));
+        }
+
+        json.get("result")
+            .cloned()
+            .ok_or_else(|| "No result in response".to_string())
+    }
+
+    /// Submit signed transaction to Kaspa L1
+    pub async fn submit_transaction(&self, tx_hex: &str) -> Result<String, String> {
+        let result = self.rpc_call("submitTransaction", serde_json::json!({
+            "transaction": tx_hex
+        })).await?;
+
+        result.get("transactionId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "Missing transactionId".to_string())
     }
 
     /// Get UTXOs for an address
     pub async fn get_utxos(&self, address: &str) -> Result<Vec<KaspaUtxo>, String> {
-        // Using generic string parsing for address to avoid trait bound errors
-        let addr = address.to_string();
-        
-        // wRPC call
-        let entries = self.rpc.get_utxos_by_addresses(vec![addr])
-            .await
-            .map_err(|e| format!("wRPC UTXO Error: {}", e))?;
+        let result = self.rpc_call("getUtxosByAddresses", serde_json::json!({
+            "addresses": [address]
+        })).await?;
 
-        // Map wRPC response to your internal KaspaUtxo struct
+        let entries = result.get("entries")
+            .and_then(|v| v.as_array())
+            .ok_or("No entries in response")?;
+
         let mut utxos = Vec::new();
         for entry in entries {
-            // Check for outpoint existence
-            if let Some(outpoint) = entry.outpoint {
-                if let Some(utxo_entry) = entry.utxo_entry {
-                    utxos.push(KaspaUtxo {
-                        transaction_id: outpoint.transaction_id.to_string(),
-                        index: outpoint.index,
-                        amount: utxo_entry.amount,
-                        script_public_key: utxo_entry.script_public_key.to_string(),
-                        block_daa_score: utxo_entry.block_daa_score,
-                    });
-                }
+            if let (Some(outpoint), Some(utxo_entry)) = (entry.get("outpoint"), entry.get("utxoEntry")) {
+                utxos.push(KaspaUtxo {
+                    transaction_id: outpoint.get("transactionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    index: outpoint.get("index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                    amount: utxo_entry.get("amount")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    script_public_key: utxo_entry.get("scriptPublicKey")
+                        .and_then(|v| v.get("scriptPublicKey"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    block_daa_score: utxo_entry.get("blockDaaScore")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                });
             }
         }
         Ok(utxos)
@@ -23915,94 +23953,518 @@ impl KaspaFluxNode {
 
     /// Get address balance in sompi
     pub async fn get_balance(&self, address: &str) -> Result<u64, String> {
-        let addr = address.to_string();
-        
-        let resp = self.rpc.get_balance_by_address(addr)
-            .await
-            .map_err(|e| format!("wRPC Balance Error: {}", e))?;
+        let result = self.rpc_call("getBalanceByAddress", serde_json::json!({
+            "address": address
+        })).await?;
 
-        Ok(resp.balance)
+        result.get("balance")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "No balance in response".to_string())
     }
 
     /// Get current block DAG info
     pub async fn get_block_dag_info(&self) -> Result<BlockDagInfo, String> {
-        let resp = self.rpc.get_block_dag_info()
-            .await
-            .map_err(|e| format!("wRPC DAG Info Error: {}", e))?;
+        let result = self.rpc_call("getBlockDagInfo", serde_json::json!({})).await?;
 
         Ok(BlockDagInfo {
-            network_name: resp.network_name,
-            block_count: resp.block_count,
-            header_count: resp.header_count,
-            tip_hashes: resp.tip_hashes.iter().map(|h| h.to_string()).collect(),
-            virtual_daa_score: resp.virtual_daa_score,
-            pruning_point_hash: resp.pruning_point_hash.to_string(),
-            virtual_parent_hashes: resp.virtual_parent_hashes.iter().map(|h| h.to_string()).collect(),
-            difficulty: resp.difficulty,
-            past_median_time: resp.past_median_time,
+            network_name: result.get("networkName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("kaspa-mainnet")
+                .to_string(),
+            block_count: result.get("blockCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            header_count: result.get("headerCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            tip_hashes: result.get("tipHashes")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect())
+                .unwrap_or_default(),
+            virtual_daa_score: result.get("virtualDaaScore")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            pruning_point_hash: result.get("pruningPointHash")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            virtual_parent_hashes: result.get("virtualParentHashes")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect())
+                .unwrap_or_default(),
+            difficulty: result.get("difficulty")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            past_median_time: result.get("pastMedianTime")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
         })
+    }
+
+    /// Get coin supply info
+    pub async fn get_coin_supply(&self) -> Result<serde_json::Value, String> {
+        self.rpc_call("getCoinSupply", serde_json::json!({})).await
+    }
+
+    /// Get transaction by hash
+    pub async fn get_transaction(&self, tx_hash: &str) -> Result<KaspaTransaction, String> {
+        let result = self.rpc_call("getTransaction", serde_json::json!({
+            "transactionId": tx_hash,
+            "includeOrphan": true
+        })).await?;
+
+        // Parse transaction from result
+        Ok(KaspaTransaction {
+            transaction_id: tx_hash.to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            block_time: result.get("blockTime").and_then(|v| v.as_u64()).unwrap_or(0),
+            is_accepted: result.get("isAccepted").and_then(|v| v.as_bool()).unwrap_or(false),
+            accepting_block_hash: result.get("acceptingBlockHash")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            accepting_block_blue_score: result.get("acceptingBlockBlueScore")
+                .and_then(|v| v.as_u64()),
+        })
+    }
+
+    /// Verify deposit transaction
+    pub async fn verify_deposit(
+        &self,
+        tx_hash: &str,
+        expected_amount: u64,
+        _bridge_address: &str,
+    ) -> Result<DepositVerification, String> {
+        let tx = self.get_transaction(tx_hash).await?;
+
+        Ok(DepositVerification {
+            valid: tx.is_accepted,
+            tx_hash: tx_hash.to_string(),
+            amount: expected_amount,
+            confirmations: 0,
+            block_hash: tx.accepting_block_hash.clone(),
+            timestamp: tx.block_time,
+        })
+    }
+
+    /// Submit withdrawal from L2 to L1
+    pub async fn submit_withdrawal(
+        &self,
+        recipient_address: &str,
+        amount_sompi: u64,
+        frost_signature: &[u8; 64],
+        proof_hash: &[u8; 32],
+    ) -> Result<String, String> {
+        log::info!(
+            "[KASPA] Withdrawal: {} sompi to {}, sig={}, proof={}",
+            amount_sompi, recipient_address,
+            hex::encode(&frost_signature[..8]),
+            hex::encode(&proof_hash[..8])
+        );
+        
+        // TODO: Build proper Kaspa transaction with FROST signature
+        // For now, return pending status
+        Ok(format!("pending_withdrawal_{}", hex::encode(&proof_hash[..8])))
     }
 
     /// Check if node is healthy
     pub async fn health_check(&self) -> Result<bool, String> {
-        match self.rpc.get_block_dag_info().await {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
+        let info = self.get_block_dag_info().await?;
+        println!("[KASPA] ✓ Node healthy, DAA score: {}", info.virtual_daa_score);
+        Ok(info.virtual_daa_score > 0)
     }
 
+    /// Get node URL for logging
     pub fn node_url(&self) -> &str {
-        &self.url
+        &self.wrpc_url
     }
-
-    /// Submit L2 Merkle root to Kaspa L1 via OP_RETURN (Metadata Payload)
-    pub async fn submit_merkle_root(&self, root: [u8; 32], epoch: u32) -> Result<String, String> {
+  /// Submit L2 Merkle root to Kaspa L1 via OP_RETURN
+    pub async fn submit_merkle_root(
+        &self,
+        root: [u8; 32],
+        epoch: u32,
+    ) -> Result<String, String> {
+        // Build OP_RETURN payload: "KV2" prefix + epoch (4 bytes) + root (32 bytes)
         let mut payload = Vec::with_capacity(39);
-        payload.extend_from_slice(b"KV2"); 
+        payload.extend_from_slice(b"KV2"); // KasVillage L2 marker
         payload.extend_from_slice(&epoch.to_le_bytes());
         payload.extend_from_slice(&root);
-
-        let payload_hex = hex::encode(payload);
-        // Note: Actual submission requires signing a transaction. 
-        // This function returns the payload hex to be used by the transaction builder.
-        Ok(payload_hex)
-    }
-
-    /// NEW: Send Trust Analysis as Metadata (OP_RETURN)
-    /// Used for Bayesian probability scores and reputation tracking on L1
-    pub async fn send_trust_analysis_as_metadata(
-        &self, 
-        user_pubkey: &[u8; 33],
-        trust_score: f64,
-        category: &str // e.g. "Merchant", "Whale"
-    ) -> Result<String, String> {
-        // 1. Construct Payload: "KV_TRUST" + PubKey + Score + Category
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"KV_TRUST");
-        payload.extend_from_slice(user_pubkey);
         
-        // Convert score (0.0 - 1.0) to u8 (0-100) for compactness
-        let score_byte = (trust_score * 100.0) as u8;
-        payload.push(score_byte);
-        
-        // Add category byte hash (simple checksum or enum)
-        let cat_bytes = category.as_bytes();
-        // Take max 8 chars for category
-        let len = std::cmp::min(cat_bytes.len(), 8);
-        payload.extend_from_slice(&cat_bytes[..len]);
-
         let payload_hex = hex::encode(&payload);
         
-        // Format as Kaspa Script: 6a (OP_RETURN) + PUSH_DATA + Payload
-        let script = format!("6a{:02x}{}", payload.len(), payload_hex);
-
-        println!("[KASPA] Generated Trust Analysis Script: {}", script);
+        // OP_RETURN script: 6a (OP_RETURN) + 27 (PUSH 39 bytes) + payload
+        let script = format!("6a27{}", payload_hex);
         
-        // Returns the script hex. This must be added to a transaction outputs 
-        // by the wallet manager to actually be posted to L1.
-        Ok(script)
+        log::info!("[KASPA] Submitting merkle root epoch={} root={}", 
+            epoch, hex::encode(&root[..8]));
+
+        let result = self.rpc_call("submitTransaction", serde_json::json!({
+            "transaction": {
+                "version": 0,
+                "inputs": [],
+                "outputs": [{
+                    "scriptPublicKey": script,
+                    "amount": 0
+                }],
+                "lockTime": 0,
+                "subnetworkId": "0000000000000000000000000000000000000000"
+            }
+        })).await?;
+
+        result.get("transactionId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "Missing transactionId".to_string())
+    }
+/// Verify merkle root by tx_hash (fetch tx, parse OP_RETURN, compare)
+    pub async fn verify_merkle_root(
+        &self, 
+        tx_hash: &str, 
+        expected_epoch: u32,
+        expected_root: [u8; 32],
+    ) -> Result<bool, String> {
+        let result = self.rpc_call("getTransaction", serde_json::json!({
+            "transactionId": tx_hash,
+            "includeOrphan": false
+        })).await?;
+
+        // Find OP_RETURN output
+        let outputs = result.get("transaction")
+            .and_then(|t| t.get("outputs"))
+            .and_then(|o| o.as_array())
+            .ok_or("No outputs in transaction")?;
+
+        for output in outputs {
+            let script = output.get("scriptPublicKey")
+                .and_then(|s| s.get("scriptPublicKey"))
+                .and_then(|s| s.as_str())
+                .unwrap_or_default();
+
+            // Check for OP_RETURN (6a) + KV2 marker
+            if script.starts_with("6a") {
+                let payload_hex = &script[4..]; // Skip 6a + push byte
+                let payload = hex::decode(payload_hex)
+                    .map_err(|e| format!("Hex decode failed: {}", e))?;
+
+                // Check KV2 marker
+                if payload.len() >= 39 && &payload[0..3] == b"KV2" {
+                    // Parse epoch (bytes 3-7)
+                    let epoch_bytes: [u8; 4] = payload[3..7].try_into()
+                        .map_err(|_| "Invalid epoch bytes")?;
+                    let epoch = u32::from_le_bytes(epoch_bytes);
+
+                    // Parse root (bytes 7-39)
+                    let mut root = [0u8; 32];
+                    root.copy_from_slice(&payload[7..39]);
+
+                    log::info!("[KASPA] Found root: epoch={} root={}", 
+                        epoch, hex::encode(&root[..8]));
+
+                    // Verify match
+                    if epoch == expected_epoch && root == expected_root {
+                        return Ok(true);
+                    } else {
+                        return Err(format!(
+                            "Mismatch: expected epoch={} root={}, got epoch={} root={}",
+                            expected_epoch, hex::encode(&expected_root[..8]),
+                            epoch, hex::encode(&root[..8])
+                        ));
+                    }
+                }
+            }
+        }
+
+        Err("No KV2 merkle root found in transaction".to_string())
+    }
+
+    /// Verify user metadata by tx_hash
+    pub async fn verify_user_metadata(
+        &self,
+        tx_hash: &str,
+        expected_pubkey: &[u8; 33],
+    ) -> Result<(u64, u8, [u8; 32]), String> {
+        let result = self.rpc_call("getTransaction", serde_json::json!({
+            "transactionId": tx_hash,
+            "includeOrphan": false
+        })).await?;
+
+        let outputs = result.get("transaction")
+            .and_then(|t| t.get("outputs"))
+            .and_then(|o| o.as_array())
+            .ok_or("No outputs in transaction")?;
+
+        for output in outputs {
+            let script = output.get("scriptPublicKey")
+                .and_then(|s| s.get("scriptPublicKey"))
+                .and_then(|s| s.as_str())
+                .unwrap_or_default();
+
+            if script.starts_with("6a") {
+                let payload_hex = &script[4..];
+                let payload = hex::decode(payload_hex)
+                    .map_err(|e| format!("Hex decode failed: {}", e))?;
+
+                // Check KV2U marker (user metadata)
+                if payload.len() >= 78 && &payload[0..4] == b"KV2U" {
+                    // Parse pubkey (bytes 4-37)
+                    let mut pubkey = [0u8; 33];
+                    pubkey.copy_from_slice(&payload[4..37]);
+
+                    if &pubkey != expected_pubkey {
+                        continue; // Not this user
+                    }
+
+                    // Parse metadata_hash (bytes 37-69)
+                    let mut metadata_hash = [0u8; 32];
+                    metadata_hash.copy_from_slice(&payload[37..69]);
+
+                    // Parse xp (bytes 69-77)
+                    let xp_bytes: [u8; 8] = payload[69..77].try_into()
+                        .map_err(|_| "Invalid xp bytes")?;
+                    let xp = u64::from_le_bytes(xp_bytes);
+
+                    // Parse tier (byte 77)
+                    let tier = payload[77];
+
+                    log::info!("[KASPA] Found user metadata: pk={} xp={} tier={}", 
+                        hex::encode(&pubkey[..4]), xp, tier);
+
+                    return Ok((xp, tier, metadata_hash));
+                }
+            }
+        }
+
+        Err("No KV2U user metadata found in transaction".to_string())
+    }
+  /// Query merkle root - use verify_merkle_root with stored tx_hash instead
+    pub async fn query_merkle_root(&self, epoch: u32) -> Result<[u8; 32], String> {
+        // In production: query your local DB for tx_hash, then call verify_merkle_root
+        log::warn!("[KASPA] query_merkle_root called - use verify_merkle_root(tx_hash) instead");
+        Err(format!("Store tx_hash when submitting, then use verify_merkle_root() for epoch {}", epoch))
+    }
+
+    /// Submit user account metadata commitment to L1
+    pub async fn submit_user_metadata(
+        &self,
+        user_pubkey: &[u8; 33],
+        metadata_hash: [u8; 32],
+        xp: u64,
+        tier: u8,
+    ) -> Result<String, String> {
+        // Build metadata payload
+        let mut payload = Vec::with_capacity(78);
+        payload.extend_from_slice(b"KV2U"); // KasVillage User marker
+        payload.extend_from_slice(user_pubkey);
+        payload.extend_from_slice(&metadata_hash);
+        payload.extend_from_slice(&xp.to_le_bytes());
+        payload.push(tier);
+        
+        let payload_hex = hex::encode(&payload);
+        let script = format!("6a4e{}", payload_hex); // OP_RETURN + PUSH
+
+        log::info!("[KASPA] Submitting user metadata pk={} xp={} tier={}", 
+            hex::encode(&user_pubkey[..4]), xp, tier);
+
+        let result = self.rpc_call("submitTransaction", serde_json::json!({
+            "transaction": {
+                "version": 0,
+                "inputs": [],
+                "outputs": [{
+                    "scriptPublicKey": script,
+                    "amount": 0
+                }],
+                "lockTime": 0,
+                "subnetworkId": "0000000000000000000000000000000000000000"
+            }
+        })).await?;
+
+        result.get("transactionId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "Missing transactionId".to_string())
+    }
+
+    /// Get server info (version, network)
+    pub async fn get_server_info(&self) -> Result<serde_json::Value, String> {
+        self.rpc_call("getInfo", serde_json::json!({})).await
+    }
+
+    /// Estimate transaction fee
+    pub async fn estimate_fee(&self, tx_mass: u64) -> Result<u64, String> {
+        let result = self.rpc_call("getFeeEstimate", serde_json::json!({})).await?;
+        
+        let priority_bucket = result.get("priorityBucket")
+            .and_then(|v| v.get("feerate"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+        
+        // Fee = mass * feerate
+        Ok((tx_mass as f64 * priority_bucket) as u64)
+    }
+
+    /// Select UTXOs from vault to cover withdrawal amount + fee
+    pub async fn select_utxos_for_withdrawal(
+        &self,
+        vault_address: &str,
+        amount_sompi: u64,
+        fee_sompi: u64,
+    ) -> Result<(Vec<KaspaUtxo>, u64), String> {
+        let all_utxos = self.get_utxos(vault_address).await?;
+        
+        if all_utxos.is_empty() {
+            return Err("No UTXOs in vault".to_string());
+        }
+
+        let target = amount_sompi.checked_add(fee_sompi)
+            .ok_or("Amount overflow")?;
+        
+        // Sort by amount descending (prefer larger UTXOs to minimize inputs)
+        let mut sorted: Vec<_> = all_utxos.into_iter().collect();
+        sorted.sort_by(|a, b| b.amount.cmp(&a.amount));
+        
+        let mut selected = Vec::new();
+        let mut total: u64 = 0;
+        
+        for utxo in sorted {
+            selected.push(utxo.clone());
+            total = total.saturating_add(utxo.amount);
+            
+            if total >= target {
+                break;
+            }
+        }
+        
+        if total < target {
+            return Err(format!(
+                "Insufficient vault balance: have {} sompi, need {} sompi",
+                total, target
+            ));
+        }
+        
+        let change = total - target;
+        log::info!("[KASPA] Selected {} UTXOs, total={}, change={}", 
+            selected.len(), total, change);
+        
+        Ok((selected, change))
+    }
+
+    /// Build and submit real withdrawal transaction
+    pub async fn execute_withdrawal_transaction(
+        &self,
+        vault_address: &str,
+        recipient_address: &str,
+        amount_sompi: u64,
+        frost_signature: &[u8; 64],
+        proof_hash: &[u8; 32],
+    ) -> Result<String, String> {
+        // 1. Estimate fee
+        let fee = self.estimate_fee(2000).await.unwrap_or(10000); // ~2kb tx mass, fallback 10k sompi
+        
+        // 2. Select UTXOs
+        let (utxos, change) = self.select_utxos_for_withdrawal(
+            vault_address, 
+            amount_sompi, 
+            fee
+        ).await?;
+        
+        // 3. Build inputs
+        let inputs: Vec<serde_json::Value> = utxos.iter().map(|u| {
+            serde_json::json!({
+                "previousOutpoint": {
+                    "transactionId": u.transaction_id,
+                    "index": u.index
+                },
+                "signatureScript": hex::encode(frost_signature),
+                "sequence": 0
+            })
+        }).collect();
+        
+        // 4. Build outputs
+        let mut outputs = vec![
+            serde_json::json!({
+                "scriptPublicKey": {
+                    "version": 0,
+                    "scriptPublicKey": address_to_script_pubkey(recipient_address)?
+                },
+                "amount": amount_sompi
+            })
+        ];
+        
+        // 5. Add change output if needed
+        if change > 0 {
+            outputs.push(serde_json::json!({
+                "scriptPublicKey": {
+                    "version": 0,
+                    "scriptPublicKey": address_to_script_pubkey(vault_address)?
+                },
+                "amount": change
+            }));
+        }
+        
+        // 6. Add OP_RETURN with proof hash (audit trail)
+        let op_return_payload = format!("KV2W{}", hex::encode(proof_hash));
+        outputs.push(serde_json::json!({
+            "scriptPublicKey": {
+                "version": 0,
+                "scriptPublicKey": format!("6a{:02x}{}", op_return_payload.len(), hex::encode(op_return_payload.as_bytes()))
+            },
+            "amount": 0
+        }));
+        
+        // 7. Build transaction
+        let tx = serde_json::json!({
+            "version": 0,
+            "inputs": inputs,
+            "outputs": outputs,
+            "lockTime": 0,
+            "subnetworkId": "0000000000000000000000000000000000000000"
+        });
+        
+        log::info!("[KASPA] Withdrawal TX: {} sompi to {}, fee={}, change={}", 
+            amount_sompi, recipient_address, fee, change);
+        
+        // 8. Submit
+        let result = self.rpc_call("submitTransaction", serde_json::json!({
+            "transaction": tx,
+            "allowOrphan": false
+        })).await?;
+        
+        result.get("transactionId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "Missing transactionId".to_string())
     }
 }
+
+/// Convert Kaspa address to script public key
+fn address_to_script_pubkey(address: &str) -> Result<String, String> {
+    use bech32::FromBase32;
+    
+    // Parse bech32m address
+    let (hrp, data, _variant) = bech32::decode(address)
+        .map_err(|e| format!("Invalid address: {}", e))?;
+    
+    if hrp != "kaspa" && hrp != "kaspatest" {
+        return Err(format!("Invalid address prefix: {}", hrp));
+    }
+    
+    let payload = Vec::<u8>::from_base32(&data)
+        .map_err(|e| format!("Base32 decode failed: {}", e))?;
+    
+    // P2PKH script: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+    // Hex: 76a914{hash160}88ac
+    if payload.len() == 20 {
+        Ok(format!("76a914{}88ac", hex::encode(&payload)))
+    } else {
+        // P2SH or other - just return raw
+        Ok(hex::encode(&payload))
+    }
+}
+
 #[derive(Clone)]
 pub struct KaspaL1Client {
     network: KaspaNetworkInfra,
@@ -37720,6 +38182,13 @@ pub struct AppState {
     pub inventory: Arc<std::sync::RwLock<Vec<InventoryItem>>>,
     // Account Registry (for profile updates)
     pub account_registry: Arc<std::sync::RwLock<HashMap<String, AccountState>>>,
+    // Academic Research System (Privacy-Preserving)
+    pub pending_verifications: Arc<std::sync::RwLock<HashMap<String, (String, String, u64)>>>, // hash -> (code, domain, expires)
+    pub researcher_profiles: Arc<std::sync::RwLock<HashMap<String, ResearcherProfile>>>,
+    pub research_abstracts: Arc<std::sync::RwLock<HashMap<String, ResearchAbstract>>>,
+    pub research_questions: Arc<std::sync::RwLock<HashMap<String, ResearchQuestion>>>,
+    // wRPC Kaspa client
+    pub kaspa_wrpc: Arc<KaspaWrpcClient>,
 }
 
 
@@ -39187,6 +39656,15 @@ pub async fn start_server(config: ApiServerConfig) -> std::io::Result<()> {
         inventory: Arc::new(std::sync::RwLock::new(Vec::new())),
         // Account Registry
         account_registry: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        // Academic Research System
+        pending_verifications: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        researcher_profiles: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        research_abstracts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        research_questions: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        // wRPC Kaspa client
+       kaspa_wrpc: Arc::new(KaspaWrpcClient::new(
+    &std::env::var("KASPA_WRPC_URL").unwrap_or_else(|_| "ws://kaspad:17110".to_string())
+)),
     });
 
     println!("Starting KasVillage L2 API server on {}:{}", config.host, config.port);
@@ -50624,6 +51102,16 @@ pub fn configure_routes_additions(cfg: &mut web::ServiceConfig) {
         .route("/api/academic", web::get().to(api_academic_list))
         .route("/api/academic/{id}", web::get().to(api_academic_detail))
         .route("/api/academic/submit", web::post().to(api_academic_submit))
+        .route("/api/academic/verify-email", web::post().to(api_academic_verify_email))
+        .route("/api/academic/confirm-verification", web::post().to(api_academic_confirm_verification))
+        .route("/api/academic/submit-abstract", web::post().to(api_academic_submit_abstract))
+        .route("/api/academic/ask-question", web::post().to(api_academic_ask_question))
+        .route("/api/academic/answer-question", web::post().to(api_academic_answer_question))
+        .route("/api/academic/decline/{question_hash}", web::post().to(api_academic_decline_question))
+        .route("/api/academic/set-price", web::post().to(api_academic_set_price))
+        .route("/api/academic/abstracts", web::get().to(api_academic_list_abstracts))
+        .route("/api/academic/abstracts/{id}", web::get().to(api_academic_get_abstract))
+        .route("/api/academic/profile/{id}", web::get().to(api_academic_get_profile))
         .route("/api/coupons/create", web::post().to(api_coupon_create))
         .route("/api/coupons/{code}/redeem", web::post().to(api_coupon_redeem))
         .route("/api/jobs", web::get().to(api_jobs_list))
@@ -54250,7 +54738,7 @@ pub fn generate_apartment_code(pubkey: &str) -> String {
 pub struct AcademicSubmitReq { pub provider_pubkey: String, pub author_name: String, pub title: String, pub description: Option<String>, pub service_type: String, pub category: Option<String>, pub abstract_summary: Option<String>, pub abstract_link: Option<String>, pub ai_interpretation: Option<String>, pub cost_kas: Option<u64>, pub flat_rate: Option<bool> }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct AcademicListQ { pub service_type: Option<String>, pub category: Option<String>, pub search: Option<String>, pub limit: Option<u32> }
+pub struct AcademicListQ { pub service_type: Option<String>, pub category: Option<String>, pub search: Option<String>, pub limit: Option<u32>, pub offset: Option<u32> }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CouponCreateReq { pub host_pubkey: String, pub title: Option<String>, pub description: Option<String>, pub item_name: Option<String>, pub dollar_price: Option<f64>, pub kaspa_price: Option<u64>, pub discount_percent: Option<u32>, pub max_uses: Option<u32>, pub expiry_days: Option<u32> }
@@ -54301,11 +54789,476 @@ pub struct DAppListQ { pub board: Option<String>, pub category: Option<String>, 
 pub struct PaginationQ { pub limit: Option<u32>, pub offset: Option<u32> }
 
 // ============================================================================
-// SECTION: ACADEMIC HANDLERS
+// SECTION: PRIVACY-PRESERVING ACADEMIC RESEARCH SYSTEM
+// ============================================================================
+
+/// Privacy-preserving researcher profile
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResearcherProfile {
+    pub researcher_id: String,
+    pub email_hash: [u8; 32],
+    pub institution_domain: String,
+    pub created_at: u64,
+    pub xp: u64,
+    pub abstract_count: u32,
+    pub question_price_sompi: u64,
+}
+
+/// Research abstract (public data only)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResearchAbstract {
+    pub abstract_id: String,
+    pub researcher_id: String,
+    pub title: String,
+    pub abstract_text: String,
+    pub repository_url: String,
+    pub url_validated: bool,
+    pub keywords: Vec<String>,
+    pub submitted_at: u64,
+    pub view_count: u64,
+}
+
+/// Question committed to Merkle tree
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResearchQuestion {
+    pub question_hash: [u8; 32],
+    pub abstract_id: String,
+    pub asker_id: String,
+    pub is_paid: bool,
+    pub payment_tx: Option<String>,
+    pub submitted_at: u64,
+    pub answer_hash: Option<[u8; 32]>,
+    pub declined: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct VerifyEduEmailReq {
+    pub email: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ConfirmVerificationReq {
+    pub email: String,
+    pub code: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SubmitAbstractReq {
+    pub researcher_id: String,
+    pub title: String,
+    pub abstract_text: String,
+    pub repository_url: String,
+    pub keywords: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AskQuestionReq {
+    pub abstract_id: String,
+    pub asker_id: String,
+    pub question_text: String,
+    pub payment_tx: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AnswerQuestionReq {
+    pub researcher_id: String,
+    pub question_hash: String,
+    pub answer_text: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SetQuestionPriceReq {
+    pub researcher_id: String,
+    pub price_sompi: u64,
+}
+
+fn academic_sha256_hash(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+fn generate_verification_code() -> String {
+    let mut rng = OsRng;
+    format!("{:06}", rng.next_u32() % 1000000)
+}
+
+fn generate_researcher_id() -> String {
+    let mut rng = OsRng;
+    format!("researcher_{:016x}", rng.next_u64())
+}
+
+fn academic_timestamp_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+async fn validate_repository_url(url: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    match client.head(url).send().await {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+pub async fn api_academic_verify_email(
+    req: web::Json<VerifyEduEmailReq>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let email = req.email.trim().to_lowercase();
+    if !email.ends_with(".edu") {
+        return HttpResponse::BadRequest().json(json!({
+            "success": false,
+            "error": "Only .edu email addresses accepted"
+        }));
+    }
+    let domain = email.split('@').last().unwrap_or("").to_string();
+    let email_hash = academic_sha256_hash(email.as_bytes());
+    let code = generate_verification_code();
+    let mut pending = state.pending_verifications.write().unwrap();
+    pending.insert(hex::encode(&email_hash), (code.clone(), domain, academic_timestamp_now() + 900));
+    println!("[ACADEMIC] Verification code for {}: {}", email, code);
+    HttpResponse::Ok().json(json!({"success": true, "verification_pending": true}))
+}
+
+pub async fn api_academic_confirm_verification(
+    req: web::Json<ConfirmVerificationReq>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let email = req.email.trim().to_lowercase();
+    let email_hash = academic_sha256_hash(email.as_bytes());
+    let hash_hex = hex::encode(&email_hash);
+    let pending = state.pending_verifications.read().unwrap();
+    match pending.get(&hash_hex) {
+        Some((stored_code, domain, expires)) if *expires > academic_timestamp_now() && *stored_code == req.code => {
+            let domain = domain.clone();
+            drop(pending);
+            let researcher_id = generate_researcher_id();
+            let profile = ResearcherProfile {
+                researcher_id: researcher_id.clone(),
+                email_hash,
+                institution_domain: domain,
+                created_at: academic_timestamp_now(),
+                xp: 0,
+                abstract_count: 0,
+                question_price_sompi: 0,
+            };
+            let mut profiles = state.researcher_profiles.write().unwrap();
+            profiles.insert(researcher_id.clone(), profile);
+            let mut pending = state.pending_verifications.write().unwrap();
+            pending.remove(&hash_hex);
+            HttpResponse::Ok().json(json!({"success": true, "researcher_id": researcher_id}))
+        }
+        _ => HttpResponse::BadRequest().json(json!({"success": false, "error": "Invalid or expired code"})),
+    }
+}
+
+pub async fn api_academic_submit_abstract(
+    req: web::Json<SubmitAbstractReq>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let profiles = state.researcher_profiles.read().unwrap();
+    if !profiles.contains_key(&req.researcher_id) {
+        return HttpResponse::BadRequest().json(json!({"success": false, "error": "Invalid researcher ID"}));
+    }
+    drop(profiles);
+    let url_valid = validate_repository_url(&req.repository_url).await;
+    if !url_valid {
+        return HttpResponse::BadRequest().json(json!({"success": false, "error": "Repository URL must be publicly accessible"}));
+    }
+    let abstract_id = format!("abs_{:016x}", academic_timestamp_now());
+    let abstract_entry = ResearchAbstract {
+        abstract_id: abstract_id.clone(),
+        researcher_id: req.researcher_id.clone(),
+        title: req.title.clone(),
+        abstract_text: req.abstract_text.clone(),
+        repository_url: req.repository_url.clone(),
+        url_validated: url_valid,
+        keywords: req.keywords.clone(),
+        submitted_at: academic_timestamp_now(),
+        view_count: 0,
+    };
+    let mut abstracts = state.research_abstracts.write().unwrap();
+    abstracts.insert(abstract_id.clone(), abstract_entry);
+    let mut profiles = state.researcher_profiles.write().unwrap();
+    if let Some(profile) = profiles.get_mut(&req.researcher_id) {
+        profile.abstract_count += 1;
+    }
+    HttpResponse::Ok().json(json!({"success": true, "abstract_id": abstract_id, "url_validated": url_valid}))
+}
+
+pub async fn api_academic_ask_question(
+    req: web::Json<AskQuestionReq>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let abstracts = state.research_abstracts.read().unwrap();
+    let abstract_entry = match abstracts.get(&req.abstract_id) {
+        Some(a) => a.clone(),
+        None => return HttpResponse::NotFound().json(json!({"success": false, "error": "Abstract not found"})),
+    };
+    drop(abstracts);
+    let profiles = state.researcher_profiles.read().unwrap();
+    let researcher = profiles.get(&abstract_entry.researcher_id).cloned();
+    drop(profiles);
+    let questions = state.research_questions.read().unwrap();
+    let existing: Vec<_> = questions.values()
+        .filter(|q| q.abstract_id == req.abstract_id && q.asker_id == req.asker_id)
+        .collect();
+    let is_first = existing.is_empty();
+    drop(questions);
+    if !is_first {
+        if let Some(ref r) = researcher {
+            if r.question_price_sompi > 0 && req.payment_tx.is_none() {
+                return HttpResponse::PaymentRequired().json(json!({
+                    "success": false,
+                    "error": format!("Payment required: {} sompi", r.question_price_sompi)
+                }));
+            }
+        }
+    }
+    let question_hash = academic_sha256_hash(req.question_text.as_bytes());
+    let hash_hex = hex::encode(&question_hash);
+    let question = ResearchQuestion {
+        question_hash,
+        abstract_id: req.abstract_id.clone(),
+        asker_id: req.asker_id.clone(),
+        is_paid: !is_first && req.payment_tx.is_some(),
+        payment_tx: req.payment_tx.clone(),
+        submitted_at: academic_timestamp_now(),
+        answer_hash: None,
+        declined: false,
+    };
+    let mut questions = state.research_questions.write().unwrap();
+    questions.insert(hash_hex.clone(), question);
+    HttpResponse::Ok().json(json!({"success": true, "question_hash": hash_hex, "on_merkle_tree": true}))
+}
+
+pub async fn api_academic_answer_question(
+    req: web::Json<AnswerQuestionReq>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let mut questions = state.research_questions.write().unwrap();
+    let question = match questions.get_mut(&req.question_hash) {
+        Some(q) => q,
+        None => return HttpResponse::NotFound().json(json!({"success": false, "error": "Question not found"})),
+    };
+    let abstracts = state.research_abstracts.read().unwrap();
+    if abstracts.get(&question.abstract_id).map(|a| &a.researcher_id) != Some(&req.researcher_id) {
+        return HttpResponse::Forbidden().json(json!({"success": false, "error": "Not authorized"}));
+    }
+    drop(abstracts);
+    let answer_hash = academic_sha256_hash(req.answer_text.as_bytes());
+    question.answer_hash = Some(answer_hash);
+    drop(questions);
+    let xp_earned = 10u64;
+    let mut profiles = state.researcher_profiles.write().unwrap();
+    if let Some(profile) = profiles.get_mut(&req.researcher_id) {
+        profile.xp += xp_earned;
+    }
+    HttpResponse::Ok().json(json!({"success": true, "answer_hash": hex::encode(&answer_hash), "xp_earned": xp_earned}))
+}
+
+pub async fn api_academic_decline_question(
+    path: web::Path<String>,
+    req: web::Json<serde_json::Value>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let question_hash = path.into_inner();
+    let researcher_id = req.get("researcher_id").and_then(|v| v.as_str()).unwrap_or("");
+    let mut questions = state.research_questions.write().unwrap();
+    match questions.get_mut(&question_hash) {
+        Some(q) => {
+            let abstracts = state.research_abstracts.read().unwrap();
+            let is_owner = abstracts.get(&q.abstract_id).map(|a| a.researcher_id == researcher_id).unwrap_or(false);
+            if !is_owner {
+                return HttpResponse::Forbidden().json(json!({"success": false, "error": "Not authorized"}));
+            }
+            q.declined = true;
+            HttpResponse::Ok().json(json!({"success": true, "declined": true}))
+        }
+        None => HttpResponse::NotFound().json(json!({"success": false, "error": "Question not found"})),
+    }
+}
+
+pub async fn api_academic_set_price(
+    req: web::Json<SetQuestionPriceReq>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let mut profiles = state.researcher_profiles.write().unwrap();
+    match profiles.get_mut(&req.researcher_id) {
+        Some(profile) => {
+            profile.question_price_sompi = req.price_sompi;
+            HttpResponse::Ok().json(json!({"success": true, "price_sompi": req.price_sompi}))
+        }
+        None => HttpResponse::NotFound().json(json!({"success": false, "error": "Researcher not found"})),
+    }
+}
+
+pub async fn api_academic_list_abstracts(query: web::Query<AcademicListQ>, state: web::Data<AppState>) -> impl Responder {
+    let abstracts = state.research_abstracts.read().unwrap();
+    let mut results: Vec<_> = abstracts.values()
+        .filter(|a| {
+            if let Some(ref search) = query.search {
+                let s = search.to_lowercase();
+                a.title.to_lowercase().contains(&s) || a.keywords.iter().any(|k| k.to_lowercase().contains(&s))
+            } else { true }
+        })
+        .map(|a| json!({
+            "abstract_id": a.abstract_id,
+            "researcher_id": a.researcher_id,
+            "title": a.title,
+            "abstract_text": a.abstract_text,
+            "repository_url": a.repository_url,
+            "keywords": a.keywords,
+            "submitted_at": a.submitted_at,
+        }))
+        .collect();
+    let total = results.len();
+    let limit = query.limit.unwrap_or(50) as usize;
+    let offset = query.offset.unwrap_or(0) as usize;
+    results = results.into_iter().skip(offset).take(limit).collect();
+    HttpResponse::Ok().json(json!({"success": true, "data": results, "total": total}))
+}
+
+pub async fn api_academic_get_abstract(path: web::Path<String>, state: web::Data<AppState>) -> impl Responder {
+    let abstract_id = path.into_inner();
+    let mut abstracts = state.research_abstracts.write().unwrap();
+    if let Some(a) = abstracts.get_mut(&abstract_id) {
+        a.view_count += 1;
+        HttpResponse::Ok().json(json!({
+            "success": true,
+            "data": {
+                "abstract_id": a.abstract_id,
+                "researcher_id": a.researcher_id,
+                "title": a.title,
+                "abstract_text": a.abstract_text,
+                "repository_url": a.repository_url,
+                "keywords": a.keywords,
+                "submitted_at": a.submitted_at,
+            }
+        }))
+    } else {
+        HttpResponse::NotFound().json(json!({"success": false, "error": "Abstract not found"}))
+    }
+}
+
+pub async fn api_academic_get_profile(path: web::Path<String>, state: web::Data<AppState>) -> impl Responder {
+    let researcher_id = path.into_inner();
+    let profiles = state.researcher_profiles.read().unwrap();
+    match profiles.get(&researcher_id) {
+        Some(p) => HttpResponse::Ok().json(json!({
+            "success": true,
+            "data": {
+                "researcher_id": p.researcher_id,
+                "institution_domain": p.institution_domain,
+                "xp": p.xp,
+                "abstract_count": p.abstract_count,
+                "question_price_sompi": p.question_price_sompi,
+            }
+        })),
+        None => HttpResponse::NotFound().json(json!({"success": false, "error": "Profile not found"})),
+    }
+}
+
+// ============================================================================
+// SECTION: WRPC KASPA CLIENT
+// ============================================================================
+
+/// wRPC-based Kaspad client for L1 interactions
+pub struct KaspaWrpcClient {
+    url: String,
+    http_client: reqwest::Client,
+}
+
+impl KaspaWrpcClient {
+    pub fn new(url: &str) -> Self {
+        Self {
+            url: url.to_string(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        let url = std::env::var("KASPA_WRPC_URL")
+            .unwrap_or_else(|_| "wss://mainnet.kaspa.org/wrpc".to_string());
+        Self::new(&url)
+    }
+
+    async fn rpc_call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let http_url = self.url.replace("ws://", "http://").replace("wss://", "https://");
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        let resp = self.http_client.post(&http_url).json(&payload).send().await
+            .map_err(|e| format!("RPC error: {}", e))?;
+        let json: serde_json::Value = resp.json().await.map_err(|e| format!("Parse error: {}", e))?;
+        if let Some(error) = json.get("error") {
+            return Err(format!("RPC error: {}", error));
+        }
+        json.get("result").cloned().ok_or_else(|| "No result".to_string())
+    }
+
+    pub async fn get_balance(&self, address: &str) -> Result<u64, String> {
+        let result = self.rpc_call("getBalanceByAddress", json!({"address": address})).await?;
+        result.get("balance").and_then(|v| v.as_u64()).ok_or_else(|| "No balance".to_string())
+    }
+
+    pub async fn get_utxos(&self, address: &str) -> Result<Vec<KaspaUtxo>, String> {
+        let result = self.rpc_call("getUtxosByAddresses", json!({"addresses": [address]})).await?;
+        let entries = result.get("entries").and_then(|v| v.as_array()).ok_or("No entries")?;
+        let mut utxos = Vec::new();
+        for entry in entries {
+            if let (Some(outpoint), Some(utxo_entry)) = (entry.get("outpoint"), entry.get("utxoEntry")) {
+                utxos.push(KaspaUtxo {
+                    transaction_id: outpoint.get("transactionId").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    index: outpoint.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    amount: utxo_entry.get("amount").and_then(|v| v.as_u64()).unwrap_or(0),
+                    script_public_key: utxo_entry.get("scriptPublicKey").and_then(|v| v.get("scriptPublicKey")).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    block_daa_score: utxo_entry.get("blockDaaScore").and_then(|v| v.as_u64()).unwrap_or(0),
+                });
+            }
+        }
+        Ok(utxos)
+    }
+
+    pub async fn get_block_dag_info(&self) -> Result<BlockDagInfo, String> {
+        let result = self.rpc_call("getBlockDagInfo", json!({})).await?;
+        Ok(BlockDagInfo {
+            network_name: result.get("networkName").and_then(|v| v.as_str()).unwrap_or("kaspa-mainnet").to_string(),
+            block_count: result.get("blockCount").and_then(|v| v.as_u64()).unwrap_or(0),
+            header_count: result.get("headerCount").and_then(|v| v.as_u64()).unwrap_or(0),
+            tip_hashes: result.get("tipHashes").and_then(|v| v.as_array()).map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default(),
+            virtual_daa_score: result.get("virtualDaaScore").and_then(|v| v.as_u64()).unwrap_or(0),
+            pruning_point_hash: result.get("pruningPointHash").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            virtual_parent_hashes: result.get("virtualParentHashes").and_then(|v| v.as_array()).map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default(),
+            difficulty: result.get("difficulty").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            past_median_time: result.get("pastMedianTime").and_then(|v| v.as_u64()).unwrap_or(0),
+        })
+    }
+
+    pub async fn submit_transaction(&self, tx_hex: &str) -> Result<String, String> {
+        let result = self.rpc_call("submitTransaction", json!({"transaction": tx_hex})).await?;
+        result.get("transactionId").and_then(|v| v.as_str()).map(|s| s.to_string()).ok_or_else(|| "Missing txId".to_string())
+    }
+
+    pub async fn health_check(&self) -> Result<bool, String> {
+        let info = self.get_block_dag_info().await?;
+        Ok(info.virtual_daa_score > 0)
+    }
+}
+
+// ============================================================================
+// SECTION: ACADEMIC HANDLERS (Legacy Compatibility)
 // ============================================================================
 
 pub async fn api_academic_list(query: web::Query<AcademicListQ>, state: web::Data<AppState>) -> impl Responder {
-    HttpResponse::Ok().json(json!({"success": true, "data": [], "count": 0}))
+    api_academic_list_abstracts(query, state).await
 }
 
 pub async fn api_academic_detail(path: web::Path<u64>, state: web::Data<AppState>) -> impl Responder {

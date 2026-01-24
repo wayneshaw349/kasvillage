@@ -14,10 +14,111 @@ import { clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 import Countdown from "react-countdown";
 
+// ============================================================================
+// CLIENT-SIDE ECIES DECRYPTION (secp256k1 + AES-256-GCM)
+// Uses Web Crypto API + noble-secp256k1 for ECDH
+// ============================================================================
+const academicCrypto = {
+  // Generate keypair for user/researcher
+  async generateKeypair() {
+    try {
+      const secp = await import('@noble/secp256k1');
+      const privateKey = secp.utils.randomPrivateKey();
+      const publicKey = secp.getPublicKey(privateKey, true); // compressed
+      return {
+        privateKey: Array.from(privateKey).map(b => b.toString(16).padStart(2,'0')).join(''),
+        publicKey: Array.from(publicKey).map(b => b.toString(16).padStart(2,'0')).join(''),
+      };
+    } catch (e) {
+      console.error('Crypto not available:', e);
+      return null;
+    }
+  },
+
+  // Simple HKDF using Web Crypto
+  async hkdfDerive(sharedSecret, info, length) {
+    const keyMaterial = await crypto.subtle.importKey('raw', sharedSecret, 'HKDF', false, ['deriveBits']);
+    const derived = await crypto.subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: new TextEncoder().encode(info) },
+      keyMaterial,
+      length * 8
+    );
+    return new Uint8Array(derived);
+  },
+
+  // Decrypt message using own private key
+  async decrypt(ciphertextHex, ephemeralPkHex, nonceHex, privateKeyHex) {
+    try {
+      const secp = await import('@noble/secp256k1');
+      
+      const privateKey = new Uint8Array(privateKeyHex.match(/.{2}/g).map(b => parseInt(b, 16)));
+      const ephemeralPk = new Uint8Array(ephemeralPkHex.match(/.{2}/g).map(b => parseInt(b, 16)));
+      const ciphertext = new Uint8Array(ciphertextHex.match(/.{2}/g).map(b => parseInt(b, 16)));
+      const nonce = new Uint8Array(nonceHex.match(/.{2}/g).map(b => parseInt(b, 16)));
+      
+      // ECDH shared secret
+      const sharedPoint = secp.getSharedSecret(privateKey, ephemeralPk);
+      
+      // Derive AES key using HKDF (skip first byte which is 0x04 for uncompressed)
+      const aesKey = await this.hkdfDerive(sharedPoint.slice(1), 'KASVILLAGE-ACADEMIC-v1', 32);
+      
+      // Decrypt with AES-GCM
+      const key = await crypto.subtle.importKey('raw', aesKey, { name: 'AES-GCM' }, false, ['decrypt']);
+      const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, key, ciphertext);
+      
+      return new TextDecoder().decode(plaintext);
+    } catch (e) {
+      console.error('Decryption failed:', e);
+      return null;
+    }
+  },
+
+  // Encrypt message for recipient
+  async encrypt(plaintext, recipientPkHex) {
+    try {
+      const secp = await import('@noble/secp256k1');
+      
+      const recipientPk = new Uint8Array(recipientPkHex.match(/.{2}/g).map(b => parseInt(b, 16)));
+      const ephemeralSk = secp.utils.randomPrivateKey();
+      const ephemeralPk = secp.getPublicKey(ephemeralSk, true);
+      
+      // ECDH shared secret
+      const sharedPoint = secp.getSharedSecret(ephemeralSk, recipientPk);
+      
+      // Derive AES key
+      const aesKey = await this.hkdfDerive(sharedPoint.slice(1), 'KASVILLAGE-ACADEMIC-v1', 32);
+      
+      // Encrypt with AES-GCM
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const key = await crypto.subtle.importKey('raw', aesKey, { name: 'AES-GCM' }, false, ['encrypt']);
+      const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, key, new TextEncoder().encode(plaintext));
+      
+      return {
+        ciphertext: Array.from(new Uint8Array(ciphertext)).map(b => b.toString(16).padStart(2,'0')).join(''),
+        ephemeralPk: Array.from(ephemeralPk).map(b => b.toString(16).padStart(2,'0')).join(''),
+        nonce: Array.from(nonce).map(b => b.toString(16).padStart(2,'0')).join(''),
+      };
+    } catch (e) {
+      console.error('Encryption failed:', e);
+      return null;
+    }
+  },
+
+  // Store/retrieve keypair from localStorage (demo - use secure storage in production)
+  getStoredKeypair(type) {
+    const stored = localStorage.getItem(`kv_${type}_keypair`);
+    return stored ? JSON.parse(stored) : null;
+  },
+  
+  storeKeypair(type, keypair) {
+    localStorage.setItem(`kv_${type}_keypair`, JSON.stringify(keypair));
+  }
+};
+
 // --- 1. UTILITIES & CONFIGURATION ---
 
 // ============================================================================
-// ERROR BOUNDARY - Production Crash Recovery-hopefully this works
+// ERROR BOUNDARY - Production Crash Recovery
 // ============================================================================
 class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -6239,6 +6340,10 @@ function AcademicResearchPreview({ onClose }) {
   const [studentAiInterpretation, setStudentAiInterpretation] = useState('');
   const [attestation1, setAttestation1] = useState(false);
   const [attestation2, setAttestation2] = useState(false);
+  const [pendingQuestions, setPendingQuestions] = useState([]);
+  const [myQuestionAnswers, setMyQuestionAnswers] = useState([]);
+  const [answerText, setAnswerText] = useState('');
+  const [selectedQuestion, setSelectedQuestion] = useState(null);
   const [viewerDisclaimerAccepted, setViewerDisclaimerAccepted] = useState(() => {
     return sessionStorage.getItem('kv_research_disclaimer_accepted') === 'true';
   });
@@ -6280,9 +6385,21 @@ function AcademicResearchPreview({ onClose }) {
     if (verificationCode.length !== 6) { setVerificationError('Enter 6-digit code'); return; }
     setIsLoading(true); setVerificationError('');
     try {
+      // Generate keypair for receiving encrypted questions
+      let keypair = academicCrypto.getStoredKeypair('researcher');
+      if (!keypair) {
+        keypair = await academicCrypto.generateKeypair();
+        if (!keypair) {
+          setVerificationError('Crypto not available - install @noble/secp256k1');
+          setIsLoading(false);
+          return;
+        }
+        academicCrypto.storeKeypair('researcher', keypair);
+      }
+      
       const res = await fetch(`${API_BASE}/api/academic/confirm-verification`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: eduEmail, code: verificationCode })
+        body: JSON.stringify({ email: eduEmail, code: verificationCode, pubkey: keypair.publicKey })
       });
       const data = await res.json();
       if (data.success && data.researcher_id) {
@@ -6336,16 +6453,32 @@ function AcademicResearchPreview({ onClose }) {
     if (!selectedAbstract || !questionText.trim()) return;
     setIsLoading(true);
     try {
+      // Generate/get keypair for receiving encrypted answers
+      let keypair = academicCrypto.getStoredKeypair('asker');
+      if (!keypair) {
+        keypair = await academicCrypto.generateKeypair();
+        if (!keypair) {
+          alert('Crypto not available - install @noble/secp256k1');
+          setIsLoading(false);
+          return;
+        }
+        academicCrypto.storeKeypair('asker', keypair);
+      }
+      
       const res = await fetch(`${API_BASE}/api/academic/ask-question`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           abstract_id: selectedAbstract.abstract_id,
           asker_id: user.pubkey || 'anon',
+          asker_pubkey: keypair.publicKey,
           question_text: questionText
         })
       });
       const data = await res.json();
-      if (data.success) { alert(`Submitted! Hash: ${data.question_hash?.slice(0,16)}...`); setQuestionText(''); }
+      if (data.success) { 
+        alert(`Submitted! Hash: ${data.question_hash?.slice(0,16)}...\nQuestion encrypted for researcher.`); 
+        setQuestionText(''); 
+      }
       else if (res.status === 402) alert(data.error || 'Payment required');
       else alert(data.error || 'Failed');
     } catch (e) { alert('Network error'); }
@@ -6368,6 +6501,117 @@ function AcademicResearchPreview({ onClose }) {
     } catch (e) { alert('Network error'); }
   };
 
+  // Load pending questions for researcher inbox (with decryption)
+  const loadPendingQuestions = async () => {
+    if (!researcherProfile) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/academic/pending-questions/${researcherProfile.researcher_id}`);
+      const data = await res.json();
+      if (data.success) {
+        // Decrypt each question using researcher's private key
+        const keypair = academicCrypto.getStoredKeypair('researcher');
+        if (keypair && data.data) {
+          const decrypted = await Promise.all(data.data.map(async (q) => {
+            try {
+              const questionText = await academicCrypto.decrypt(
+                q.question_ciphertext,
+                q.question_ephemeral_pk,
+                q.question_nonce,
+                keypair.privateKey
+              );
+              return { ...q, question_text: questionText || '[Decryption failed]' };
+            } catch (e) {
+              return { ...q, question_text: '[Decryption failed]' };
+            }
+          }));
+          setPendingQuestions(decrypted);
+        } else {
+          setPendingQuestions(data.data || []);
+        }
+      }
+    } catch (e) { console.error(e); }
+  };
+
+  // Load my question answers (user view) with decryption
+  const loadMyAnswers = async () => {
+    const askerId = user.pubkey || 'anon';
+    try {
+      const res = await fetch(`${API_BASE}/api/academic/my-answers/${askerId}`);
+      const data = await res.json();
+      if (data.success) {
+        // Decrypt each answer using asker's private key
+        const keypair = academicCrypto.getStoredKeypair('asker');
+        if (keypair && data.data) {
+          const decrypted = await Promise.all(data.data.map(async (q) => {
+            if (q.has_answer && q.answer_ciphertext && q.answer_ephemeral_pk && q.answer_nonce) {
+              try {
+                const answerText = await academicCrypto.decrypt(
+                  q.answer_ciphertext,
+                  q.answer_ephemeral_pk,
+                  q.answer_nonce,
+                  keypair.privateKey
+                );
+                return { ...q, answer_text: answerText || '[Decryption failed]' };
+              } catch (e) {
+                return { ...q, answer_text: '[Decryption failed]' };
+              }
+            }
+            return q;
+          }));
+          setMyQuestionAnswers(decrypted);
+        } else {
+          setMyQuestionAnswers(data.data || []);
+        }
+      }
+    } catch (e) { console.error(e); }
+  };
+
+  // Submit answer to a question
+  const handleSubmitAnswer = async () => {
+    if (!selectedQuestion || !answerText.trim() || !researcherProfile) return;
+    setIsLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/academic/answer-question`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          researcher_id: researcherProfile.researcher_id,
+          question_hash: selectedQuestion.question_hash,
+          answer_text: answerText
+        })
+      });
+      const data = await res.json();
+      if (data.success) {
+        alert(`Answer submitted! Hash: ${data.answer_hash?.slice(0,16)}...\nAnswer encrypted for asker.`);
+        setAnswerText('');
+        setSelectedQuestion(null);
+        loadPendingQuestions();
+      } else alert(data.error || 'Failed');
+    } catch (e) { alert('Network error'); }
+    finally { setIsLoading(false); }
+  };
+
+  // Decline a question
+  const handleDeclineQuestion = async (questionHash) => {
+    if (!researcherProfile) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/academic/decline/${questionHash}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ researcher_id: researcherProfile.researcher_id })
+      });
+      const data = await res.json();
+      if (data.success) {
+        alert('Question declined');
+        loadPendingQuestions();
+      }
+    } catch (e) { alert('Network error'); }
+  };
+
+  // Auto-load when switching tabs
+  useEffect(() => {
+    if (activeTab === 'inbox' && researcherProfile) loadPendingQuestions();
+    if (activeTab === 'my_questions') loadMyAnswers();
+  }, [activeTab, researcherProfile]);
+
   return (
     <div className="fixed inset-0 bg-amber-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-[70]">
       <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="bg-white rounded-3xl w-full max-w-lg shadow-2xl overflow-hidden max-h-[90vh] flex flex-col">
@@ -6379,10 +6623,10 @@ function AcademicResearchPreview({ onClose }) {
           <Button variant="outline" onClick={onClose} className="rounded-full h-8 w-8 p-0"><X className="w-5 h-5" /></Button>
         </div>
 
-        <div className="flex border-b border-amber-200 bg-amber-50/50">
-          {['browse', 'submit', 'services', 'profile'].map(tab => (
-            <button key={tab} onClick={() => setActiveTab(tab)} className={cn("flex-1 py-3 text-sm font-bold transition-colors", activeTab === tab ? "text-amber-900 border-b-2 border-amber-600 bg-white" : "text-amber-600 hover:text-amber-800")}>
-              {tab === 'browse' && '🔍 Browse'}{tab === 'submit' && '📝 Submit'}{tab === 'services' && '💼 Services'}{tab === 'profile' && '👤 Profile'}
+        <div className="flex border-b border-amber-200 bg-amber-50/50 overflow-x-auto">
+          {['browse', 'my_questions', 'submit', 'inbox', 'services', 'profile'].map(tab => (
+            <button key={tab} onClick={() => setActiveTab(tab)} className={cn("flex-1 py-3 text-sm font-bold transition-colors whitespace-nowrap px-2", activeTab === tab ? "text-amber-900 border-b-2 border-amber-600 bg-white" : "text-amber-600 hover:text-amber-800")}>
+              {tab === 'browse' && '🔍 Browse'}{tab === 'my_questions' && '❓ My Q&A'}{tab === 'submit' && '📝 Submit'}{tab === 'inbox' && '📥 Inbox'}{tab === 'services' && '💼 Services'}{tab === 'profile' && '👤 Profile'}
             </button>
           ))}
         </div>
@@ -6635,6 +6879,122 @@ function AcademicResearchPreview({ onClose }) {
                   <Button className="w-full bg-indigo-600">Link to Zoom / Class</Button>
                 </a>
               </section>
+            </div>
+          )}
+
+          {/* RESEARCHER INBOX - Pending Questions */}
+          {activeTab === 'inbox' && (
+            <div className="space-y-4">
+              {!researcherProfile ? (
+                <div className="text-center py-8">
+                  <Lock size={32} className="mx-auto mb-2 text-amber-400" />
+                  <p className="text-stone-600 text-sm">Verify .edu email in Submit tab to see your question inbox.</p>
+                </div>
+              ) : (
+                <>
+                  <div className="p-4 bg-blue-50 rounded-xl border border-blue-200">
+                    <h3 className="font-bold text-blue-900 flex items-center gap-2"><Mail size={18}/> Question Inbox</h3>
+                    <p className="text-xs text-blue-700 mt-1">Questions from readers on your research. Answer them to earn XP!</p>
+                  </div>
+                  <Button onClick={loadPendingQuestions} className="w-full bg-blue-600 hover:bg-blue-500">
+                    <RefreshCw size={16} className="mr-2"/> Refresh Inbox
+                  </Button>
+                  {pendingQuestions.length === 0 ? (
+                    <div className="text-center py-8 text-amber-600 text-sm">No pending questions. When readers ask about your research, they'll appear here.</div>
+                  ) : (
+                    <div className="space-y-3">
+                      {pendingQuestions.map(q => (
+                        <div key={q.question_hash} className={cn("p-4 rounded-xl border transition-all", selectedQuestion?.question_hash === q.question_hash ? "border-blue-500 bg-blue-50" : "border-stone-200 hover:border-blue-300")}>
+                          <div className="flex justify-between items-start">
+                            <div className="flex-1">
+                              <p className="text-[10px] text-stone-400 font-mono">From: {q.asker_id?.slice(0,16)}...</p>
+                              <p className="text-[10px] text-stone-400">Abstract: {q.abstract_id}</p>
+                            </div>
+                            {q.is_paid && <span className="text-[10px] bg-green-100 text-green-700 px-2 py-0.5 rounded font-bold">PAID</span>}
+                          </div>
+                          <div className="mt-2 p-3 bg-white rounded-lg border border-stone-100">
+                            <p className="text-sm text-stone-800 font-medium">{q.question_text}</p>
+                          </div>
+                          <div className="mt-3 flex gap-2">
+                            <Button onClick={() => setSelectedQuestion(q)} className="flex-1 bg-blue-600 hover:bg-blue-500 text-xs h-8">Answer</Button>
+                            <Button onClick={() => handleDeclineQuestion(q.question_hash)} variant="outline" className="text-xs h-8 text-red-600 border-red-200 hover:bg-red-50">Decline</Button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {/* Answer Modal */}
+                  {selectedQuestion && (
+                    <div className="mt-4 p-4 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl border-2 border-blue-300">
+                      <h4 className="font-bold text-blue-900 mb-2">Answering Question</h4>
+                      <div className="p-3 bg-white rounded-lg mb-3">
+                        <p className="text-sm text-stone-700">{selectedQuestion.question_text}</p>
+                      </div>
+                      <textarea 
+                        value={answerText} 
+                        onChange={(e) => setAnswerText(e.target.value)} 
+                        placeholder="Type your answer here..." 
+                        className="w-full p-3 border border-blue-300 rounded-xl text-sm" 
+                        rows={4} 
+                      />
+                      <div className="flex gap-2 mt-3">
+                        <Button onClick={handleSubmitAnswer} disabled={!answerText.trim() || isLoading} className="flex-1 bg-green-600 hover:bg-green-500">
+                          {isLoading ? 'Submitting...' : 'Submit Answer (+10 XP)'}
+                        </Button>
+                        <Button onClick={() => { setSelectedQuestion(null); setAnswerText(''); }} variant="outline">Cancel</Button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* USER VIEW - My Questions & Answers */}
+          {activeTab === 'my_questions' && (
+            <div className="space-y-4">
+              <div className="p-4 bg-purple-50 rounded-xl border border-purple-200">
+                <h3 className="font-bold text-purple-900 flex items-center gap-2"><FileText size={18}/> My Questions</h3>
+                <p className="text-xs text-purple-700 mt-1">Track questions you've asked and check for answers from researchers.</p>
+              </div>
+              <Button onClick={loadMyAnswers} className="w-full bg-purple-600 hover:bg-purple-500">
+                <RefreshCw size={16} className="mr-2"/> Check for Answers
+              </Button>
+              {myQuestionAnswers.length === 0 ? (
+                <div className="text-center py-8 text-purple-600 text-sm">No questions yet. Browse abstracts and ask researchers questions!</div>
+              ) : (
+                <div className="space-y-3">
+                  {myQuestionAnswers.map(q => (
+                    <div key={q.question_hash} className={cn("p-4 rounded-xl border", q.has_answer ? "border-green-300 bg-green-50" : q.declined ? "border-red-200 bg-red-50" : "border-amber-200 bg-amber-50")}>
+                      <div className="flex justify-between items-start mb-2">
+                        <span className="text-[10px] text-stone-400 font-mono">Abstract: {q.abstract_id}</span>
+                        {q.has_answer ? (
+                          <span className="text-[10px] bg-green-100 text-green-700 px-2 py-0.5 rounded font-bold">✓ ANSWERED</span>
+                        ) : q.declined ? (
+                          <span className="text-[10px] bg-red-100 text-red-700 px-2 py-0.5 rounded font-bold">DECLINED</span>
+                        ) : (
+                          <span className="text-[10px] bg-amber-100 text-amber-700 px-2 py-0.5 rounded font-bold">⏳ PENDING</span>
+                        )}
+                      </div>
+                      <div className="p-3 bg-white rounded-lg border border-stone-100">
+                        <p className="text-xs text-stone-500 font-bold mb-1">Your Question:</p>
+                        <p className="text-sm text-stone-800">{q.question_text}</p>
+                      </div>
+                      {q.has_answer && q.answer_text && (
+                        <div className="mt-3 p-3 bg-green-100 rounded-lg border border-green-200">
+                          <p className="text-xs text-green-700 font-bold mb-1">Researcher's Answer:</p>
+                          <p className="text-sm text-green-900">{q.answer_text}</p>
+                        </div>
+                      )}
+                      {q.declined && (
+                        <div className="mt-2 p-2 bg-red-100 rounded-lg text-xs text-red-700">
+                          The researcher declined to answer this question.
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 

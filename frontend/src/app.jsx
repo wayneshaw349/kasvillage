@@ -16,7 +16,7 @@ import Countdown from "react-countdown";
 
 // ============================================================================
 // CLIENT-SIDE ECIES DECRYPTION (secp256k1 + AES-256-GCM)
-// Uses Web Crypto API + noble-secp256k1 for ECDH
+// Uses Web Crypto API + noble-secp256k1 for ECDH Godwilling this works 
 // ============================================================================
 const academicCrypto = {
   // Generate keypair for user/researcher

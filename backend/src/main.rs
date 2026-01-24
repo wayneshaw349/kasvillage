@@ -18693,8 +18693,13 @@ pub async fn start_api_server(
     // ========================================================================
     // Configure via: KASPA_NODE_URL=ws://your-flux-node:16210
     // Or use public API if not set
-    let kaspa_node = Arc::new(KaspaFluxNode::from_env());
-    
+    let kaspa_node = match KaspaFluxNode::from_env_async().await {
+        Ok(node) => Arc::new(node),
+        Err(e) => {
+            eprintln!("[KASPA] ⚠ wRPC init failed, using HTTP fallback: {}", e);
+            Arc::new(KaspaFluxNode::from_env())
+        }
+    };
     // Health check the node
     match kaspa_node.health_check().await {
         Ok(true) => println!("[KASPA] ✓ Node connected: {}", kaspa_node.node_url()),
@@ -23818,6 +23823,7 @@ pub struct KaspaFluxNode {
     mode: KaspaNodeMode,
     http_client: reqwest::Client,
     wrpc_url: String,
+    wrpc_client: Option<Arc<KaspaWrpcRpcClient>>, 
 }
 
 impl KaspaFluxNode {
@@ -23837,7 +23843,51 @@ impl KaspaFluxNode {
             None => Self::new_public(network),
         }
     }
-
+/// Create with wRPC retry loop (for Flux/self-hosted kaspad)
+    pub async fn from_env_async() -> Result<Self, String> {
+        let node_url = std::env::var("KASPA_NODE_URL")
+            .unwrap_or_else(|_| "ws://127.0.0.1:17110".to_string());
+        
+        println!("[KASPA] ⏳ Initializing wRPC client for {}", node_url);
+        
+        let client = Arc::new(KaspaWrpcRpcClient::new(
+            WrpcEncoding::Borsh,
+            Some(&node_url),
+            None, None, None,
+        ).map_err(|e| format!("Client config error: {}", e))?);
+        
+        loop {
+            println!("[KASPA] ⏳ Attempting to connect to Kaspad...");
+            match client.start().await {
+                Ok(_) => {
+                    match client.get_block_dag_info().await {
+                        Ok(info) => {
+                            println!("[KASPA] ✓ Connected & Synced! (DAA Score: {})", info.virtual_daa_score);
+                            break;
+                        }
+                        Err(_) => {
+                            println!("[KASPA] ⚠ Connected, but API not responding. Retrying in 5s...");
+                            let _ = client.disconnect().await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[KASPA] ❌ Connection failed: {}. Retrying in 5s...", e);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+        
+        Ok(Self {
+            mode: KaspaNodeMode::SelfHosted { url: node_url.clone() },
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            wrpc_url: node_url,
+            wrpc_client: Some(client),
+        })
+    }
     /// Connect to self-hosted kaspad via wRPC
     pub fn new_self_hosted(url: &str) -> Self {
         let base_url = url.trim_end_matches('/').to_string();
@@ -23850,6 +23900,7 @@ impl KaspaFluxNode {
                 .build()
                 .unwrap(),
             wrpc_url: base_url,
+            wrpc_client: None,
         }
     }
 
@@ -23865,6 +23916,7 @@ impl KaspaFluxNode {
                 .build()
                 .unwrap(),
             wrpc_url: rest_url,
+            wrpc_client: None,
         }
     }
 
@@ -40549,7 +40601,6 @@ fn compute_lagrange_coefficient(
     signers: &[ParticipantId],
 ) -> [u8; 32] {
     use k256::Scalar as K256Scalar;
-    use ff::Field;
     
     // Validate input
     if !signers.contains(&identifier) {
@@ -54847,7 +54898,7 @@ pub struct ResearchQuestion {
 }
 
 mod option_array_33 {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S>(val: &Option<[u8; 33]>, s: S) -> Result<S::Ok, S::Error> where S: Serializer {
         match val {
             Some(arr) => crate::serde_arrays::serialize(arr, s),
@@ -55408,6 +55459,9 @@ pub async fn api_academic_get_profile(path: web::Path<String>, state: web::Data<
 pub struct KaspaWrpcClient {
     url: String,
     http_client: reqwest::Client,
+    mode: KaspaNodeMode,
+    wrpc_url: String,
+    wrpc_client: Option<Arc<KaspaWrpcRpcClient>>,
 }
 
 impl KaspaWrpcClient {
@@ -55418,6 +55472,9 @@ impl KaspaWrpcClient {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap(),
+            mode: KaspaNodeMode::SelfHosted { url: url.to_string() },
+            wrpc_url: url.to_string(),
+            wrpc_client: None,
         }
     }
 
@@ -55426,7 +55483,52 @@ impl KaspaWrpcClient {
             .unwrap_or_else(|_| "wss://mainnet.kaspa.org/wrpc".to_string());
         Self::new(&url)
     }
-
+/// Create with wRPC retry loop (for Flux/self-hosted kaspad)
+    pub async fn from_env_async() -> Result<Self, String> {
+        let node_url = std::env::var("KASPA_NODE_URL")
+            .unwrap_or_else(|_| "ws://127.0.0.1:17110".to_string());
+        
+        println!("[KASPA] ⏳ Initializing wRPC client for {}", node_url);
+        
+        let client = Arc::new(KaspaWrpcRpcClient::new(
+            WrpcEncoding::Borsh,
+            Some(&node_url),
+            None, None, None,
+        ).map_err(|e| format!("Client config error: {}", e))?);
+        
+        loop {
+            println!("[KASPA] ⏳ Attempting to connect to Kaspad...");
+            match client.start().await {
+                Ok(_) => {
+                    match client.get_block_dag_info().await {
+                        Ok(info) => {
+                            println!("[KASPA] ✓ Connected & Synced! (DAA Score: {})", info.virtual_daa_score);
+                            break;
+                        }
+                        Err(_) => {
+                            println!("[KASPA] ⚠ Connected, but API not responding. Retrying in 5s...");
+                            let _ = client.disconnect().await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[KASPA] ❌ Connection failed: {}. Retrying in 5s...", e);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+        
+        Ok(Self {
+            url: node_url.clone(),
+            mode: KaspaNodeMode::SelfHosted { url: node_url.clone() },
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            wrpc_url: node_url,
+            wrpc_client: Some(client),
+        })
+    }
     async fn rpc_call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
         let http_url = self.url.replace("ws://", "http://").replace("wss://", "https://");
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});

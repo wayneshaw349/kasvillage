@@ -16841,90 +16841,6 @@ pub struct WithdrawalRequestPipeline {
     pub kaspa_destination: [u8; 34], // L1 destination address
     pub requested_epoch: u64,         // Epoch withdrawal requested
     pub status: WithdrawalStatus,
-    pub inscription: Option<WithdrawalInscription>, // L1 inscription data
-}
-
-/// L1 Withdrawal Inscription - embedded in withdrawal UTXO (96 bytes)
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WithdrawalInscription {
-    pub epoch: u64,                  // 8 bytes
-    pub merkle_root: [u8; 32],       // 32 bytes - L2 state root
-    pub user_xp: u64,                // 8 bytes
-    pub user_deadlocks: u64,         // 8 bytes
-    pub user_tx_completed: u64,      // 8 bytes
-    pub user_tx_disputed: u64,       // 8 bytes
-    pub completion_rate: u64,        // 8 bytes (0-100)
-    pub amount_sompi: u64,           // 8 bytes
-    pub l1_block_height: u64,        // 8 bytes
-}
-
-impl WithdrawalInscription {
-    pub fn new(
-        epoch: u64,
-        merkle_root: Fr,
-        user_xp: u64,
-        user_deadlocks: u64,
-        user_tx_completed: u64,
-        user_tx_disputed: u64,
-        amount_sompi: u64,
-        l1_block_height: u64,
-    ) -> Self {
-        let root_bytes = merkle_root.to_repr();
-        let mut root = [0u8; 32];
-        root.copy_from_slice(&root_bytes[0..32]);
-        
-        let total = user_tx_completed + user_tx_disputed;
-        let completion_rate = if total > 0 { (user_tx_completed * 100) / total } else { 100 };
-        
-        Self {
-            epoch,
-            merkle_root: root,
-            user_xp,
-            user_deadlocks,
-            user_tx_completed,
-            user_tx_disputed,
-            completion_rate,
-            amount_sompi,
-            l1_block_height,
-        }
-    }
-
-    /// Serialize for L1 OP_DATA script (96 bytes)
-    pub fn to_inscription_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(96);
-        bytes.extend_from_slice(&self.epoch.to_le_bytes());            // 8
-        bytes.extend_from_slice(&self.merkle_root);                    // 32
-        bytes.extend_from_slice(&self.user_xp.to_le_bytes());          // 8
-        bytes.extend_from_slice(&self.user_deadlocks.to_le_bytes());   // 8
-        bytes.extend_from_slice(&self.user_tx_completed.to_le_bytes());// 8
-        bytes.extend_from_slice(&self.user_tx_disputed.to_le_bytes()); // 8
-        bytes.extend_from_slice(&self.completion_rate.to_le_bytes());  // 8
-        bytes.extend_from_slice(&self.amount_sompi.to_le_bytes());     // 8
-        bytes.extend_from_slice(&self.l1_block_height.to_le_bytes());  // 8
-        bytes // 96 bytes total
-    }
-
-    /// Generate OP_DATA script hex for Kaspa (OP_DATA_96 = 0x60)
-    pub fn to_script_hex(&self) -> String {
-        let payload = self.to_inscription_bytes();
-        format!("4c60{}", hex::encode(&payload))
-    }
-
-    /// Compute commitment hash for proof verification
-    pub fn commitment_hash(&self) -> Fr {
-        let constants = PoseidonConstants::<Fr, U8>::new();
-        let mut hasher = Poseidon::<Fr, U8>::new(&constants);
-        hasher.input(Fr::from(self.epoch)).unwrap();
-        let root_fr = Fr::from_repr(self.merkle_root).unwrap_or(Fr::zero());
-        hasher.input(root_fr).unwrap();
-        hasher.input(Fr::from(self.user_xp)).unwrap();
-        hasher.input(Fr::from(self.user_deadlocks)).unwrap();
-        hasher.input(Fr::from(self.user_tx_completed)).unwrap();
-        hasher.input(Fr::from(self.user_tx_disputed)).unwrap();
-        hasher.input(Fr::from(self.amount_sompi)).unwrap();
-        hasher.input(Fr::from(self.l1_block_height)).unwrap();
-        hasher.hash()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -16980,25 +16896,10 @@ impl WithdrawalLedger {
                 kaspa_destination,
                 requested_epoch: epoch,
                 status: WithdrawalStatus::Pending,
-                inscription: None,
             },
         );
         
         Ok(request_id)
-    }
-
-    /// Attach inscription to withdrawal request
-    pub fn attach_inscription(
-        &mut self,
-        request_id: u64,
-        inscription: WithdrawalInscription,
-    ) -> Result<(), String> {
-        if let Some(request) = self.requests.get_mut(&request_id) {
-            request.inscription = Some(inscription);
-            Ok(())
-        } else {
-            Err("Request not found".to_string())
-        }
     }
     pub fn mark_nullifier_spent(&mut self, nullifier: Fq) -> Result<(), String> {
         if self.is_nullifier_spent_fq(&nullifier) {
@@ -17164,53 +17065,6 @@ self.nullifier_set.insert(FieldConverter::fq_to_fr(nullifier_fq));
         }
         
         Ok(())
-    }
-
-    /// ✅ STEP 4b: Execute withdrawal with user stats inscription
-    pub fn execute_withdrawal_with_inscription(
-        &mut self,
-        request_id: u64,
-        proof: WithdrawalProofOutput,
-        user_xp: u64,
-        user_deadlocks: u64,
-        user_tx_completed: u64,
-        user_tx_disputed: u64,
-        l1_block_height: u64,
-    ) -> Result<WithdrawalInscription, String> {
-        // Execute base withdrawal
-        self.execute_withdrawal(request_id, proof)?;
-        
-        // Get request amount
-        let amount = self.ledger.requests
-            .get(&request_id)
-            .map(|r| r.amount)
-            .ok_or("Request not found")?;
-        
-        // Get current epoch
-        let epoch = self.ledger.requests
-            .get(&request_id)
-            .map(|r| r.requested_epoch)
-            .ok_or("Request not found")?;
-        
-        // Create inscription with user stats
-        let inscription = WithdrawalInscription::new(
-            epoch,
-            self.merkle_root,
-            user_xp,
-            user_deadlocks,
-            user_tx_completed,
-            user_tx_disputed,
-            amount,
-            l1_block_height,
-        );
-        
-        // Attach inscription to request
-        self.ledger.attach_inscription(request_id, inscription.clone())?;
-        
-        // Update status to L1Inscribed
-        self.ledger.update_request_status(request_id, WithdrawalStatus::L1Inscribed)?;
-        
-        Ok(inscription)
     }
     
     /// ✅ STEP 5: Finalize withdrawal (after L1 confirmation)
@@ -30898,13 +30752,11 @@ impl ValidatorSetManager {
     }
 }
 
-/// Merkle root inscription on Kaspa L1 (with user stats)
+/// Merkle root inscription on Kaspa L1
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MerkleRootInscription {
     pub epoch: u64,
     pub merkle_root: [u8; 32],  // 32-byte root
-    pub completion_rate: u64,   // 0-100 percentage
-    pub total_disputes: u64,
     pub tx_id: String,
     pub inscription_id: String,
     pub timestamp: u64,
@@ -30912,14 +30764,8 @@ pub struct MerkleRootInscription {
 }
 
 impl MerkleRootInscription {
-    /// Create inscription from L2 state root with stats
-    pub fn from_l2_root(
-        epoch: u64,
-        root_fr: Fr,
-        completion_rate: u64,
-        total_disputes: u64,
-        block_height: u64,
-    ) -> Self {
+    /// Create inscription from L2 state root
+    pub fn from_l2_root(epoch: u64, root_fr: Fr, block_height: u64) -> Self {
         let root_bytes = root_fr.to_repr();
         let mut merkle_root = [0u8; 32];
         merkle_root.copy_from_slice(&root_bytes[0..32]);
@@ -30927,8 +30773,6 @@ impl MerkleRootInscription {
         Self {
             epoch,
             merkle_root,
-            completion_rate,
-            total_disputes,
             tx_id: String::new(),
             inscription_id: String::new(),
             timestamp: std::time::SystemTime::now()
@@ -30939,27 +30783,13 @@ impl MerkleRootInscription {
         }
     }
 
-    /// Serialize for L1 OP_DATA script (64 bytes)
+    /// Serialize for inscription
     pub fn to_inscription_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(64);
-        bytes.extend_from_slice(&self.epoch.to_le_bytes());           // 8
-        bytes.extend_from_slice(&self.merkle_root);                   // 32
-        bytes.extend_from_slice(&self.completion_rate.to_le_bytes()); // 8
-        bytes.extend_from_slice(&self.total_disputes.to_le_bytes());  // 8
-        bytes.extend_from_slice(&self.l1_block_height.to_le_bytes()); // 8
-        bytes // 64 bytes total
-    }
-
-    /// Generate OP_DATA script hex for Kaspa
-    pub fn to_script_hex(&self) -> String {
-        let payload = self.to_inscription_bytes();
-        format!("4c40{}", hex::encode(&payload))
-    }
-
-    pub fn with_tx_id(mut self, tx_id: String) -> Self {
-        self.tx_id = tx_id.clone();
-        self.inscription_id = format!("kv_epoch_{}_{}", self.epoch, &tx_id[..8.min(tx_id.len())]);
-        self
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.epoch.to_le_bytes());
+        bytes.extend_from_slice(&self.merkle_root);
+        bytes.extend_from_slice(&self.l1_block_height.to_le_bytes());
+        bytes
     }
 }
 
@@ -30983,8 +30813,8 @@ impl KaspaL1Settlement {
     }
 
     /// Queue L2 state root for L1 inscription
-    pub fn queue_inscription(&mut self, epoch: u64, root_fr: Fr, completion_rate: u64, total_disputes: u64, block_height: u64) {
-        let inscription = MerkleRootInscription::from_l2_root(epoch, root_fr, completion_rate, total_disputes, block_height);
+    pub fn queue_inscription(&mut self, epoch: u64, root_fr: Fr, block_height: u64) {
+        let inscription = MerkleRootInscription::from_l2_root(epoch, root_fr, block_height);
         self.pending_inscriptions.push(inscription);
     }
 
@@ -31136,18 +30966,7 @@ impl L2L1Bridge {
         root_fr: Fr,
         block_height: u64,
     ) -> Result<(), String> {
-        // Compute aggregate stats from pending withdrawals
-        let total_completed = self.pending_withdrawals.values()
-            .filter(|w| w.status == WithdrawalStatus::L2Verified || w.status == WithdrawalStatus::Finalized)
-            .count() as u64;
-        let total_disputed = self.pending_withdrawals.values()
-            .filter(|w| matches!(w.status, WithdrawalStatus::Failed(_)))
-            .count() as u64;
-        let completion_rate = if total_completed + total_disputed > 0 {
-            (total_completed * 100) / (total_completed + total_disputed)
-        } else { 100 };
-        
-        self.l1_settlement.queue_inscription(epoch, root_fr, completion_rate, total_disputed, block_height);
+        self.l1_settlement.queue_inscription(epoch, root_fr, block_height);
         
         // Settle pending inscriptions
         self.l1_settlement.settle_pending()?;
@@ -48168,50 +47987,6 @@ impl XpTreeState {
         }
         current == self.xp_root
     }
-
-    /// Aggregate stats for L1 inscription
-    pub fn compute_aggregate_stats(&self) -> (u64, u64) {
-        let mut total_completed = 0u64;
-        let mut total_disputed = 0u64;
-        for record in self.xp_states.values() {
-            total_completed += record.tx_completed;
-            total_disputed += record.tx_disputed;
-        }
-        let completion_rate = if total_completed + total_disputed > 0 {
-            (total_completed * 100) / (total_completed + total_disputed)
-        } else { 100 };
-        (completion_rate, total_disputed)
-    }
-
-    /// Create L1 inscription from current state
-    pub fn create_inscription(&self, l1_block_height: u64) -> MerkleRootInscription {
-        let (completion_rate, total_disputes) = self.compute_aggregate_stats();
-        MerkleRootInscription::from_l2_root(
-            self.epoch,
-            self.xp_root,
-            completion_rate,
-            total_disputes,
-            l1_block_height,
-        )
-    }
-}
-
-/// Compute user leaf hash from individual stats (for merkle tree)
-pub fn compute_user_leaf_hash(
-    xp: u64,
-    deadlocks: u64,
-    tx_completed: u64,
-    tx_disputed: u64,
-    variety_score: f64,
-) -> Fr {
-    let constants = PoseidonConstants::<Fr, U5>::new();
-    let mut hasher = Poseidon::<Fr, U5>::new(&constants);
-    hasher.input(Fr::from(xp)).unwrap();
-    hasher.input(Fr::from(deadlocks)).unwrap();
-    hasher.input(Fr::from(tx_completed)).unwrap();
-    hasher.input(Fr::from(tx_disputed)).unwrap();
-    hasher.input(Fr::from((variety_score * 1000.0) as u64)).unwrap();
-    hasher.hash()
 }
 
 fn build_xp_merkle_tree(leaves: &[Fr]) -> (Fr, Vec<Vec<(Fr, bool)>>) {
@@ -49263,201 +49038,6 @@ pub async fn api_verify_xp(
     })
 }
 
-/// POST /api/withdrawal/inscribe - Submit withdrawal with user stats inscription to L1
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WithdrawalInscribeRequest {
-    pub user_pubkey: String,
-    pub amount_sompi: u64,
-    pub kaspa_destination: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct WithdrawalInscribeResponse {
-    pub success: bool,
-    pub tx_id: String,
-    pub epoch: u64,
-    pub merkle_root: String,
-    pub user_xp: u64,
-    pub user_deadlocks: u64,
-    pub user_tx_completed: u64,
-    pub user_tx_disputed: u64,
-    pub completion_rate: u64,
-    pub amount_sompi: u64,
-    pub script_hex: String,
-}
-
-pub async fn api_withdrawal_inscribe(
-    state: web::Data<FrontendAppState>,
-    req: web::Json<WithdrawalInscribeRequest>,
-) -> impl Responder {
-    let xp_tree = state.xp_tree.read().await;
-    let wrpc = KaspaWrpcClient::from_env();
-    
-    // Get L1 block height
-    let l1_height = wrpc.get_block_dag_info().await.map(|i| i.virtual_daa_score).unwrap_or(0);
-    
-    // Get user stats
-    let (user_xp, user_deadlocks, user_tx_completed, user_tx_disputed) = 
-        if let Some(record) = xp_tree.get_user(&req.user_pubkey) {
-            (record.xp, record.deadlocks, record.tx_completed, record.tx_disputed)
-        } else {
-            (0, 0, 0, 0)
-        };
-    
-    // Create withdrawal inscription
-    let inscription = WithdrawalInscription::new(
-        xp_tree.epoch,
-        xp_tree.xp_root,
-        user_xp,
-        user_deadlocks,
-        user_tx_completed,
-        user_tx_disputed,
-        req.amount_sompi,
-        l1_height,
-    );
-    
-    // Submit to L1
-    match wrpc.submit_withdrawal_inscription(&inscription, &req.kaspa_destination).await {
-        Ok(tx_id) => HttpResponse::Ok().json(WithdrawalInscribeResponse {
-            success: true,
-            tx_id,
-            epoch: inscription.epoch,
-            merkle_root: hex::encode(&inscription.merkle_root),
-            user_xp: inscription.user_xp,
-            user_deadlocks: inscription.user_deadlocks,
-            user_tx_completed: inscription.user_tx_completed,
-            user_tx_disputed: inscription.user_tx_disputed,
-            completion_rate: inscription.completion_rate,
-            amount_sompi: inscription.amount_sompi,
-            script_hex: inscription.to_script_hex(),
-        }),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "success": false,
-            "error": e
-        })),
-    }
-}
-
-/// GET /api/withdrawal/inscription/preview/{pubkey}/{amount} - Preview withdrawal inscription
-pub async fn api_withdrawal_inscription_preview(
-    state: web::Data<FrontendAppState>,
-    path: web::Path<(String, u64)>,
-) -> impl Responder {
-    let (pubkey, amount_sompi) = path.into_inner();
-    let xp_tree = state.xp_tree.read().await;
-    let wrpc = KaspaWrpcClient::from_env();
-    
-    let l1_height = wrpc.get_block_dag_info().await.map(|i| i.virtual_daa_score).unwrap_or(0);
-    
-    let (user_xp, user_deadlocks, user_tx_completed, user_tx_disputed) = 
-        if let Some(record) = xp_tree.get_user(&pubkey) {
-            (record.xp, record.deadlocks, record.tx_completed, record.tx_disputed)
-        } else {
-            (0, 0, 0, 0)
-        };
-    
-    let inscription = WithdrawalInscription::new(
-        xp_tree.epoch,
-        xp_tree.xp_root,
-        user_xp,
-        user_deadlocks,
-        user_tx_completed,
-        user_tx_disputed,
-        amount_sompi,
-        l1_height,
-    );
-    
-    HttpResponse::Ok().json(serde_json::json!({
-        "epoch": inscription.epoch,
-        "merkle_root": hex::encode(&inscription.merkle_root),
-        "user_xp": inscription.user_xp,
-        "user_deadlocks": inscription.user_deadlocks,
-        "user_tx_completed": inscription.user_tx_completed,
-        "user_tx_disputed": inscription.user_tx_disputed,
-        "completion_rate": inscription.completion_rate,
-        "amount_sompi": inscription.amount_sompi,
-        "l1_block_height": inscription.l1_block_height,
-        "script_hex": inscription.to_script_hex(),
-        "payload_bytes": 96,
-        "commitment_hash": fr_to_hex(&inscription.commitment_hash()),
-    }))
-}
-
-/// POST /api/inscription/submit - Submit epoch inscription to L1 (legacy)
-#[derive(Debug, Serialize, Deserialize)]
-pub struct InscriptionSubmitRequest {
-    pub sender_address: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct InscriptionSubmitResponse {
-    pub success: bool,
-    pub epoch: u64,
-    pub merkle_root: String,
-    pub completion_rate: u64,
-    pub total_disputes: u64,
-    pub tx_id: String,
-    pub inscription_id: String,
-    pub script_hex: String,
-}
-
-pub async fn api_submit_inscription(
-    state: web::Data<FrontendAppState>,
-    req: web::Json<InscriptionSubmitRequest>,
-) -> impl Responder {
-    let xp_tree = state.xp_tree.read().await;
-    let wrpc = KaspaWrpcClient::from_env();
-    
-    // Get current L1 block height
-    let l1_height = match wrpc.get_block_dag_info().await {
-        Ok(info) => info.virtual_daa_score,
-        Err(_) => 0,
-    };
-    
-    // Create inscription from current state
-    let inscription = xp_tree.create_inscription(l1_height);
-    
-    // Submit to L1
-    match wrpc.submit_inscription(&inscription, &req.sender_address).await {
-        Ok(submitted) => HttpResponse::Ok().json(InscriptionSubmitResponse {
-            success: true,
-            epoch: submitted.epoch,
-            merkle_root: hex::encode(&submitted.merkle_root),
-            completion_rate: submitted.completion_rate,
-            total_disputes: submitted.total_disputes,
-            tx_id: submitted.tx_id.clone(),
-            inscription_id: submitted.inscription_id.clone(),
-            script_hex: inscription.to_script_hex(),
-        }),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "success": false,
-            "error": e
-        })),
-    }
-}
-
-/// GET /api/inscription/preview - Preview inscription without submitting
-pub async fn api_preview_inscription(
-    state: web::Data<FrontendAppState>,
-) -> impl Responder {
-    let xp_tree = state.xp_tree.read().await;
-    let wrpc = KaspaWrpcClient::from_env();
-    
-    let l1_height = wrpc.get_block_dag_info().await.map(|i| i.virtual_daa_score).unwrap_or(0);
-    let inscription = xp_tree.create_inscription(l1_height);
-    
-    HttpResponse::Ok().json(serde_json::json!({
-        "epoch": inscription.epoch,
-        "merkle_root": hex::encode(&inscription.merkle_root),
-        "completion_rate": inscription.completion_rate,
-        "total_disputes": inscription.total_disputes,
-        "l1_block_height": inscription.l1_block_height,
-        "timestamp": inscription.timestamp,
-        "script_hex": inscription.to_script_hex(),
-        "payload_bytes": 64,
-    }))
-}
-
 /// GET /api/reputation/{pubkey} - Get full reputation assessment
 pub async fn api_get_reputation(
     state: web::Data<FrontendAppState>,
@@ -49663,12 +49243,6 @@ pub fn configure_frontend_api(cfg: &mut web::ServiceConfig) {
             .route("/xp/{pubkey}", web::get().to(api_get_xp))
             .route("/xp/verify", web::post().to(api_verify_xp))
             .route("/reputation/{pubkey}", web::get().to(api_get_reputation))
-            // L1 Inscription endpoints
-            .route("/inscription/submit", web::post().to(api_submit_inscription))
-            .route("/inscription/preview", web::get().to(api_preview_inscription))
-            // Withdrawal inscription endpoints (user stats in L1 UTXO)
-            .route("/withdrawal/inscribe", web::post().to(api_withdrawal_inscribe))
-            .route("/withdrawal/inscription/preview/{pubkey}/{amount}", web::get().to(api_withdrawal_inscription_preview))
             .route("/balance/{pubkey}", web::get().to(api_get_balance))
             .route("/state/root", web::get().to(api_get_state_root))
             // FROST wallet endpoints
@@ -51538,6 +51112,8 @@ pub fn configure_routes_additions(cfg: &mut web::ServiceConfig) {
         .route("/api/academic/abstracts", web::get().to(api_academic_list_abstracts))
         .route("/api/academic/abstracts/{id}", web::get().to(api_academic_get_abstract))
         .route("/api/academic/profile/{id}", web::get().to(api_academic_get_profile))
+        .route("/api/academic/pending-questions/{researcher_id}", web::get().to(api_academic_pending_questions))
+        .route("/api/academic/my-answers/{asker_id}", web::get().to(api_academic_my_answers))
         .route("/api/coupons/create", web::post().to(api_coupon_create))
         .route("/api/coupons/{code}/redeem", web::post().to(api_coupon_redeem))
         .route("/api/jobs", web::get().to(api_jobs_list))
@@ -55224,6 +54800,8 @@ pub struct ResearcherProfile {
     pub researcher_id: String,
     pub email_hash: [u8; 32],
     pub institution_domain: String,
+    #[serde(with = "serde_arrays")]
+    pub pubkey: [u8; 33],
     pub created_at: u64,
     pub xp: u64,
     pub abstract_count: u32,
@@ -55250,11 +54828,44 @@ pub struct ResearchQuestion {
     pub question_hash: [u8; 32],
     pub abstract_id: String,
     pub asker_id: String,
+    #[serde(with = "serde_arrays")]
+    pub asker_pubkey: [u8; 33],
+    pub question_ciphertext: Vec<u8>,
+    #[serde(with = "serde_arrays")]
+    pub question_ephemeral_pk: [u8; 33],
+    pub question_nonce: [u8; 12],
     pub is_paid: bool,
     pub payment_tx: Option<String>,
     pub submitted_at: u64,
     pub answer_hash: Option<[u8; 32]>,
+    pub answer_ciphertext: Option<Vec<u8>>,
+    #[serde(with = "option_array_33")]
+    pub answer_ephemeral_pk: Option<[u8; 33]>,
+    pub answer_nonce: Option<[u8; 12]>,
+    pub answered_at: Option<u64>,
     pub declined: bool,
+}
+
+mod option_array_33 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S>(val: &Option<[u8; 33]>, s: S) -> Result<S::Ok, S::Error> where S: Serializer {
+        match val {
+            Some(arr) => crate::serde_arrays::serialize(arr, s),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D>(d: D) -> Result<Option<[u8; 33]>, D::Error> where D: Deserializer<'de> {
+        let opt: Option<Vec<u8>> = Option::deserialize(d)?;
+        match opt {
+            Some(v) if v.len() == 33 => {
+                let mut arr = [0u8; 33];
+                arr.copy_from_slice(&v);
+                Ok(Some(arr))
+            }
+            Some(_) => Err(serde::de::Error::custom("expected 33 bytes")),
+            None => Ok(None),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -55266,6 +54877,7 @@ pub struct VerifyEduEmailReq {
 pub struct ConfirmVerificationReq {
     pub email: String,
     pub code: String,
+    pub pubkey: String,  // hex-encoded 33-byte compressed pubkey for receiving questions
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -55281,6 +54893,7 @@ pub struct SubmitAbstractReq {
 pub struct AskQuestionReq {
     pub abstract_id: String,
     pub asker_id: String,
+    pub asker_pubkey: String,        // hex-encoded 33-byte compressed pubkey
     pub question_text: String,
     pub payment_tx: Option<String>,
 }
@@ -55296,6 +54909,88 @@ pub struct AnswerQuestionReq {
 pub struct SetQuestionPriceReq {
     pub researcher_id: String,
     pub price_sompi: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DecryptQuestionReq {
+    pub question_hash: String,
+    pub researcher_signature: String,   // Sign question_hash with researcher's key to prove ownership
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DecryptAnswerReq {
+    pub question_hash: String,
+    pub asker_signature: String,        // Sign question_hash with asker's key to prove ownership
+}
+
+/// Encrypt text for a recipient using ECIES (ECDH + AES-256-GCM)
+fn academic_encrypt_for_pubkey(
+    plaintext: &[u8],
+    recipient_pubkey: &[u8; 33],
+) -> Result<(Vec<u8>, [u8; 33], [u8; 12]), String> {
+    let mut rng = OsRng;
+    let ephemeral_sk = K256SecretKey::random(&mut rng);
+    let ephemeral_pk = ephemeral_sk.public_key();
+    
+    let recipient_pk = K256PublicKey::from_sec1_bytes(recipient_pubkey)
+        .map_err(|e| format!("Invalid recipient pubkey: {}", e))?;
+    
+    let shared_point = k256::ecdh::diffie_hellman(
+        ephemeral_sk.to_nonzero_scalar(),
+        recipient_pk.as_affine(),
+    );
+    
+    let hkdf = Hkdf::<Sha256>::new(None, shared_point.raw_secret_bytes());
+    let mut aes_key = [0u8; 32];
+    hkdf.expand(b"KASVILLAGE-ACADEMIC-v1", &mut aes_key)
+        .map_err(|_| "HKDF expansion failed")?;
+    
+    let mut nonce_bytes = [0u8; 12];
+    rng.fill_bytes(&mut nonce_bytes);
+    
+    let cipher = <Aes256Gcm as AesKeyInit>::new_from_slice(&aes_key)
+        .map_err(|e| format!("AES init failed: {}", e))?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    
+    let ciphertext = cipher.encrypt(nonce, plaintext)
+        .map_err(|e| format!("Encryption failed: {}", e))?;
+    
+    let ephemeral_pk_bytes = ephemeral_pk.to_sec1_bytes();
+    let mut ephemeral_pubkey = [0u8; 33];
+    ephemeral_pubkey.copy_from_slice(&ephemeral_pk_bytes);
+    
+    Ok((ciphertext, ephemeral_pubkey, nonce_bytes))
+}
+
+/// Decrypt text using own secret key
+fn academic_decrypt_with_sk(
+    ciphertext: &[u8],
+    ephemeral_pubkey: &[u8; 33],
+    nonce: &[u8; 12],
+    own_sk: &[u8; 32],
+) -> Result<Vec<u8>, String> {
+    let sk = K256SecretKey::from_bytes(own_sk.into())
+        .map_err(|e| format!("Invalid secret key: {}", e))?;
+    
+    let ephemeral_pk = K256PublicKey::from_sec1_bytes(ephemeral_pubkey)
+        .map_err(|e| format!("Invalid ephemeral pubkey: {}", e))?;
+    
+    let shared_point = k256::ecdh::diffie_hellman(
+        sk.to_nonzero_scalar(),
+        ephemeral_pk.as_affine(),
+    );
+    
+    let hkdf = Hkdf::<Sha256>::new(None, shared_point.raw_secret_bytes());
+    let mut aes_key = [0u8; 32];
+    hkdf.expand(b"KASVILLAGE-ACADEMIC-v1", &mut aes_key)
+        .map_err(|_| "HKDF expansion failed")?;
+    
+    let cipher = <Aes256Gcm as AesKeyInit>::new_from_slice(&aes_key)
+        .map_err(|e| format!("AES init failed: {}", e))?;
+    let nonce_obj = Nonce::from_slice(nonce);
+    
+    cipher.decrypt(nonce_obj, ciphertext)
+        .map_err(|_| "Decryption failed - invalid ciphertext or wrong key".to_string())
 }
 
 fn academic_sha256_hash(data: &[u8]) -> [u8; 32] {
@@ -55359,6 +55054,17 @@ pub async fn api_academic_confirm_verification(
     let email = req.email.trim().to_lowercase();
     let email_hash = academic_sha256_hash(email.as_bytes());
     let hash_hex = hex::encode(&email_hash);
+    
+    // Parse pubkey
+    let pubkey_bytes = match hex::decode(&req.pubkey) {
+        Ok(b) if b.len() == 33 => {
+            let mut arr = [0u8; 33];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return HttpResponse::BadRequest().json(json!({"success": false, "error": "Invalid pubkey (need 33-byte hex)"})),
+    };
+    
     let pending = state.pending_verifications.read().unwrap();
     match pending.get(&hash_hex) {
         Some((stored_code, domain, expires)) if *expires > academic_timestamp_now() && *stored_code == req.code => {
@@ -55369,6 +55075,7 @@ pub async fn api_academic_confirm_verification(
                 researcher_id: researcher_id.clone(),
                 email_hash,
                 institution_domain: domain,
+                pubkey: pubkey_bytes,
                 created_at: academic_timestamp_now(),
                 xp: 0,
                 abstract_count: 0,
@@ -55422,41 +55129,71 @@ pub async fn api_academic_ask_question(
     req: web::Json<AskQuestionReq>,
     state: web::Data<AppState>,
 ) -> impl Responder {
+    // Parse asker pubkey
+    let asker_pubkey = match hex::decode(&req.asker_pubkey) {
+        Ok(b) if b.len() == 33 => {
+            let mut arr = [0u8; 33];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return HttpResponse::BadRequest().json(json!({"success": false, "error": "Invalid asker pubkey"})),
+    };
+    
     let abstracts = state.research_abstracts.read().unwrap();
     let abstract_entry = match abstracts.get(&req.abstract_id) {
         Some(a) => a.clone(),
         None => return HttpResponse::NotFound().json(json!({"success": false, "error": "Abstract not found"})),
     };
     drop(abstracts);
+    
     let profiles = state.researcher_profiles.read().unwrap();
-    let researcher = profiles.get(&abstract_entry.researcher_id).cloned();
+    let researcher = match profiles.get(&abstract_entry.researcher_id).cloned() {
+        Some(r) => r,
+        None => return HttpResponse::NotFound().json(json!({"success": false, "error": "Researcher not found"})),
+    };
     drop(profiles);
+    
     let questions = state.research_questions.read().unwrap();
     let existing: Vec<_> = questions.values()
         .filter(|q| q.abstract_id == req.abstract_id && q.asker_id == req.asker_id)
         .collect();
     let is_first = existing.is_empty();
     drop(questions);
-    if !is_first {
-        if let Some(ref r) = researcher {
-            if r.question_price_sompi > 0 && req.payment_tx.is_none() {
-                return HttpResponse::PaymentRequired().json(json!({
-                    "success": false,
-                    "error": format!("Payment required: {} sompi", r.question_price_sompi)
-                }));
-            }
-        }
+    
+    if !is_first && researcher.question_price_sompi > 0 && req.payment_tx.is_none() {
+        return HttpResponse::PaymentRequired().json(json!({
+            "success": false,
+            "error": format!("Payment required: {} sompi", researcher.question_price_sompi)
+        }));
     }
+    
+    // Encrypt question for researcher
+    let (ciphertext, ephemeral_pk, nonce) = match academic_encrypt_for_pubkey(
+        req.question_text.as_bytes(),
+        &researcher.pubkey,
+    ) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::InternalServerError().json(json!({"success": false, "error": e})),
+    };
+    
     let question_hash = academic_sha256_hash(req.question_text.as_bytes());
     let hash_hex = hex::encode(&question_hash);
     let question = ResearchQuestion {
         question_hash,
         abstract_id: req.abstract_id.clone(),
         asker_id: req.asker_id.clone(),
+        asker_pubkey,
+        question_ciphertext: ciphertext,
+        question_ephemeral_pk: ephemeral_pk,
+        question_nonce: nonce,
         is_paid: !is_first && req.payment_tx.is_some(),
         payment_tx: req.payment_tx.clone(),
         submitted_at: academic_timestamp_now(),
         answer_hash: None,
+        answer_ciphertext: None,
+        answer_ephemeral_pk: None,
+        answer_nonce: None,
+        answered_at: None,
         declined: false,
     };
     let mut questions = state.research_questions.write().unwrap();
@@ -55478,9 +55215,24 @@ pub async fn api_academic_answer_question(
         return HttpResponse::Forbidden().json(json!({"success": false, "error": "Not authorized"}));
     }
     drop(abstracts);
+    
+    // Encrypt answer for asker
+    let (ciphertext, ephemeral_pk, nonce) = match academic_encrypt_for_pubkey(
+        req.answer_text.as_bytes(),
+        &question.asker_pubkey,
+    ) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::InternalServerError().json(json!({"success": false, "error": e})),
+    };
+    
     let answer_hash = academic_sha256_hash(req.answer_text.as_bytes());
     question.answer_hash = Some(answer_hash);
+    question.answer_ciphertext = Some(ciphertext);
+    question.answer_ephemeral_pk = Some(ephemeral_pk);
+    question.answer_nonce = Some(nonce);
+    question.answered_at = Some(academic_timestamp_now());
     drop(questions);
+    
     let xp_earned = 10u64;
     let mut profiles = state.researcher_profiles.write().unwrap();
     if let Some(profile) = profiles.get_mut(&req.researcher_id) {
@@ -55523,6 +55275,63 @@ pub async fn api_academic_set_price(
         }
         None => HttpResponse::NotFound().json(json!({"success": false, "error": "Researcher not found"})),
     }
+}
+
+/// Researcher: Get pending questions for their abstracts
+pub async fn api_academic_pending_questions(
+    path: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let researcher_id = path.into_inner();
+    let abstracts = state.research_abstracts.read().unwrap();
+    let my_abstract_ids: Vec<String> = abstracts.values()
+        .filter(|a| a.researcher_id == researcher_id)
+        .map(|a| a.abstract_id.clone())
+        .collect();
+    drop(abstracts);
+    
+    let questions = state.research_questions.read().unwrap();
+    let pending: Vec<_> = questions.values()
+        .filter(|q| my_abstract_ids.contains(&q.abstract_id) && q.answer_hash.is_none() && !q.declined)
+        .map(|q| json!({
+            "question_hash": hex::encode(&q.question_hash),
+            "abstract_id": q.abstract_id,
+            "asker_id": q.asker_id,
+            // Encrypted question data - decrypt client-side with researcher's private key
+            "question_ciphertext": hex::encode(&q.question_ciphertext),
+            "question_ephemeral_pk": hex::encode(&q.question_ephemeral_pk),
+            "question_nonce": hex::encode(&q.question_nonce),
+            "is_paid": q.is_paid,
+            "submitted_at": q.submitted_at,
+        }))
+        .collect();
+    HttpResponse::Ok().json(json!({"success": true, "data": pending}))
+}
+
+/// User: Get answers to questions they asked
+pub async fn api_academic_my_answers(
+    path: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let asker_id = path.into_inner();
+    let questions = state.research_questions.read().unwrap();
+    let answered: Vec<_> = questions.values()
+        .filter(|q| q.asker_id == asker_id)
+        .map(|q| json!({
+            "question_hash": hex::encode(&q.question_hash),
+            "abstract_id": q.abstract_id,
+            // User's own question - they know what they asked
+            "submitted_at": q.submitted_at,
+            "has_answer": q.answer_hash.is_some(),
+            // Encrypted answer data - decrypt client-side with asker's private key
+            "answer_ciphertext": q.answer_ciphertext.as_ref().map(|c| hex::encode(c)),
+            "answer_ephemeral_pk": q.answer_ephemeral_pk.as_ref().map(|p| hex::encode(p)),
+            "answer_nonce": q.answer_nonce.as_ref().map(|n| hex::encode(n)),
+            "answered_at": q.answered_at,
+            "declined": q.declined,
+        }))
+        .collect();
+    HttpResponse::Ok().json(json!({"success": true, "data": answered}))
 }
 
 pub async fn api_academic_list_abstracts(query: web::Query<AcademicListQ>, state: web::Data<AppState>) -> impl Responder {
@@ -55676,98 +55485,6 @@ impl KaspaWrpcClient {
     pub async fn health_check(&self) -> Result<bool, String> {
         let info = self.get_block_dag_info().await?;
         Ok(info.virtual_daa_score > 0)
-    }
-
-    /// Submit MerkleRootInscription to Kaspa L1
-    pub async fn submit_inscription(
-        &self,
-        inscription: &MerkleRootInscription,
-        sender_address: &str,
-    ) -> Result<MerkleRootInscription, String> {
-        let script_hex = inscription.to_script_hex();
-        let dag_info = self.get_block_dag_info().await?;
-        
-        // Build transaction with OP_DATA output
-        let tx_payload = json!({
-            "transaction": {
-                "version": 0,
-                "inputs": [],
-                "outputs": [{
-                    "value": 1000, // Minimum dust
-                    "scriptPublicKey": {"scriptPublicKey": script_hex}
-                }],
-                "lockTime": 0,
-                "subnetworkId": "0000000000000000000000000000000000000000"
-            }
-        });
-        
-        let result = self.rpc_call("submitTransaction", tx_payload).await?;
-        let tx_id = result.get("transactionId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("pending")
-            .to_string();
-        
-        log::info!(
-            "L1 inscription submitted: epoch={} root={} completion={}% disputes={} tx={}",
-            inscription.epoch,
-            hex::encode(&inscription.merkle_root),
-            inscription.completion_rate,
-            inscription.total_disputes,
-            tx_id
-        );
-        
-        Ok(inscription.clone().with_tx_id(tx_id))
-    }
-
-    /// Queue inscription for batch submission
-    pub async fn queue_inscription(&self, inscription: MerkleRootInscription) -> Result<String, String> {
-        let inscription_id = format!("kv_epoch_{}", inscription.epoch);
-        log::info!("Inscription queued: {} ({}% completion, {} disputes)",
-            inscription_id, inscription.completion_rate, inscription.total_disputes);
-        Ok(inscription_id)
-    }
-
-    /// Submit withdrawal with inscription to Kaspa L1
-    pub async fn submit_withdrawal_inscription(
-        &self,
-        inscription: &WithdrawalInscription,
-        destination_address: &str,
-    ) -> Result<String, String> {
-        let script_hex = inscription.to_script_hex();
-        
-        // Build withdrawal transaction with OP_DATA inscription
-        let tx_payload = json!({
-            "transaction": {
-                "version": 0,
-                "inputs": [],
-                "outputs": [{
-                    "value": inscription.amount_sompi,
-                    "scriptPublicKey": {"scriptPublicKey": destination_address}
-                }, {
-                    "value": 1000, // OP_DATA output (dust)
-                    "scriptPublicKey": {"scriptPublicKey": script_hex}
-                }],
-                "lockTime": 0,
-                "subnetworkId": "0000000000000000000000000000000000000000"
-            }
-        });
-        
-        let result = self.rpc_call("submitTransaction", tx_payload).await?;
-        let tx_id = result.get("transactionId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("pending")
-            .to_string();
-        
-        log::info!(
-            "L1 withdrawal inscription: amount={} xp={} deadlocks={} completion={}% tx={}",
-            inscription.amount_sompi,
-            inscription.user_xp,
-            inscription.user_deadlocks,
-            inscription.completion_rate,
-            tx_id
-        );
-        
-        Ok(tx_id)
     }
 }
 

@@ -15,7 +15,8 @@
     "lucide-react": "^0.263.1",
     "clsx": "^2.0.0",
     "tailwind-merge": "^2.0.0",
-    "react-countdown": "^2.3.5"
+    "react-countdown": "^2.3.5",
+    "@noble/secp256k1": "^3.0.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.2.0",

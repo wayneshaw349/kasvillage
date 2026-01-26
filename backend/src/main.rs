@@ -8342,6 +8342,243 @@ impl WithdrawalCap {
     }
 }
 
+// ============================================================================
+// ENTRY 177.5 — 24-HOUR ROLLING FLOW TRACKER (COMPLIANCE PATCH)
+// ============================================================================
+// Prevents structuring attacks by tracking per-user deposits/withdrawals
+// with proper 24h rolling window memory.
+
+/// Single transaction record for rolling window calculation
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FlowTransaction {
+    pub amount_sompi: u64,
+    pub timestamp: u64,
+    pub direction: FlowDirection,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum FlowDirection {
+    Deposit,
+    Withdrawal,
+}
+
+/// Per-user flow tracking with 24h rolling window
+#[derive(Clone, Debug, Default)]
+pub struct UserFlow {
+    /// All transactions within the rolling window
+    pub transactions: Vec<FlowTransaction>,
+    /// Cached 24h deposit total (recalculated on access)
+    pub cached_deposit_24h: u64,
+    /// Cached 24h withdrawal total (recalculated on access)
+    pub cached_withdrawal_24h: u64,
+    /// Last recalculation timestamp
+    pub last_recalc: u64,
+}
+
+impl UserFlow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Prune expired transactions and recalculate totals
+    pub fn recalculate(&mut self, now: u64) {
+        const WINDOW_SECS: u64 = 86400; // 24 hours
+        
+        // Remove transactions older than 24h
+        self.transactions.retain(|tx| now.saturating_sub(tx.timestamp) < WINDOW_SECS);
+        
+        // Recalculate totals
+        self.cached_deposit_24h = self.transactions.iter()
+            .filter(|tx| tx.direction == FlowDirection::Deposit)
+            .map(|tx| tx.amount_sompi)
+            .sum();
+        
+        self.cached_withdrawal_24h = self.transactions.iter()
+            .filter(|tx| tx.direction == FlowDirection::Withdrawal)
+            .map(|tx| tx.amount_sompi)
+            .sum();
+        
+        self.last_recalc = now;
+    }
+    
+    /// Get current 24h deposit total
+    pub fn deposit_total_24h(&mut self, now: u64) -> u64 {
+        if now.saturating_sub(self.last_recalc) > 60 {
+            self.recalculate(now);
+        }
+        self.cached_deposit_24h
+    }
+    
+    /// Get current 24h withdrawal total
+    pub fn withdrawal_total_24h(&mut self, now: u64) -> u64 {
+        if now.saturating_sub(self.last_recalc) > 60 {
+            self.recalculate(now);
+        }
+        self.cached_withdrawal_24h
+    }
+    
+    /// Check if deposit is allowed under rolling 24h limit
+    pub fn can_deposit(&mut self, amount: u64, max_24h: u64, now: u64) -> Result<(), String> {
+        let current = self.deposit_total_24h(now);
+        let new_total = current.saturating_add(amount);
+        
+        if new_total > max_24h {
+            return Err(format!(
+                "Deposit would exceed 24h limit: ${:.2} + ${:.2} > ${:.2} USD",
+                current as f64 / 100_000_000.0 * 0.12,
+                amount as f64 / 100_000_000.0 * 0.12,
+                max_24h as f64 / 100_000_000.0 * 0.12
+            ));
+        }
+        Ok(())
+    }
+    
+    /// Check if withdrawal is allowed under rolling 24h limit
+    pub fn can_withdraw(&mut self, amount: u64, max_24h: u64, now: u64) -> Result<(), String> {
+        let current = self.withdrawal_total_24h(now);
+        let new_total = current.saturating_add(amount);
+        
+        if new_total > max_24h {
+            return Err(format!(
+                "Withdrawal would exceed 24h limit: ${:.2} + ${:.2} > ${:.2} USD",
+                current as f64 / 100_000_000.0 * 0.12,
+                amount as f64 / 100_000_000.0 * 0.12,
+                max_24h as f64 / 100_000_000.0 * 0.12
+            ));
+        }
+        Ok(())
+    }
+    
+    /// Record a deposit
+    pub fn record_deposit(&mut self, amount: u64, now: u64) {
+        self.transactions.push(FlowTransaction {
+            amount_sompi: amount,
+            timestamp: now,
+            direction: FlowDirection::Deposit,
+        });
+        self.recalculate(now);
+    }
+    
+    /// Record a withdrawal
+    pub fn record_withdrawal(&mut self, amount: u64, now: u64) {
+        self.transactions.push(FlowTransaction {
+            amount_sompi: amount,
+            timestamp: now,
+            direction: FlowDirection::Withdrawal,
+        });
+        self.recalculate(now);
+    }
+}
+
+/// Global flow tracker for all users
+#[derive(Clone, Debug, Default)]
+pub struct UserFlowTracker {
+    /// Per-user flow tracking (keyed by pubkey string)
+    pub users: std::collections::HashMap<String, UserFlow>,
+    /// Per-transaction cap (1k USD in sompi at reference price)  
+    pub max_single_tx_sompi: u64,
+    /// 24h rolling cap per user (1k USD in sompi at reference price)
+    pub max_24h_per_user_sompi: u64,
+    /// Per-user max balance cap: 100,000 KAS (fixed, not USD-based)
+    /// Users with balance >= this must withdraw before depositing more
+    pub max_user_balance_sompi: u64,
+}
+
+/// Maximum individual apartment balance: 100,000 KAS
+/// This is a fixed KAS amount, not USD-denominated
+/// Provides HODL protection while keeping users in retail category
+pub const MAX_APARTMENT_BALANCE_KAS: u64 = 100_000;
+pub const MAX_APARTMENT_BALANCE_SOMPI: u64 = MAX_APARTMENT_BALANCE_KAS * 100_000_000;
+
+impl UserFlowTracker {
+    /// Create with USD limits (converted to sompi at given KAS price)
+    pub fn new_with_limits(kas_price: f64) -> Self {
+        // Convert USD limits to sompi
+        let sompi_per_usd = (100_000_000.0 / kas_price) as u64;
+        
+        Self {
+            users: std::collections::HashMap::new(),
+            max_single_tx_sompi: 1_000 * sompi_per_usd,       // $1,000 per tx
+            max_24h_per_user_sompi: 1_000 * sompi_per_usd,    // $1,000 per 24h per user
+            max_user_balance_sompi: MAX_APARTMENT_BALANCE_SOMPI, // 100,000 KAS fixed
+        }
+    }
+    
+    /// Update limits based on current KAS price (balance cap stays fixed in KAS)
+    pub fn update_limits(&mut self, kas_price: f64) {
+        let sompi_per_usd = (100_000_000.0 / kas_price) as u64;
+        self.max_single_tx_sompi = 1_000 * sompi_per_usd;
+        self.max_24h_per_user_sompi = 1_000 * sompi_per_usd;
+        // max_user_balance_sompi stays fixed at 100,000 KAS
+    }
+    
+    /// Check if user can deposit (single tx + 24h rolling)
+    pub fn check_deposit(&mut self, pubkey: &str, amount: u64, now: u64, kas_price: f64) -> Result<(), String> {
+        self.update_limits(kas_price);
+        
+        // Check single transaction limit
+        if amount > self.max_single_tx_sompi {
+            return Err(format!(
+                "Single deposit exceeds $1000 USD limit ({:.2} KAS @ ${:.4})",
+                amount as f64 / 100_000_000.0, kas_price
+            ));
+        }
+        
+        // Check 24h rolling limit
+        let user_flow = self.users.entry(pubkey.to_string()).or_default();
+        user_flow.can_deposit(amount, self.max_24h_per_user_sompi, now)?;
+        
+        Ok(())
+    }
+    
+    /// Check if user can withdraw (single tx + 24h rolling)
+    pub fn check_withdrawal(&mut self, pubkey: &str, amount: u64, now: u64, kas_price: f64) -> Result<(), String> {
+        self.update_limits(kas_price);
+        
+        // Check single transaction limit
+        if amount > self.max_single_tx_sompi {
+            return Err(format!(
+                "Single withdrawal exceeds $1000 USD limit ({:.2} KAS @ ${:.4})",
+                amount as f64 / 100_000_000.0, kas_price
+            ));
+        }
+        
+        // Check 24h rolling limit
+        let user_flow = self.users.entry(pubkey.to_string()).or_default();
+        user_flow.can_withdraw(amount, self.max_24h_per_user_sompi, now)?;
+        
+        Ok(())
+    }
+    
+    /// Record successful deposit
+    pub fn record_deposit(&mut self, pubkey: &str, amount: u64, now: u64) {
+        let user_flow = self.users.entry(pubkey.to_string()).or_default();
+        user_flow.record_deposit(amount, now);
+    }
+    
+    /// Record successful withdrawal
+    pub fn record_withdrawal(&mut self, pubkey: &str, amount: u64, now: u64) {
+        let user_flow = self.users.entry(pubkey.to_string()).or_default();
+        user_flow.record_withdrawal(amount, now);
+    }
+    
+    /// Get user's remaining 24h deposit capacity
+    pub fn remaining_deposit_capacity(&mut self, pubkey: &str, now: u64, kas_price: f64) -> u64 {
+        self.update_limits(kas_price);
+        let user_flow = self.users.entry(pubkey.to_string()).or_default();
+        let used = user_flow.deposit_total_24h(now);
+        self.max_24h_per_user_sompi.saturating_sub(used)
+    }
+    
+    /// Get user's remaining 24h withdrawal capacity
+    pub fn remaining_withdrawal_capacity(&mut self, pubkey: &str, now: u64, kas_price: f64) -> u64 {
+        self.update_limits(kas_price);
+        let user_flow = self.users.entry(pubkey.to_string()).or_default();
+        let used = user_flow.withdrawal_total_24h(now);
+        self.max_24h_per_user_sompi.saturating_sub(used)
+    }
+}
+
 /// Entry 178 — Drainage Detection
 #[derive(Clone, Debug)]
 pub struct DrainageDetector {
@@ -48463,6 +48700,8 @@ pub struct FrontendAppState {
     pub frost_kaspa_address: String,
     // NEW: Direct access to sanctions database for handshake endpoint
     pub sanctions_state: Arc<RwLock<SanctionsDatabase>>,
+    // NEW: 24h rolling flow tracker for compliance
+    pub flow_tracker: Arc<RwLock<UserFlowTracker>>,
 }
 
 impl FrontendAppState {
@@ -48491,6 +48730,7 @@ impl FrontendAppState {
             frost_group_pubkey: group_pubkey,
             frost_kaspa_address,
             sanctions_state: Arc::new(RwLock::new(SanctionsDatabase::default())),
+            flow_tracker: Arc::new(RwLock::new(UserFlowTracker::new_with_limits(0.12))),
         }
     }
 
@@ -48540,6 +48780,7 @@ impl FrontendAppState {
             frost_group_pubkey: group_pubkey,
             frost_kaspa_address,
             sanctions_state: Arc::new(RwLock::new(sanctions_db)),
+            flow_tracker: Arc::new(RwLock::new(UserFlowTracker::new_with_limits(0.12))),
         }
     }
 
@@ -49042,20 +49283,27 @@ pub async fn api_withdrawal_submit(
     
     // Fetch current KAS price for cap calculation
     let kas_price = fetch_kas_price_coingecko().await.unwrap_or(0.12);
-    let max_withdrawal_sompi = get_max_withdrawal_sompi(kas_price);
+    let now = current_timestamp();
     
-    // Check $1000 USD withdrawal cap
-    if req.amount_sompi > max_withdrawal_sompi {
-        return HttpResponse::BadRequest().json(WithdrawalSubmitResponse {
-            success: false,
-            request_id: 0,
-            submitted_at: 0,
-            unlocks_at: 0,
-            l1_block_submitted: 0,
-            seconds_remaining: 0,
-            error: Some(format!("Withdrawal exceeds $1000 USD limit ({:.2} KAS @ ${:.4})", 
-                max_withdrawal_sompi as f64 / 100_000_000.0, kas_price)),
-        });
+    // CHECK PER-USER 24H ROLLING WITHDRAWAL LIMIT
+    {
+        let mut tracker = state.flow_tracker.write().await;
+        
+        if let Err(e) = tracker.check_withdrawal(&req.user_pubkey, req.amount_sompi, now, kas_price) {
+            let remaining = tracker.remaining_withdrawal_capacity(&req.user_pubkey, now, kas_price);
+            return HttpResponse::BadRequest().json(WithdrawalSubmitResponse {
+                success: false,
+                request_id: 0,
+                submitted_at: 0,
+                unlocks_at: 0,
+                l1_block_submitted: 0,
+                seconds_remaining: 0,
+                error: Some(format!("{}. Remaining 24h capacity: {:.2} KAS (${:.2} USD)", 
+                    e, 
+                    remaining as f64 / 100_000_000.0,
+                    remaining as f64 / 100_000_000.0 * kas_price)),
+            });
+        }
     }
     
     // Check circuit breaker
@@ -49144,6 +49392,12 @@ pub async fn api_withdrawal_submit(
     };
     
     inner.pending_withdrawals.insert(request_id, pending);
+    
+    // Record successful withdrawal in flow tracker for 24h rolling limit
+    {
+        let mut tracker = state.flow_tracker.write().await;
+        tracker.record_withdrawal(&req.user_pubkey, req.amount_sompi, now);
+    }
     
     HttpResponse::Ok().json(WithdrawalSubmitResponse {
         success: true,
@@ -49550,7 +49804,7 @@ pub async fn api_get_frost_wallet(
     }))
 }
 
-/// POST /api/frost/deposit - Deposit to communal wallet
+/// POST /api/frost/deposit - Deposit to communal wallet with 24h rolling limits
 pub async fn api_frost_deposit(
     state: web::Data<FrontendAppState>,
     req: web::Json<serde_json::Value>,
@@ -49561,12 +49815,13 @@ pub async fn api_frost_deposit(
     
     let source_address = req.get("user_pubkey")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     
-    if amount == 0 {
+    if amount == 0 || source_address.is_empty() {
         return HttpResponse::BadRequest().json(serde_json::json!({
             "success": false,
-            "error": "Invalid amount"
+            "error": "Invalid amount or missing user_pubkey"
         }));
     }
     
@@ -49583,46 +49838,136 @@ pub async fn api_frost_deposit(
     
     // Fetch current KAS price
     let kas_price = fetch_kas_price_coingecko().await.unwrap_or(0.12);
-    let max_deposit_usd = 1000.0;
+    let now = current_timestamp();
     
-    // Check if CURRENT balance already exceeds $1000 USD (price rise scenario)
-    let wallet = state.frost_wallet.read().await;
-    let current_balance_usd = (wallet.balance as f64 / 100_000_000.0) * kas_price;
-    
-    if current_balance_usd > max_deposit_usd {
-        return HttpResponse::BadRequest().json(serde_json::json!({
-            "success": false,
-            "error": format!(
-                "Balance limit exceeded: ${:.2} USD > ${:.2} USD. Withdraw KASPA before depositing more.",
-                current_balance_usd, max_deposit_usd
-            )
-        }));
-    }
-    drop(wallet);
-    
-    // Check if this new deposit amount exceeds $1000 USD
-    let max_deposit_sompi = get_max_deposit_sompi(kas_price);
-    
-    if amount > max_deposit_sompi {
-        return HttpResponse::BadRequest().json(serde_json::json!({
-            "success": false,
-            "error": format!("Deposit exceeds $1000 USD limit ({:.2} KAS @ ${:.4})", 
-                max_deposit_sompi as f64 / 100_000_000.0, kas_price)
-        }));
+    // CHECK USER BALANCE CAP: Individual apartments capped at 100,000 KAS
+    // This is enforced here as a safety valve; frontend should also enforce
+    {
+        let inner = state.inner.read().await;
+        if let Some(user) = inner.users.get(&source_address) {
+            let current_balance = user.balance_sompi;
+            let new_balance = current_balance.saturating_add(amount);
+            
+            if new_balance > MAX_APARTMENT_BALANCE_SOMPI {
+                return HttpResponse::BadRequest().json(serde_json::json!({
+                    "success": false,
+                    "error": format!(
+                        "Apartment balance would exceed 100,000 KAS limit. Current: {:.2} KAS, Deposit: {:.2} KAS, Max: 100,000 KAS. Please withdraw before depositing more.",
+                        current_balance as f64 / 100_000_000.0,
+                        amount as f64 / 100_000_000.0
+                    ),
+                    "current_balance_kas": current_balance as f64 / 100_000_000.0,
+                    "max_balance_kas": MAX_APARTMENT_BALANCE_KAS,
+                    "must_withdraw_kas": new_balance.saturating_sub(MAX_APARTMENT_BALANCE_SOMPI) as f64 / 100_000_000.0
+                }));
+            }
+        }
     }
     
+    // CHECK PER-USER 24H ROLLING LIMIT
+    {
+        let mut tracker = state.flow_tracker.write().await;
+        
+        if let Err(e) = tracker.check_deposit(&source_address, amount, now, kas_price) {
+            let remaining = tracker.remaining_deposit_capacity(&source_address, now, kas_price);
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "success": false,
+                "error": e,
+                "remaining_24h_sompi": remaining,
+                "remaining_24h_kas": remaining as f64 / 100_000_000.0,
+                "remaining_24h_usd": remaining as f64 / 100_000_000.0 * kas_price
+            }));
+        }
+    }
+    
+    // Execute deposit
     let mut wallet = state.frost_wallet.write().await;
     match wallet.deposit(amount) {
-        Ok(()) => HttpResponse::Ok().json(serde_json::json!({
-            "success": true,
-            "new_balance_sompi": wallet.balance,
-            "new_balance_kas": wallet.balance as f64 / SOMPI_PER_KAS as f64,
-        })),
+        Ok(()) => {
+            // Record successful deposit in flow tracker
+            let mut tracker = state.flow_tracker.write().await;
+            tracker.record_deposit(&source_address, amount, now);
+            let remaining = tracker.remaining_deposit_capacity(&source_address, now, kas_price);
+            
+            HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "new_balance_sompi": wallet.balance,
+                "new_balance_kas": wallet.balance as f64 / SOMPI_PER_KAS as f64,
+                "remaining_24h_deposit_sompi": remaining,
+                "remaining_24h_deposit_kas": remaining as f64 / 100_000_000.0,
+                "remaining_24h_deposit_usd": remaining as f64 / 100_000_000.0 * kas_price
+            }))
+        },
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({
             "success": false,
             "error": e
         })),
     }
+}
+
+/// GET /api/frost/capacity/{pubkey} - Get user's remaining 24h flow capacity
+pub async fn api_get_flow_capacity(
+    state: web::Data<FrontendAppState>,
+    pubkey: web::Path<String>,
+) -> impl Responder {
+    let kas_price = fetch_kas_price_coingecko().await.unwrap_or(0.12);
+    let now = current_timestamp();
+    
+    let mut tracker = state.flow_tracker.write().await;
+    
+    let deposit_remaining = tracker.remaining_deposit_capacity(&pubkey, now, kas_price);
+    let withdrawal_remaining = tracker.remaining_withdrawal_capacity(&pubkey, now, kas_price);
+    
+    // Get user's current 24h totals
+    let user_flow = tracker.users.entry(pubkey.to_string()).or_default();
+    let deposit_used = user_flow.deposit_total_24h(now);
+    let withdrawal_used = user_flow.withdrawal_total_24h(now);
+    
+    // Get user's current balance for apartment cap check
+    let inner = state.inner.read().await;
+    let (current_balance, balance_remaining) = if let Some(user) = inner.users.get(pubkey.as_str()) {
+        let bal = user.balance_sompi;
+        let remaining = MAX_APARTMENT_BALANCE_SOMPI.saturating_sub(bal);
+        (bal, remaining)
+    } else {
+        (0, MAX_APARTMENT_BALANCE_SOMPI)
+    };
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "pubkey": pubkey.as_str(),
+        "kas_price_usd": kas_price,
+        "limits": {
+            "single_tx_usd": 1000.0,
+            "daily_usd": 1000.0,
+            "apartment_cap_kas": MAX_APARTMENT_BALANCE_KAS,
+            "system_tvl": "unlimited"
+        },
+        "apartment": {
+            "current_balance_sompi": current_balance,
+            "current_balance_kas": current_balance as f64 / 100_000_000.0,
+            "max_balance_kas": MAX_APARTMENT_BALANCE_KAS,
+            "remaining_capacity_sompi": balance_remaining,
+            "remaining_capacity_kas": balance_remaining as f64 / 100_000_000.0,
+            "at_capacity": current_balance >= MAX_APARTMENT_BALANCE_SOMPI
+        },
+        "deposit": {
+            "used_24h_sompi": deposit_used,
+            "used_24h_kas": deposit_used as f64 / 100_000_000.0,
+            "used_24h_usd": deposit_used as f64 / 100_000_000.0 * kas_price,
+            "remaining_sompi": deposit_remaining,
+            "remaining_kas": deposit_remaining as f64 / 100_000_000.0,
+            "remaining_usd": deposit_remaining as f64 / 100_000_000.0 * kas_price
+        },
+        "withdrawal": {
+            "used_24h_sompi": withdrawal_used,
+            "used_24h_kas": withdrawal_used as f64 / 100_000_000.0,
+            "used_24h_usd": withdrawal_used as f64 / 100_000_000.0 * kas_price,
+            "remaining_sompi": withdrawal_remaining,
+            "remaining_kas": withdrawal_remaining as f64 / 100_000_000.0,
+            "remaining_usd": withdrawal_remaining as f64 / 100_000_000.0 * kas_price
+        },
+        "timestamp": now
+    }))
 }
 
 /// Configure all frontend API routes - WITH XP ENDPOINTS
@@ -49645,6 +49990,7 @@ pub fn configure_frontend_api(cfg: &mut web::ServiceConfig) {
             // FROST wallet endpoints
             .route("/frost/wallet", web::get().to(api_get_frost_wallet))
             .route("/frost/deposit", web::post().to(api_frost_deposit))
+            .route("/frost/capacity/{pubkey}", web::get().to(api_get_flow_capacity))
             // NEW: Sanctions handshake for pre-flight checks
             .route("/sanctions/handshake", web::post().to(api_sanctions_handshake))
             .route("/sanctions/check", web::post().to(api_sanctions_handshake))
@@ -57040,3 +57386,311 @@ pub async fn api_consignment_confirm_receipt(state: web::Data<AppState>, req: we
 // ============================================================================
 // END MISSING ENDPOINT HANDLERS
 // ============================================================================
+
+// ============================================================================
+// TESTS: 24-HOUR ROLLING FLOW TRACKER (COMPLIANCE PATCH)
+// ============================================================================
+#[cfg(test)]
+mod tests_rolling_flow_limits {
+    use super::*;
+    
+    const SOMPI_PER_KAS_TEST: u64 = 100_000_000;
+    const TEST_KAS_PRICE: f64 = 0.12;
+    
+    fn test_pubkey() -> String {
+        "03a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string()
+    }
+    
+    /// Convert USD to sompi using same method as tracker (to avoid float mismatch)
+    fn sompi_for_usd_tracker_style(usd: u64, kas_price: f64) -> u64 {
+        let sompi_per_usd = (100_000_000.0 / kas_price) as u64;
+        usd * sompi_per_usd
+    }
+    
+    #[test]
+    fn test_user_flow_single_deposit() {
+        let mut flow = UserFlow::new();
+        let now = 1000000u64;
+        let amount = sompi_for_usd_tracker_style(500, TEST_KAS_PRICE);
+        let max_24h = sompi_for_usd_tracker_style(1000, TEST_KAS_PRICE);
+        
+        // Should allow $500 deposit
+        assert!(flow.can_deposit(amount, max_24h, now).is_ok());
+        
+        flow.record_deposit(amount, now);
+        
+        // Should show $500 used
+        assert_eq!(flow.deposit_total_24h(now), amount);
+    }
+    
+    #[test]
+    fn test_user_flow_blocks_over_limit() {
+        let mut flow = UserFlow::new();
+        let now = 1000000u64;
+        let max_24h = sompi_for_usd_tracker_style(1000, TEST_KAS_PRICE);
+        
+        // Deposit $999
+        let first = sompi_for_usd_tracker_style(999, TEST_KAS_PRICE);
+        flow.record_deposit(first, now);
+        
+        // Try to deposit another $999 (structuring attempt)
+        let second = sompi_for_usd_tracker_style(999, TEST_KAS_PRICE);
+        assert!(flow.can_deposit(second, max_24h, now + 1).is_err());
+    }
+    
+    #[test]
+    fn test_rolling_window_expires() {
+        let mut flow = UserFlow::new();
+        let now = 1000000u64;
+        let max_24h = sompi_for_usd_tracker_style(1000, TEST_KAS_PRICE);
+        
+        // Deposit $999
+        let amount = sompi_for_usd_tracker_style(999, TEST_KAS_PRICE);
+        flow.record_deposit(amount, now);
+        
+        // Can't deposit more now
+        assert!(flow.can_deposit(amount, max_24h, now + 100).is_err());
+        
+        // After 24h + 1 sec, limit should reset
+        let after_24h = now + 86401;
+        assert!(flow.can_deposit(amount, max_24h, after_24h).is_ok());
+        
+        // Verify old transaction expired
+        assert_eq!(flow.deposit_total_24h(after_24h), 0);
+    }
+    
+    #[test]
+    fn test_tracker_multiple_users() {
+        let mut tracker = UserFlowTracker::new_with_limits(TEST_KAS_PRICE);
+        let now = 1000000u64;
+        
+        let user1 = "user1_pubkey".to_string();
+        let user2 = "user2_pubkey".to_string();
+        
+        let amount = sompi_for_usd_tracker_style(800, TEST_KAS_PRICE);
+        
+        // Both users should be able to deposit $800
+        assert!(tracker.check_deposit(&user1, amount, now, TEST_KAS_PRICE).is_ok());
+        tracker.record_deposit(&user1, amount, now);
+        
+        assert!(tracker.check_deposit(&user2, amount, now, TEST_KAS_PRICE).is_ok());
+        tracker.record_deposit(&user2, amount, now);
+        
+        // User1 can't deposit another $800
+        assert!(tracker.check_deposit(&user1, amount, now + 1, TEST_KAS_PRICE).is_err());
+        
+        // User2 can't deposit another $800
+        assert!(tracker.check_deposit(&user2, amount, now + 1, TEST_KAS_PRICE).is_err());
+        
+        // But User1 can deposit $199
+        let small = sompi_for_usd_tracker_style(199, TEST_KAS_PRICE);
+        assert!(tracker.check_deposit(&user1, small, now + 1, TEST_KAS_PRICE).is_ok());
+    }
+    
+    #[test]
+    fn test_single_tx_limit() {
+        let mut tracker = UserFlowTracker::new_with_limits(TEST_KAS_PRICE);
+        let now = 1000000u64;
+        let user = "test_user".to_string();
+        
+        // Single deposit > $1000 should fail
+        let over_limit = sompi_for_usd_tracker_style(1001, TEST_KAS_PRICE);
+        assert!(tracker.check_deposit(&user, over_limit, now, TEST_KAS_PRICE).is_err());
+        
+        // Single deposit = $999 should succeed (use 999 to avoid edge case)
+        let under_limit = sompi_for_usd_tracker_style(999, TEST_KAS_PRICE);
+        assert!(tracker.check_deposit(&user, under_limit, now, TEST_KAS_PRICE).is_ok());
+    }
+    
+    #[test]
+    fn test_withdrawal_tracking() {
+        let mut tracker = UserFlowTracker::new_with_limits(TEST_KAS_PRICE);
+        let now = 1000000u64;
+        let user = "test_user".to_string();
+        
+        let amount = sompi_for_usd_tracker_style(400, TEST_KAS_PRICE);
+        
+        // First withdrawal should work
+        assert!(tracker.check_withdrawal(&user, amount, now, TEST_KAS_PRICE).is_ok());
+        tracker.record_withdrawal(&user, amount, now);
+        
+        // Second withdrawal should work (total $800)
+        assert!(tracker.check_withdrawal(&user, amount, now + 1, TEST_KAS_PRICE).is_ok());
+        tracker.record_withdrawal(&user, amount, now + 1);
+        
+        // Third withdrawal would be $1200 total - should fail
+        assert!(tracker.check_withdrawal(&user, amount, now + 2, TEST_KAS_PRICE).is_err());
+    }
+    
+    #[test]
+    fn test_remaining_capacity() {
+        let mut tracker = UserFlowTracker::new_with_limits(TEST_KAS_PRICE);
+        let now = 1000000u64;
+        let user = "test_user".to_string();
+        
+        // Full capacity initially matches tracker's calculation
+        let initial = tracker.remaining_deposit_capacity(&user, now, TEST_KAS_PRICE);
+        assert_eq!(initial, tracker.max_24h_per_user_sompi);
+        
+        // After $600 deposit
+        let deposit = sompi_for_usd_tracker_style(600, TEST_KAS_PRICE);
+        tracker.record_deposit(&user, deposit, now);
+        
+        let remaining = tracker.remaining_deposit_capacity(&user, now + 1, TEST_KAS_PRICE);
+        let expected = tracker.max_24h_per_user_sompi - deposit;
+        
+        assert_eq!(remaining, expected);
+    }
+    
+    #[test]
+    fn test_deposits_and_withdrawals_independent() {
+        let mut tracker = UserFlowTracker::new_with_limits(TEST_KAS_PRICE);
+        let now = 1000000u64;
+        let user = "test_user".to_string();
+        
+        // Max out deposits with $999 (under limit to avoid edge case)
+        let max_amount = sompi_for_usd_tracker_style(999, TEST_KAS_PRICE);
+        tracker.record_deposit(&user, max_amount, now);
+        
+        // Should still be able to withdraw (separate limit)
+        assert!(tracker.check_withdrawal(&user, max_amount, now, TEST_KAS_PRICE).is_ok());
+        
+        // Deposit limit nearly exhausted - only $1 left
+        let small = sompi_for_usd_tracker_style(2, TEST_KAS_PRICE);
+        assert!(tracker.check_deposit(&user, small, now + 1, TEST_KAS_PRICE).is_err());
+    }
+    
+    #[test]
+    fn test_price_update_affects_limits() {
+        let mut tracker = UserFlowTracker::new_with_limits(0.10); // $0.10/KAS
+        
+        // At $0.10, $1000 = 10,000 KAS
+        let low_price_limit = tracker.max_single_tx_sompi;
+        
+        // Update to $0.20
+        tracker.update_limits(0.20);
+        let high_price_limit = tracker.max_single_tx_sompi;
+        
+        // Higher price = fewer sompi for same USD value
+        assert!(high_price_limit < low_price_limit);
+        assert_eq!(high_price_limit, low_price_limit / 2);
+    }
+    
+    #[test]
+    fn test_anti_structuring_rapid_deposits() {
+        let mut tracker = UserFlowTracker::new_with_limits(TEST_KAS_PRICE);
+        let now = 1000000u64;
+        let user = "structurer".to_string();
+        
+        // Try to structure: 4 x $200 deposits (total $800)
+        let small = sompi_for_usd_tracker_style(200, TEST_KAS_PRICE);
+        
+        for i in 0..4u64 {
+            assert!(tracker.check_deposit(&user, small, now + i, TEST_KAS_PRICE).is_ok(),
+                "Deposit {} should succeed", i + 1);
+            tracker.record_deposit(&user, small, now + i);
+        }
+        
+        // 5th deposit of $200 would be $1000 total - should work
+        assert!(tracker.check_deposit(&user, small, now + 4, TEST_KAS_PRICE).is_ok());
+        tracker.record_deposit(&user, small, now + 4);
+        
+        // 6th deposit should fail (would exceed $1000)
+        assert!(tracker.check_deposit(&user, small, now + 5, TEST_KAS_PRICE).is_err(),
+            "6th deposit should fail - structuring blocked");
+    }
+}
+
+// ============================================================================
+// TESTS: FLOW DIRECTION SERIALIZATION
+// ============================================================================
+#[cfg(test)]
+mod tests_flow_serialization {
+    use super::*;
+    
+    #[test]
+    fn test_flow_direction_equality() {
+        assert_eq!(FlowDirection::Deposit, FlowDirection::Deposit);
+        assert_eq!(FlowDirection::Withdrawal, FlowDirection::Withdrawal);
+        assert_ne!(FlowDirection::Deposit, FlowDirection::Withdrawal);
+    }
+    
+    #[test]
+    fn test_flow_transaction_serialize() {
+        let tx = FlowTransaction {
+            amount_sompi: 100_000_000,
+            timestamp: 1700000000,
+            direction: FlowDirection::Deposit,
+        };
+        
+        let json = serde_json::to_string(&tx).expect("serialize");
+        assert!(json.contains("100000000"));
+        assert!(json.contains("Deposit"));
+        
+        let parsed: FlowTransaction = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.amount_sompi, tx.amount_sompi);
+        assert_eq!(parsed.direction, FlowDirection::Deposit);
+    }
+}
+
+// ============================================================================
+// TESTS: APARTMENT BALANCE CAP (100,000 KAS)
+// ============================================================================
+#[cfg(test)]
+mod tests_apartment_cap {
+    use super::*;
+    
+    #[test]
+    fn test_apartment_cap_constants() {
+        // 100,000 KAS = 10,000,000,000,000 sompi (10 trillion)
+        assert_eq!(MAX_APARTMENT_BALANCE_KAS, 100_000);
+        assert_eq!(MAX_APARTMENT_BALANCE_SOMPI, 100_000 * 100_000_000);
+        assert_eq!(MAX_APARTMENT_BALANCE_SOMPI, 10_000_000_000_000);
+    }
+    
+    #[test]
+    fn test_tracker_has_apartment_cap() {
+        let tracker = UserFlowTracker::new_with_limits(0.12);
+        assert_eq!(tracker.max_user_balance_sompi, MAX_APARTMENT_BALANCE_SOMPI);
+    }
+    
+    #[test]
+    fn test_apartment_cap_independent_of_price() {
+        // Cap is in KAS, not USD - should not change with price
+        let mut tracker = UserFlowTracker::new_with_limits(0.10);
+        let cap_at_10_cents = tracker.max_user_balance_sompi;
+        
+        tracker.update_limits(1.00); // 10x price increase
+        let cap_at_1_dollar = tracker.max_user_balance_sompi;
+        
+        // Apartment cap stays same (100k KAS)
+        assert_eq!(cap_at_10_cents, cap_at_1_dollar);
+        assert_eq!(cap_at_1_dollar, MAX_APARTMENT_BALANCE_SOMPI);
+        
+        // But per-tx USD limits should change
+        let mut tracker_low = UserFlowTracker::new_with_limits(0.10);
+        let mut tracker_high = UserFlowTracker::new_with_limits(1.00);
+        
+        // At $0.10, $1000 = 10,000 KAS
+        // At $1.00, $1000 = 1,000 KAS
+        assert!(tracker_low.max_single_tx_sompi > tracker_high.max_single_tx_sompi);
+    }
+    
+    #[test]
+    fn test_apartment_cap_hodl_protection() {
+        // Scenario: User deposits 50k KAS at $0.10 ($5,000 value)
+        // Price rises to $1.00 (now worth $50,000)
+        // User should NOT be forced to withdraw due to USD value increase
+        // Because cap is in KAS, not USD
+        
+        let initial_deposit_kas: u64 = 50_000;
+        let initial_deposit_sompi = initial_deposit_kas * 100_000_000;
+        
+        // At any price, 50k KAS < 100k KAS cap
+        assert!(initial_deposit_sompi < MAX_APARTMENT_BALANCE_SOMPI);
+        
+        // User can still deposit up to 50k more KAS regardless of USD price
+        let remaining = MAX_APARTMENT_BALANCE_SOMPI - initial_deposit_sompi;
+        assert_eq!(remaining, 50_000 * 100_000_000);
+    }
+}

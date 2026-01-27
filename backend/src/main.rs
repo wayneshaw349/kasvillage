@@ -19115,25 +19115,35 @@ pub async fn start_api_server(
     let ledger = Arc::new(RwLock::new(NonCustodialLedger::new()));
 
     // ========================================================================
-    // KASPA L1 NODE - Self-hosted (Flux) or public API
+    // KASPA L1 NODE - Self-hosted (Flux) or public API (NON-BLOCKING)
     // ========================================================================
     // Configure via: KASPA_NODE_URL=ws://your-flux-node:16210
     // Or use public API if not set
+    // 
+    // IMPORTANT: This returns IMMEDIATELY - connection happens in background
+    // The API server starts without waiting for kaspad to be ready
+    let l1_state = L1ConnectionState::new();
+    
     let kaspa_node = match KaspaFluxNode::from_env_async().await {
-        Ok(node) => Arc::new(node),
+        Ok(node) => {
+            let node = Arc::new(node);
+            // 🚀 SPAWN BACKGROUND L1 MONITOR - Connects without blocking API
+            KaspaFluxNode::spawn_l1_monitor(node.clone(), l1_state.clone());
+            println!("[KASPA] 🚀 Background L1 monitor spawned - API server starting immediately");
+            node
+        }
         Err(e) => {
             eprintln!("[KASPA] ⚠ wRPC init failed, using HTTP fallback: {}", e);
+            l1_state.set_status(L1ConnectionStatus::FallbackApi).await;
             Arc::new(KaspaFluxNode::from_env())
         }
     };
-    // Health check the node
-    match kaspa_node.health_check().await {
-        Ok(true) => println!("[KASPA] ✓ Node connected: {}", kaspa_node.node_url()),
-        Ok(false) => eprintln!("[KASPA] ⚠ Node returned unhealthy"),
-        Err(e) => eprintln!("[KASPA] ⚠ Node health check failed: {}", e),
-    }
+    
+    // Note: We don't block on health check anymore - monitor handles this
+    println!("[KASPA] ✓ L1 node configured: {} (connection in background)", kaspa_node.node_url());
     
     let kaspa_node_data = web::Data::new(kaspa_node.clone());
+    let l1_state_data = web::Data::new(l1_state.clone());
 
     let state = web::Data::new(ServerState {
         halo2_setup: halo2_setup.clone(),
@@ -24252,6 +24262,104 @@ pub struct KaspaFluxNode {
     wrpc_client: Option<Arc<KaspaWrpcRpcClient>>, 
 }
 
+// ============================================================================
+// L1 CONNECTION STATE - Non-blocking kaspad monitoring
+// ============================================================================
+
+/// L1 connection status for frontend "Safety Meter"
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum L1ConnectionStatus {
+    /// Initial state - not yet attempted
+    Pending,
+    /// Actively trying to connect
+    Connecting,
+    /// Connected and synced
+    Connected,
+    /// Connected but node is syncing
+    Syncing { progress_percent: f64 },
+    /// Disconnected - will retry
+    Disconnected { reason: String, retry_in_secs: u64 },
+    /// Using fallback public API
+    FallbackApi,
+}
+
+impl L1ConnectionStatus {
+    pub fn is_operational(&self) -> bool {
+        matches!(self, L1ConnectionStatus::Connected | L1ConnectionStatus::FallbackApi)
+    }
+    
+    pub fn safety_level(&self) -> &'static str {
+        match self {
+            L1ConnectionStatus::Connected => "STREETS_SAFE",
+            L1ConnectionStatus::FallbackApi => "STREETS_SAFE",
+            L1ConnectionStatus::Syncing { .. } => "STREETS_CAUTION",
+            L1ConnectionStatus::Connecting => "STREETS_CAUTION",
+            L1ConnectionStatus::Pending => "STREETS_CAUTION",
+            L1ConnectionStatus::Disconnected { .. } => "STREETS_CAUTION",
+        }
+    }
+    
+    pub fn user_message(&self) -> String {
+        match self {
+            L1ConnectionStatus::Connected => "L1 Bridge Online".to_string(),
+            L1ConnectionStatus::FallbackApi => "L1 Bridge Online (Public API)".to_string(),
+            L1ConnectionStatus::Syncing { progress_percent } => 
+                format!("L1 Bridge Syncing ({:.1}%)", progress_percent),
+            L1ConnectionStatus::Connecting => "L1 Bridge Connecting...".to_string(),
+            L1ConnectionStatus::Pending => "L1 Bridge Initializing...".to_string(),
+            L1ConnectionStatus::Disconnected { reason, retry_in_secs } => 
+                format!("L1 Bridge Offline: {}. Retry in {}s", reason, retry_in_secs),
+        }
+    }
+}
+
+/// Shared L1 connection state for background worker and API
+#[derive(Clone)]
+pub struct L1ConnectionState {
+    pub status: Arc<RwLock<L1ConnectionStatus>>,
+    pub last_daa_score: Arc<RwLock<u64>>,
+    pub last_check: Arc<RwLock<u64>>,
+    pub connection_attempts: Arc<RwLock<u64>>,
+}
+
+impl Default for L1ConnectionState {
+    fn default() -> Self {
+        Self {
+            status: Arc::new(RwLock::new(L1ConnectionStatus::Pending)),
+            last_daa_score: Arc::new(RwLock::new(0)),
+            last_check: Arc::new(RwLock::new(0)),
+            connection_attempts: Arc::new(RwLock::new(0)),
+        }
+    }
+}
+
+impl L1ConnectionState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    pub async fn set_status(&self, status: L1ConnectionStatus) {
+        *self.status.write().await = status;
+        *self.last_check.write().await = current_timestamp();
+    }
+    
+    pub async fn set_connected(&self, daa_score: u64) {
+        *self.status.write().await = L1ConnectionStatus::Connected;
+        *self.last_daa_score.write().await = daa_score;
+        *self.last_check.write().await = current_timestamp();
+    }
+    
+    pub async fn get_status(&self) -> L1ConnectionStatus {
+        self.status.read().await.clone()
+    }
+    
+    pub async fn increment_attempts(&self) -> u64 {
+        let mut attempts = self.connection_attempts.write().await;
+        *attempts += 1;
+        *attempts
+    }
+}
+
 impl KaspaFluxNode {
     /// Create from environment or use public API
     pub fn from_env() -> Self {
@@ -24269,12 +24377,13 @@ impl KaspaFluxNode {
             None => Self::new_public(network),
         }
     }
-/// Create with wRPC retry loop (for Flux/self-hosted kaspad)
+/// Create with wRPC client (NON-BLOCKING - returns immediately)
+    /// Connection is established in background via spawn_l1_monitor
     pub async fn from_env_async() -> Result<Self, String> {
         let node_url = std::env::var("KASPA_NODE_URL")
             .unwrap_or_else(|_| "ws://127.0.0.1:17110".to_string());
         
-        println!("[KASPA] ⏳ Initializing wRPC client for {}", node_url);
+        println!("[KASPA] ⏳ Initializing wRPC client for {} (non-blocking)", node_url);
         
         let client = Arc::new(KaspaWrpcRpcClient::new(
             WrpcEncoding::Borsh,
@@ -24282,28 +24391,7 @@ impl KaspaFluxNode {
             None, None, None,
         ).map_err(|e| format!("Client config error: {}", e))?);
         
-        loop {
-            println!("[KASPA] ⏳ Attempting to connect to Kaspad...");
-            match client.start().await {
-                Ok(_) => {
-                    match client.get_block_dag_info().await {
-                        Ok(info) => {
-                            println!("[KASPA] ✓ Connected & Synced! (DAA Score: {})", info.virtual_daa_score);
-                            break;
-                        }
-                        Err(_) => {
-                            println!("[KASPA] ⚠ Connected, but API not responding. Retrying in 5s...");
-                            let _ = client.disconnect().await;
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("[KASPA] ❌ Connection failed: {}. Retrying in 5s...", e);
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-        
+        // Return IMMEDIATELY - connection happens in background worker
         Ok(Self {
             mode: KaspaNodeMode::SelfHosted { url: node_url.clone() },
             http_client: reqwest::Client::builder()
@@ -24313,6 +24401,87 @@ impl KaspaFluxNode {
             wrpc_url: node_url,
             wrpc_client: Some(client),
         })
+    }
+    
+    /// Spawn background L1 monitor that connects to kaspad without blocking API
+    /// This is the "Background Worker" pattern for resilient startup
+    pub fn spawn_l1_monitor(
+        kaspa_node: Arc<KaspaFluxNode>,
+        l1_state: L1ConnectionState,
+    ) {
+        tokio::spawn(async move {
+            let client = match &kaspa_node.wrpc_client {
+                Some(c) => c.clone(),
+                None => {
+                    println!("[KASPA-MONITOR] No wRPC client configured, using fallback API");
+                    l1_state.set_status(L1ConnectionStatus::FallbackApi).await;
+                    return;
+                }
+            };
+            
+            println!("[KASPA-MONITOR] 🚀 Background L1 monitor started");
+            l1_state.set_status(L1ConnectionStatus::Connecting).await;
+            
+            let mut retry_delay_secs = 5u64;
+            let max_retry_delay = 60u64;
+            
+            loop {
+                let attempt = l1_state.increment_attempts().await;
+                println!("[KASPA-MONITOR] ⏳ Connection attempt #{}", attempt);
+                
+                match client.start().await {
+                    Ok(_) => {
+                        // Connected - check if synced
+                        match client.get_block_dag_info().await {
+                            Ok(info) => {
+                                println!("[KASPA-MONITOR] ✓ Connected! DAA Score: {}", info.virtual_daa_score);
+                                l1_state.set_connected(info.virtual_daa_score).await;
+                                
+                                // Reset retry delay on success
+                                retry_delay_secs = 5;
+                                
+                                // Stay connected and monitor health
+                                loop {
+                                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                    
+                                    match client.get_block_dag_info().await {
+                                        Ok(new_info) => {
+                                            l1_state.set_connected(new_info.virtual_daa_score).await;
+                                        }
+                                        Err(e) => {
+                                            println!("[KASPA-MONITOR] ⚠ Health check failed: {}. Reconnecting...", e);
+                                            l1_state.set_status(L1ConnectionStatus::Disconnected {
+                                                reason: e.to_string(),
+                                                retry_in_secs: retry_delay_secs,
+                                            }).await;
+                                            let _ = client.disconnect().await;
+                                            break; // Exit health loop, retry connection
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("[KASPA-MONITOR] ⚠ Connected but API not responding: {}", e);
+                                l1_state.set_status(L1ConnectionStatus::Syncing { progress_percent: 0.0 }).await;
+                                let _ = client.disconnect().await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("[KASPA-MONITOR] ❌ Connection failed: {}. Retry in {}s...", e, retry_delay_secs);
+                        l1_state.set_status(L1ConnectionStatus::Disconnected {
+                            reason: e.to_string(),
+                            retry_in_secs: retry_delay_secs,
+                        }).await;
+                    }
+                }
+                
+                // Wait before retry with exponential backoff
+                tokio::time::sleep(std::time::Duration::from_secs(retry_delay_secs)).await;
+                retry_delay_secs = (retry_delay_secs * 2).min(max_retry_delay);
+                l1_state.set_status(L1ConnectionStatus::Connecting).await;
+            }
+        });
     }
     /// Connect to self-hosted kaspad via wRPC
     pub fn new_self_hosted(url: &str) -> Self {
@@ -48702,6 +48871,8 @@ pub struct FrontendAppState {
     pub sanctions_state: Arc<RwLock<SanctionsDatabase>>,
     // NEW: 24h rolling flow tracker for compliance
     pub flow_tracker: Arc<RwLock<UserFlowTracker>>,
+    // NEW: L1 connection state for non-blocking kaspad monitoring
+    pub l1_state: L1ConnectionState,
 }
 
 impl FrontendAppState {
@@ -48731,6 +48902,7 @@ impl FrontendAppState {
             frost_kaspa_address,
             sanctions_state: Arc::new(RwLock::new(SanctionsDatabase::default())),
             flow_tracker: Arc::new(RwLock::new(UserFlowTracker::new_with_limits(0.12))),
+            l1_state: L1ConnectionState::new(),
         }
     }
 
@@ -48781,6 +48953,7 @@ impl FrontendAppState {
             frost_kaspa_address,
             sanctions_state: Arc::new(RwLock::new(sanctions_db)),
             flow_tracker: Arc::new(RwLock::new(UserFlowTracker::new_with_limits(0.12))),
+            l1_state: L1ConnectionState::new(),
         }
     }
 
@@ -49970,6 +50143,33 @@ pub async fn api_get_flow_capacity(
     }))
 }
 
+/// GET /api/l1/health - L1 connection status for frontend Safety Meter
+/// Returns current kaspad connection state without blocking
+pub async fn api_l1_health(
+    state: web::Data<FrontendAppState>,
+) -> impl Responder {
+    let status = state.l1_state.get_status().await;
+    let last_daa = *state.l1_state.last_daa_score.read().await;
+    let last_check = *state.l1_state.last_check.read().await;
+    let attempts = *state.l1_state.connection_attempts.read().await;
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": format!("{:?}", status),
+        "safety_level": status.safety_level(),
+        "user_message": status.user_message(),
+        "is_operational": status.is_operational(),
+        "l1_functions_available": status.is_operational(),
+        "last_daa_score": last_daa,
+        "last_check_timestamp": last_check,
+        "connection_attempts": attempts,
+        "advice": if status.is_operational() {
+            "All L1 bridge functions are available."
+        } else {
+            "L1 bridge is temporarily offline. Your L2 funds are safe. Off-chain features remain available."
+        }
+    }))
+}
+
 /// Configure all frontend API routes - WITH XP ENDPOINTS
 pub fn configure_frontend_api(cfg: &mut web::ServiceConfig) {
     cfg.service(
@@ -49991,6 +50191,8 @@ pub fn configure_frontend_api(cfg: &mut web::ServiceConfig) {
             .route("/frost/wallet", web::get().to(api_get_frost_wallet))
             .route("/frost/deposit", web::post().to(api_frost_deposit))
             .route("/frost/capacity/{pubkey}", web::get().to(api_get_flow_capacity))
+            // L1 connection health (for Safety Meter)
+            .route("/l1/health", web::get().to(api_l1_health))
             // NEW: Sanctions handshake for pre-flight checks
             .route("/sanctions/handshake", web::post().to(api_sanctions_handshake))
             .route("/sanctions/check", web::post().to(api_sanctions_handshake))
@@ -56177,12 +56379,13 @@ impl KaspaWrpcClient {
         Self::new(&url)
     }
 
-    /// Create with wRPC retry loop (for Flux/self-hosted kaspad)
+    /// Create with wRPC client (NON-BLOCKING - returns immediately)
+    /// Use spawn_l1_monitor from KaspaFluxNode for background connection
     pub async fn from_env_async() -> Result<Self, String> {
         let node_url = std::env::var("KASPA_NODE_URL")
             .unwrap_or_else(|_| "ws://127.0.0.1:17110".to_string());
         
-        println!("[KASPA-WRPC] ⏳ Initializing wRPC client for {}", node_url);
+        println!("[KASPA-WRPC] ⏳ Initializing wRPC client for {} (non-blocking)", node_url);
         
         let client = Arc::new(KaspaWrpcRpcClient::new(
             WrpcEncoding::Borsh,
@@ -56190,28 +56393,7 @@ impl KaspaWrpcClient {
             None, None, None,
         ).map_err(|e| format!("Client config error: {}", e))?);
         
-        loop {
-            println!("[KASPA-WRPC] ⏳ Attempting to connect to Kaspad...");
-            match client.start().await {
-                Ok(_) => {
-                    match client.get_block_dag_info().await {
-                        Ok(info) => {
-                            println!("[KASPA-WRPC] ✓ Connected & Synced! (DAA Score: {})", info.virtual_daa_score);
-                            break;
-                        }
-                        Err(_) => {
-                            println!("[KASPA-WRPC] ⚠ Connected, but API not responding. Retrying in 5s...");
-                            let _ = client.disconnect().await;
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("[KASPA-WRPC] ❌ Connection failed: {}. Retrying in 5s...", e);
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-        
+        // Return IMMEDIATELY - use KaspaFluxNode::spawn_l1_monitor for background connection
         Ok(Self {
             url: node_url.clone(),
             mode: KaspaNodeMode::SelfHosted { url: node_url.clone() },
@@ -57692,5 +57874,110 @@ mod tests_apartment_cap {
         // User can still deposit up to 50k more KAS regardless of USD price
         let remaining = MAX_APARTMENT_BALANCE_SOMPI - initial_deposit_sompi;
         assert_eq!(remaining, 50_000 * 100_000_000);
+    }
+}
+
+// ============================================================================
+// TESTS: L1 CONNECTION STATE (Non-blocking kaspad monitoring)
+// ============================================================================
+#[cfg(test)]
+mod tests_l1_connection_state {
+    use super::*;
+    
+    #[test]
+    fn test_l1_status_safety_levels() {
+        assert_eq!(L1ConnectionStatus::Connected.safety_level(), "STREETS_SAFE");
+        assert_eq!(L1ConnectionStatus::FallbackApi.safety_level(), "STREETS_SAFE");
+        assert_eq!(L1ConnectionStatus::Syncing { progress_percent: 50.0 }.safety_level(), "STREETS_CAUTION");
+        assert_eq!(L1ConnectionStatus::Connecting.safety_level(), "STREETS_CAUTION");
+        assert_eq!(L1ConnectionStatus::Pending.safety_level(), "STREETS_CAUTION");
+        assert_eq!(L1ConnectionStatus::Disconnected { 
+            reason: "test".to_string(), 
+            retry_in_secs: 10 
+        }.safety_level(), "STREETS_CAUTION");
+    }
+    
+    #[test]
+    fn test_l1_status_is_operational() {
+        assert!(L1ConnectionStatus::Connected.is_operational());
+        assert!(L1ConnectionStatus::FallbackApi.is_operational());
+        assert!(!L1ConnectionStatus::Syncing { progress_percent: 50.0 }.is_operational());
+        assert!(!L1ConnectionStatus::Connecting.is_operational());
+        assert!(!L1ConnectionStatus::Pending.is_operational());
+        assert!(!L1ConnectionStatus::Disconnected { 
+            reason: "test".to_string(), 
+            retry_in_secs: 10 
+        }.is_operational());
+    }
+    
+    #[test]
+    fn test_l1_status_user_messages() {
+        assert_eq!(L1ConnectionStatus::Connected.user_message(), "L1 Bridge Online");
+        assert_eq!(L1ConnectionStatus::FallbackApi.user_message(), "L1 Bridge Online (Public API)");
+        assert!(L1ConnectionStatus::Syncing { progress_percent: 75.5 }
+            .user_message().contains("75.5%"));
+        assert_eq!(L1ConnectionStatus::Connecting.user_message(), "L1 Bridge Connecting...");
+    }
+    
+    #[test]
+    fn test_l1_connection_state_default() {
+        let state = L1ConnectionState::new();
+        // Can't easily test async in sync test, but we can verify construction
+        assert!(Arc::strong_count(&state.status) >= 1);
+        assert!(Arc::strong_count(&state.last_daa_score) >= 1);
+    }
+    
+    #[tokio::test]
+    async fn test_l1_state_set_connected() {
+        let state = L1ConnectionState::new();
+        
+        // Initial state is Pending
+        let initial = state.get_status().await;
+        assert_eq!(initial, L1ConnectionStatus::Pending);
+        
+        // Set to connected with DAA score
+        state.set_connected(12345678).await;
+        
+        let status = state.get_status().await;
+        assert_eq!(status, L1ConnectionStatus::Connected);
+        
+        let daa = *state.last_daa_score.read().await;
+        assert_eq!(daa, 12345678);
+    }
+    
+    #[tokio::test]
+    async fn test_l1_state_increment_attempts() {
+        let state = L1ConnectionState::new();
+        
+        assert_eq!(state.increment_attempts().await, 1);
+        assert_eq!(state.increment_attempts().await, 2);
+        assert_eq!(state.increment_attempts().await, 3);
+        
+        let count = *state.connection_attempts.read().await;
+        assert_eq!(count, 3);
+    }
+    
+    #[tokio::test]
+    async fn test_l1_state_status_transitions() {
+        let state = L1ConnectionState::new();
+        
+        // Pending -> Connecting
+        state.set_status(L1ConnectionStatus::Connecting).await;
+        assert_eq!(state.get_status().await, L1ConnectionStatus::Connecting);
+        
+        // Connecting -> Syncing
+        state.set_status(L1ConnectionStatus::Syncing { progress_percent: 25.0 }).await;
+        assert_eq!(state.get_status().await, L1ConnectionStatus::Syncing { progress_percent: 25.0 });
+        
+        // Syncing -> Connected
+        state.set_connected(99999999).await;
+        assert_eq!(state.get_status().await, L1ConnectionStatus::Connected);
+        
+        // Connected -> Disconnected (reconnect scenario)
+        state.set_status(L1ConnectionStatus::Disconnected {
+            reason: "Network error".to_string(),
+            retry_in_secs: 10,
+        }).await;
+        assert!(!state.get_status().await.is_operational());
     }
 }

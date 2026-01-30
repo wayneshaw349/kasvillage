@@ -127,7 +127,7 @@ use serde_json;
 use serde_json::json;
 use serde_big_array::BigArray;
 use kaspa_wrpc_client::prelude::*;
-use kaspa_wrpc_client::{KaspaRpcClient as KaspaWrpcRpcClient, WrpcEncoding};
+use kaspa_wrpc_client::{KaspaRpcClient as KaspaWrpcRpcClient, WrpcEncoding, Resolver};
 use kaspa_addresses::Address as KaspaLibAddress;
 // ============================================================================
 // FIRESTORE + REDIS IMPORTS (for Firestore integration)
@@ -24380,25 +24380,50 @@ impl KaspaFluxNode {
 /// Create with wRPC client (NON-BLOCKING - returns immediately)
     /// Connection is established in background via spawn_l1_monitor
     pub async fn from_env_async() -> Result<Self, String> {
-        let node_url = std::env::var("KASPA_NODE_URL")
-            .unwrap_or_else(|_| "ws://127.0.0.1:17110".to_string());
+        let node_url = std::env::var("KASPA_NODE_URL").ok();
+        let network = std::env::var("KASPA_NETWORK")
+            .unwrap_or_else(|_| "mainnet".to_string());
         
-        println!("[KASPA] ⏳ Initializing wRPC client for {} (non-blocking)", node_url);
-        
-        let client = Arc::new(KaspaWrpcRpcClient::new(
-            WrpcEncoding::Borsh,
-            Some(&node_url),
-            None, None, None,
-        ).map_err(|e| format!("Client config error: {}", e))?);
+        let (client, url_str) = match node_url {
+            Some(url) => {
+                println!("[KASPA] ⏳ Connecting to {} (direct)", url);
+                let c = KaspaWrpcRpcClient::new(
+                    WrpcEncoding::Borsh,
+                    Some(&url),
+                    None,  // no resolver
+                    None,  // no network_id needed for direct
+                    None,
+                ).map_err(|e| format!("Client config error: {}", e))?;
+                (Arc::new(c), url)
+            }
+            None => {
+                // Use Resolver for auto-discovery (v1.0.1 compatible)
+                println!("[KASPA] 🔍 Using Resolver for {} auto-discovery", network);
+                let network_id = match network.as_str() {
+                    "testnet-10" => NetworkId::with_suffix(NetworkType::Testnet, 10),
+                    "testnet-11" => NetworkId::with_suffix(NetworkType::Testnet, 11),
+                    _ => NetworkId::new(NetworkType::Mainnet),
+                };
+                let resolver = Resolver::default();
+                let c = KaspaWrpcRpcClient::new(
+                    WrpcEncoding::Borsh,
+                    None,  // no direct URL
+                    Some(resolver),
+                    Some(network_id),
+                    None,
+                ).map_err(|e| format!("Resolver error: {}", e))?;
+                (Arc::new(c), format!("resolver://{}", network))
+            }
+        };
         
         // Return IMMEDIATELY - connection happens in background worker
         Ok(Self {
-            mode: KaspaNodeMode::SelfHosted { url: node_url.clone() },
+            mode: KaspaNodeMode::SelfHosted { url: url_str.clone() },
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap(),
-            wrpc_url: node_url,
+            wrpc_url: url_str,
             wrpc_client: Some(client),
         })
     }
@@ -40466,9 +40491,7 @@ pub async fn start_server(config: ApiServerConfig) -> std::io::Result<()> {
         research_abstracts: Arc::new(std::sync::RwLock::new(HashMap::new())),
         research_questions: Arc::new(std::sync::RwLock::new(HashMap::new())),
         // wRPC Kaspa client
-       kaspa_wrpc: Arc::new(KaspaWrpcClient::new(
-    &std::env::var("KASPA_WRPC_URL").unwrap_or_else(|_| "ws://kaspad:17110".to_string())
-)),
+       kaspa_wrpc: Arc::new(KaspaWrpcClient::from_env()),
     });
 
     println!("Starting KasVillage L2 API server on {}:{}", config.host, config.port);
@@ -56374,34 +56397,97 @@ impl KaspaWrpcClient {
     }
 
     pub fn from_env() -> Self {
+        // Note: Sync version can't use Resolver. Use from_env_async() for auto-discovery.
+        // Falls back to aspectron public node (v1.0.1 compatible)
         let url = std::env::var("KASPA_WRPC_URL")
-            .unwrap_or_else(|_| "wss://mainnet.kaspa.org/wrpc".to_string());
+            .or_else(|_| std::env::var("KASPA_NODE_URL"))
+            .unwrap_or_else(|_| "wss://kaspa.aspectron.com/mainnet/wrpc/borsh".to_string());
         Self::new(&url)
     }
 
     /// Create with wRPC client (NON-BLOCKING - returns immediately)
     /// Use spawn_l1_monitor from KaspaFluxNode for background connection
     pub async fn from_env_async() -> Result<Self, String> {
-        let node_url = std::env::var("KASPA_NODE_URL")
-            .unwrap_or_else(|_| "ws://127.0.0.1:17110".to_string());
+        let node_url = std::env::var("KASPA_NODE_URL").ok();
+        let network = std::env::var("KASPA_NETWORK")
+            .unwrap_or_else(|_| "mainnet".to_string());
         
-        println!("[KASPA-WRPC] ⏳ Initializing wRPC client for {} (non-blocking)", node_url);
-        
-        let client = Arc::new(KaspaWrpcRpcClient::new(
-            WrpcEncoding::Borsh,
-            Some(&node_url),
-            None, None, None,
-        ).map_err(|e| format!("Client config error: {}", e))?);
+        let (client, url_str) = match node_url {
+            Some(url) => {
+                println!("[KASPA-WRPC] ⏳ Connecting to {} (direct)", url);
+                let c = KaspaWrpcRpcClient::new(
+                    WrpcEncoding::Borsh,
+                    Some(&url),
+                    None,  // no resolver
+                    None,  // no network_id needed for direct
+                    None,
+                ).map_err(|e| format!("Client config error: {}", e))?;
+                (Arc::new(c), url)
+            }
+            None => {
+                // Use Resolver for auto-discovery (v1.0.1 compatible)
+                println!("[KASPA-WRPC] 🔍 Using Resolver for {} auto-discovery", network);
+                let network_id = match network.as_str() {
+                    "testnet-10" => NetworkId::with_suffix(NetworkType::Testnet, 10),
+                    "testnet-11" => NetworkId::with_suffix(NetworkType::Testnet, 11),
+                    _ => NetworkId::new(NetworkType::Mainnet),
+                };
+                let resolver = Resolver::default();
+                let c = KaspaWrpcRpcClient::new(
+                    WrpcEncoding::Borsh,
+                    None,  // no direct URL
+                    Some(resolver),
+                    Some(network_id),
+                    None,
+                ).map_err(|e| format!("Resolver error: {}", e))?;
+                (Arc::new(c), format!("resolver://{}", network))
+            }
+        };
         
         // Return IMMEDIATELY - use KaspaFluxNode::spawn_l1_monitor for background connection
         Ok(Self {
-            url: node_url.clone(),
-            mode: KaspaNodeMode::SelfHosted { url: node_url.clone() },
+            url: url_str.clone(),
+            mode: KaspaNodeMode::SelfHosted { url: url_str.clone() },
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap(),
-            wrpc_url: node_url,
+            wrpc_url: url_str,
+            wrpc_client: Some(client),
+        })
+    }
+
+    /// Create with Resolver for auto-discovery of public nodes (RECOMMENDED)
+    /// Works with v1.0.1 stable public infrastructure
+    pub async fn from_resolver(network: &str) -> Result<Self, String> {
+        let network_id = match network {
+            "mainnet" => NetworkId::new(NetworkType::Mainnet),
+            "testnet-10" => NetworkId::with_suffix(NetworkType::Testnet, 10),
+            "testnet-11" => NetworkId::with_suffix(NetworkType::Testnet, 11),
+            _ => return Err(format!("Unknown network: {}", network)),
+        };
+        
+        println!("[KASPA-WRPC] 🔍 Using Resolver for {} auto-discovery", network);
+        
+        let resolver = Resolver::default();
+        let client = Arc::new(KaspaWrpcRpcClient::new(
+            WrpcEncoding::Borsh,
+            None,  // no direct URL
+            Some(resolver),
+            Some(network_id),
+            None,
+        ).map_err(|e| format!("Resolver client error: {}", e))?);
+        
+        let resolved_url = format!("resolver://{}", network);
+        
+        Ok(Self {
+            url: resolved_url.clone(),
+            mode: KaspaNodeMode::SelfHosted { url: resolved_url.clone() },
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            wrpc_url: resolved_url,
             wrpc_client: Some(client),
         })
     }

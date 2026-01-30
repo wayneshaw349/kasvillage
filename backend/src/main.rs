@@ -1,5 +1,5 @@
 // ============================================================================
-// KASVILLAGE L2 - COMPLETE PRODUCTION IMPLEMENTATION - God willing this works!!! 
+// KASVILLAGE L2 - COMPLETE PRODUCTION IMPLEMENTATION - God willing this works 
 // ============================================================================
 // hopefully this works
 // Single-file merged implementation containing:
@@ -24452,12 +24452,8 @@ impl KaspaFluxNode {
     ) {
         tokio::spawn(async move {
             let client = match &kaspa_node.wrpc_client {
-                Some(c) => c.clone(),
-                None => {
-                    println!("[KASPA-MONITOR] No wRPC client configured, using fallback API");
-                    l1_state.set_status(L1ConnectionStatus::FallbackApi).await;
-                    return;
-                }
+                Some(c) => Some(c.clone()),
+                None => None,
             };
             
             println!("[KASPA-MONITOR] 🚀 Background L1 monitor started");
@@ -24465,56 +24461,117 @@ impl KaspaFluxNode {
             
             let mut retry_delay_secs = 5u64;
             let max_retry_delay = 60u64;
+            let max_wrpc_attempts = 5u32;
+            let mut using_http_fallback = false;
+            let http_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default();
             
             loop {
                 let attempt = l1_state.increment_attempts().await;
                 println!("[KASPA-MONITOR] ⏳ Connection attempt #{}", attempt);
                 
-                match client.start().await {
-                    Ok(_) => {
-                        // Connected - check if synced
-                        match client.get_block_dag_info().await {
-                            Ok(info) => {
-                                println!("[KASPA-MONITOR] ✓ Connected! DAA Score: {}", info.virtual_daa_score);
-                                l1_state.set_connected(info.virtual_daa_score).await;
-                                
-                                // Reset retry delay on success
-                                retry_delay_secs = 5;
-                                
-                                // Stay connected and monitor health
-                                loop {
-                                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                // After max_wrpc_attempts, switch to HTTP REST API
+                if attempt > max_wrpc_attempts && !using_http_fallback {
+                    println!("[KASPA-MONITOR] 🔄 wRPC failed {} times, switching to HTTP REST API (kas.fyi)...", max_wrpc_attempts);
+                    using_http_fallback = true;
+                    retry_delay_secs = 5;
+                }
+                
+                if using_http_fallback {
+                    // Use kas.fyi REST API
+                    match http_client.get("https://api.kaspa.org/info/virtual-chain-blue-score")
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => {
+                            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                                if let Some(score) = json.get("blueScore").and_then(|v| v.as_u64()) {
+                                    println!("[KASPA-MONITOR] ✓ Connected via HTTP API! Blue Score: {}", score);
+                                    l1_state.set_connected(score).await;
+                                    l1_state.set_status(L1ConnectionStatus::FallbackApi).await;
+                                    retry_delay_secs = 5;
                                     
-                                    match client.get_block_dag_info().await {
-                                        Ok(new_info) => {
-                                            l1_state.set_connected(new_info.virtual_daa_score).await;
+                                    // Health check loop for HTTP
+                                    loop {
+                                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                        match http_client.get("https://api.kaspa.org/info/virtual-chain-blue-score")
+                                            .send()
+                                            .await
+                                        {
+                                            Ok(r) => {
+                                                if let Ok(j) = r.json::<serde_json::Value>().await {
+                                                    if let Some(s) = j.get("blueScore").and_then(|v| v.as_u64()) {
+                                                        l1_state.set_connected(s).await;
+                                                        continue;
+                                                    }
+                                                }
+                                                println!("[KASPA-MONITOR] ⚠ HTTP health check failed. Reconnecting...");
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                println!("[KASPA-MONITOR] ⚠ HTTP health check error: {}. Reconnecting...", e);
+                                                break;
+                                            }
                                         }
-                                        Err(e) => {
-                                            println!("[KASPA-MONITOR] ⚠ Health check failed: {}. Reconnecting...", e);
-                                            l1_state.set_status(L1ConnectionStatus::Disconnected {
-                                                reason: e.to_string(),
-                                                retry_in_secs: retry_delay_secs,
-                                            }).await;
-                                            let _ = client.disconnect().await;
-                                            break; // Exit health loop, retry connection
+                                    }
+                                } else {
+                                    println!("[KASPA-MONITOR] ⚠ HTTP API response invalid");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("[KASPA-MONITOR] ❌ HTTP API failed: {}", e);
+                        }
+                    }
+                } else if let Some(ref wrpc) = client {
+                    // Try wRPC connection
+                    match wrpc.connect(None).await {
+                        Ok(_) => {
+                            match wrpc.get_block_dag_info().await {
+                                Ok(info) => {
+                                    println!("[KASPA-MONITOR] ✓ Connected via wRPC! DAA Score: {}", info.virtual_daa_score);
+                                    l1_state.set_connected(info.virtual_daa_score).await;
+                                    retry_delay_secs = 5;
+                                    
+                                    loop {
+                                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                        match wrpc.get_block_dag_info().await {
+                                            Ok(new_info) => {
+                                                l1_state.set_connected(new_info.virtual_daa_score).await;
+                                            }
+                                            Err(e) => {
+                                                println!("[KASPA-MONITOR] ⚠ wRPC health check failed: {}. Reconnecting...", e);
+                                                l1_state.set_status(L1ConnectionStatus::Disconnected {
+                                                    reason: e.to_string(),
+                                                    retry_in_secs: retry_delay_secs,
+                                                }).await;
+                                                let _ = wrpc.disconnect().await;
+                                                break;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                println!("[KASPA-MONITOR] ⚠ Connected but API not responding: {}", e);
-                                l1_state.set_status(L1ConnectionStatus::Syncing { progress_percent: 0.0 }).await;
-                                let _ = client.disconnect().await;
+                                Err(e) => {
+                                    println!("[KASPA-MONITOR] ⚠ wRPC connected but API not responding: {}", e);
+                                    l1_state.set_status(L1ConnectionStatus::Syncing { progress_percent: 0.0 }).await;
+                                    let _ = wrpc.disconnect().await;
+                                }
                             }
                         }
+                        Err(e) => {
+                            println!("[KASPA-MONITOR] ❌ wRPC connection failed: {}. Retry in {}s...", e, retry_delay_secs);
+                            l1_state.set_status(L1ConnectionStatus::Disconnected {
+                                reason: e.to_string(),
+                                retry_in_secs: retry_delay_secs,
+                            }).await;
+                        }
                     }
-                    Err(e) => {
-                        println!("[KASPA-MONITOR] ❌ Connection failed: {}. Retry in {}s...", e, retry_delay_secs);
-                        l1_state.set_status(L1ConnectionStatus::Disconnected {
-                            reason: e.to_string(),
-                            retry_in_secs: retry_delay_secs,
-                        }).await;
-                    }
+                } else {
+                    // No wRPC client, go directly to HTTP fallback
+                    using_http_fallback = true;
+                    continue;
                 }
                 
                 // Wait before retry with exponential backoff

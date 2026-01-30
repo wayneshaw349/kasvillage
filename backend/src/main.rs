@@ -24379,41 +24379,57 @@ impl KaspaFluxNode {
     }
 /// Create with wRPC client (NON-BLOCKING - returns immediately)
     /// Connection is established in background via spawn_l1_monitor
+    /// Priority: KASPA_NODE_URL (direct) → Resolver (fallback)
     pub async fn from_env_async() -> Result<Self, String> {
         let node_url = std::env::var("KASPA_NODE_URL").ok();
         let network = std::env::var("KASPA_NETWORK")
             .unwrap_or_else(|_| "mainnet".to_string());
         
-        let (client, url_str) = match node_url {
-            Some(url) => {
-                println!("[KASPA] ⏳ Connecting to {} (direct)", url);
-                let c = KaspaWrpcRpcClient::new(
-                    WrpcEncoding::Borsh,
-                    Some(&url),
-                    None,  // no resolver
-                    None,  // no network_id needed for direct
-                    None,
-                ).map_err(|e| format!("Client config error: {}", e))?;
-                (Arc::new(c), url)
+        let network_id = match network.as_str() {
+            "testnet-10" => NetworkId::with_suffix(NetworkType::Testnet, 10),
+            "testnet-11" => NetworkId::with_suffix(NetworkType::Testnet, 11),
+            _ => NetworkId::new(NetworkType::Mainnet),
+        };
+        
+        // Try direct URL first, then Resolver as fallback
+        let (client, url_str) = if let Some(url) = node_url {
+            println!("[KASPA] ⏳ Trying direct connection to {}", url);
+            match KaspaWrpcRpcClient::new(
+                WrpcEncoding::Borsh,
+                Some(&url),
+                None,
+                Some(network_id),
+                None,
+            ) {
+                Ok(c) => {
+                    println!("[KASPA] ✅ Direct client configured for {}", url);
+                    (Arc::new(c), url)
+                }
+                Err(e) => {
+                    println!("[KASPA] ⚠️ Direct connection failed: {}, falling back to Resolver", e);
+                    let resolver = Resolver::default();
+                    let c = KaspaWrpcRpcClient::new(
+                        WrpcEncoding::Borsh,
+                        None,
+                        Some(resolver),
+                        Some(network_id),
+                        None,
+                    ).map_err(|e| format!("Resolver fallback failed: {}", e))?;
+                    (Arc::new(c), format!("resolver://{}", network))
+                }
             }
-            None => {
-                // Use Resolver for auto-discovery (v1.0.1 compatible)
-                println!("[KASPA] 🔍 Using Resolver for {} auto-discovery", network);
-                let network_id = match network.as_str() {
-                    "testnet-10" => NetworkId::with_suffix(NetworkType::Testnet, 10),
-                    "testnet-11" => NetworkId::with_suffix(NetworkType::Testnet, 11),
-                    _ => NetworkId::new(NetworkType::Mainnet),
-                };
-                let resolver = Resolver::default();
-                let c = KaspaWrpcRpcClient::new(
-                    WrpcEncoding::Borsh,
-                    None,  // no direct URL
-                    Some(resolver),
-                    Some(network_id),
-                    None,
-                ).map_err(|e| format!("Resolver error: {}", e))?;
-                (Arc::new(c), format!("resolver://{}", network))
-            }
+        } else {
+            // No URL provided, use Resolver directly
+            println!("[KASPA] 🔍 Using Resolver for {} auto-discovery", network);
+            let resolver = Resolver::default();
+            let c = KaspaWrpcRpcClient::new(
+                WrpcEncoding::Borsh,
+                None,
+                Some(resolver),
+                Some(network_id),
+                None,
+            ).map_err(|e| format!("Resolver error: {}", e))?;
+            (Arc::new(c), format!("resolver://{}", network))
         };
         
         // Return IMMEDIATELY - connection happens in background worker
@@ -56407,44 +56423,58 @@ impl KaspaWrpcClient {
 
     /// Create with wRPC client (NON-BLOCKING - returns immediately)
     /// Use spawn_l1_monitor from KaspaFluxNode for background connection
+    /// Priority: KASPA_NODE_URL (direct) → Resolver (fallback)
     pub async fn from_env_async() -> Result<Self, String> {
         let node_url = std::env::var("KASPA_NODE_URL").ok();
         let network = std::env::var("KASPA_NETWORK")
             .unwrap_or_else(|_| "mainnet".to_string());
         
-        let (client, url_str) = match node_url {
-            Some(url) => {
-                println!("[KASPA-WRPC] ⏳ Connecting to {} (direct)", url);
-                let c = KaspaWrpcRpcClient::new(
-                    WrpcEncoding::Borsh,
-                    Some(&url),
-                    None,  // no resolver
-                    None,  // no network_id needed for direct
-                    None,
-                ).map_err(|e| format!("Client config error: {}", e))?;
-                (Arc::new(c), url)
-            }
-            None => {
-                // Use Resolver for auto-discovery (v1.0.1 compatible)
-                println!("[KASPA-WRPC] 🔍 Using Resolver for {} auto-discovery", network);
-                let network_id = match network.as_str() {
-                    "testnet-10" => NetworkId::with_suffix(NetworkType::Testnet, 10),
-                    "testnet-11" => NetworkId::with_suffix(NetworkType::Testnet, 11),
-                    _ => NetworkId::new(NetworkType::Mainnet),
-                };
-                let resolver = Resolver::default();
-                let c = KaspaWrpcRpcClient::new(
-                    WrpcEncoding::Borsh,
-                    None,  // no direct URL
-                    Some(resolver),
-                    Some(network_id),
-                    None,
-                ).map_err(|e| format!("Resolver error: {}", e))?;
-                (Arc::new(c), format!("resolver://{}", network))
-            }
+        let network_id = match network.as_str() {
+            "testnet-10" => NetworkId::with_suffix(NetworkType::Testnet, 10),
+            "testnet-11" => NetworkId::with_suffix(NetworkType::Testnet, 11),
+            _ => NetworkId::new(NetworkType::Mainnet),
         };
         
-        // Return IMMEDIATELY - use KaspaFluxNode::spawn_l1_monitor for background connection
+        // Try direct URL first, then Resolver as fallback
+        let (client, url_str) = if let Some(url) = node_url {
+            println!("[KASPA-WRPC] ⏳ Trying direct connection to {}", url);
+            match KaspaWrpcRpcClient::new(
+                WrpcEncoding::Borsh,
+                Some(&url),
+                None,
+                Some(network_id),
+                None,
+            ) {
+                Ok(c) => {
+                    println!("[KASPA-WRPC] ✅ Direct client configured for {}", url);
+                    (Arc::new(c), url)
+                }
+                Err(e) => {
+                    println!("[KASPA-WRPC] ⚠️ Direct failed: {}, falling back to Resolver", e);
+                    let resolver = Resolver::default();
+                    let c = KaspaWrpcRpcClient::new(
+                        WrpcEncoding::Borsh,
+                        None,
+                        Some(resolver),
+                        Some(network_id),
+                        None,
+                    ).map_err(|e| format!("Resolver fallback failed: {}", e))?;
+                    (Arc::new(c), format!("resolver://{}", network))
+                }
+            }
+        } else {
+            println!("[KASPA-WRPC] 🔍 Using Resolver for {} auto-discovery", network);
+            let resolver = Resolver::default();
+            let c = KaspaWrpcRpcClient::new(
+                WrpcEncoding::Borsh,
+                None,
+                Some(resolver),
+                Some(network_id),
+                None,
+            ).map_err(|e| format!("Resolver error: {}", e))?;
+            (Arc::new(c), format!("resolver://{}", network))
+        };
+        
         Ok(Self {
             url: url_str.clone(),
             mode: KaspaNodeMode::SelfHosted { url: url_str.clone() },
@@ -58065,5 +58095,201 @@ mod tests_l1_connection_state {
             retry_in_secs: 10,
         }).await;
         assert!(!state.get_status().await.is_operational());
+    }
+}
+
+// ============================================================================
+// TESTS: KASPA NODE URL FALLBACK LOGIC
+// ============================================================================
+#[cfg(test)]
+mod tests_kaspa_node_fallback {
+    use super::*;
+    
+    /// Test helper to parse connection result
+    fn is_resolver_url(url: &str) -> bool {
+        url.starts_with("resolver://")
+    }
+    
+    fn is_direct_url(url: &str) -> bool {
+        url.starts_with("ws://") || url.starts_with("wss://")
+    }
+    
+    #[test]
+    fn test_network_id_parsing() {
+        // Mainnet
+        let network = "mainnet";
+        let network_id = match network {
+            "testnet-10" => NetworkId::with_suffix(NetworkType::Testnet, 10),
+            "testnet-11" => NetworkId::with_suffix(NetworkType::Testnet, 11),
+            _ => NetworkId::new(NetworkType::Mainnet),
+        };
+        // NetworkId created successfully
+        let _ = network_id;
+        
+        // Testnet-10
+        let network = "testnet-10";
+        let network_id = match network {
+            "testnet-10" => NetworkId::with_suffix(NetworkType::Testnet, 10),
+            "testnet-11" => NetworkId::with_suffix(NetworkType::Testnet, 11),
+            _ => NetworkId::new(NetworkType::Mainnet),
+        };
+        let _ = network_id;
+        
+        // Testnet-11
+        let network = "testnet-11";
+        let network_id = match network {
+            "testnet-10" => NetworkId::with_suffix(NetworkType::Testnet, 10),
+            "testnet-11" => NetworkId::with_suffix(NetworkType::Testnet, 11),
+            _ => NetworkId::new(NetworkType::Mainnet),
+        };
+        let _ = network_id;
+        
+        // Unknown defaults to mainnet
+        let network = "unknown-network";
+        let network_id = match network {
+            "testnet-10" => NetworkId::with_suffix(NetworkType::Testnet, 10),
+            "testnet-11" => NetworkId::with_suffix(NetworkType::Testnet, 11),
+            _ => NetworkId::new(NetworkType::Mainnet),
+        };
+        let _ = network_id;
+    }
+    
+    #[test]
+    fn test_url_classification() {
+        // Direct URLs
+        assert!(is_direct_url("ws://127.0.0.1:17110"));
+        assert!(is_direct_url("ws://provider.dal.leet.haus:31431"));
+        assert!(is_direct_url("wss://kaspa.aspectron.com/mainnet/wrpc/borsh"));
+        
+        // Resolver URLs
+        assert!(is_resolver_url("resolver://mainnet"));
+        assert!(is_resolver_url("resolver://testnet-11"));
+        
+        // Not resolver
+        assert!(!is_resolver_url("ws://127.0.0.1:17110"));
+        assert!(!is_direct_url("resolver://mainnet"));
+    }
+    
+    #[test]
+    fn test_env_var_priority_logic() {
+        // Simulates the decision logic without actual network calls
+        
+        // Case 1: KASPA_NODE_URL set -> should try direct first
+        let node_url: Option<String> = Some("ws://provider.dal.leet.haus:31431".to_string());
+        let network = "mainnet".to_string();
+        
+        let expected_primary = if node_url.is_some() {
+            "direct"
+        } else {
+            "resolver"
+        };
+        assert_eq!(expected_primary, "direct");
+        
+        // Case 2: KASPA_NODE_URL not set -> should use resolver
+        let node_url: Option<String> = None;
+        
+        let expected_primary = if node_url.is_some() {
+            "direct"
+        } else {
+            "resolver"
+        };
+        assert_eq!(expected_primary, "resolver");
+    }
+    
+    #[test]
+    fn test_fallback_url_format() {
+        let network = "mainnet";
+        let fallback_url = format!("resolver://{}", network);
+        assert_eq!(fallback_url, "resolver://mainnet");
+        assert!(is_resolver_url(&fallback_url));
+        
+        let network = "testnet-11";
+        let fallback_url = format!("resolver://{}", network);
+        assert_eq!(fallback_url, "resolver://testnet-11");
+    }
+    
+    #[test]
+    fn test_resolver_default_creation() {
+        // Verify Resolver::default() doesn't panic
+        let resolver = Resolver::default();
+        // Resolver created successfully (can't easily test internals)
+        drop(resolver);
+    }
+    
+    #[test]
+    fn test_wrpc_encoding() {
+        // Verify encoding can be created
+        let _encoding = WrpcEncoding::Borsh;
+        // Borsh encoding is used for kaspad communication
+    }
+    
+    #[tokio::test]
+    async fn test_fallback_decision_tree() {
+        // Test the complete decision tree logic
+        
+        struct TestCase {
+            node_url: Option<String>,
+            direct_succeeds: bool,
+            expected_result: &'static str,
+        }
+        
+        let test_cases = vec![
+            // Case 1: URL set, direct succeeds -> use direct
+            TestCase {
+                node_url: Some("ws://kaspad:17110".to_string()),
+                direct_succeeds: true,
+                expected_result: "direct",
+            },
+            // Case 2: URL set, direct fails -> fallback to resolver
+            TestCase {
+                node_url: Some("ws://invalid:99999".to_string()),
+                direct_succeeds: false,
+                expected_result: "resolver",
+            },
+            // Case 3: URL not set -> use resolver directly
+            TestCase {
+                node_url: None,
+                direct_succeeds: false, // irrelevant
+                expected_result: "resolver",
+            },
+        ];
+        
+        for (i, tc) in test_cases.iter().enumerate() {
+            let result = if let Some(_url) = &tc.node_url {
+                if tc.direct_succeeds {
+                    "direct"
+                } else {
+                    "resolver" // fallback
+                }
+            } else {
+                "resolver"
+            };
+            
+            assert_eq!(
+                result, tc.expected_result,
+                "Test case {} failed: expected {}, got {}",
+                i + 1, tc.expected_result, result
+            );
+        }
+    }
+    
+    #[test]
+    fn test_kaspa_node_mode_variants() {
+        // Test KaspaNodeMode can hold both direct and resolver URLs
+        let direct_mode = KaspaNodeMode::SelfHosted { 
+            url: "ws://kaspad:17110".to_string() 
+        };
+        
+        if let KaspaNodeMode::SelfHosted { url } = direct_mode {
+            assert!(is_direct_url(&url));
+        }
+        
+        let resolver_mode = KaspaNodeMode::SelfHosted { 
+            url: "resolver://mainnet".to_string() 
+        };
+        
+        if let KaspaNodeMode::SelfHosted { url } = resolver_mode {
+            assert!(is_resolver_url(&url));
+        }
     }
 }

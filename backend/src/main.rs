@@ -24461,7 +24461,7 @@ impl KaspaFluxNode {
             
             let mut retry_delay_secs = 5u64;
             let max_retry_delay = 60u64;
-            let max_wrpc_attempts = 5u32;
+            let max_wrpc_attempts = 5u64;
             let mut using_http_fallback = false;
             let http_client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))

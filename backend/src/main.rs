@@ -24526,11 +24526,22 @@ impl KaspaFluxNode {
                         }
                     }
                 } else if let Some(ref wrpc) = client {
-                    // Try wRPC connection
-                    match wrpc.connect(None).await {
-                        Ok(_) => {
-                            match wrpc.get_block_dag_info().await {
-                                Ok(info) => {
+                    // Try wRPC connection with 10s timeout
+                    let connect_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        wrpc.connect(None)
+                    ).await;
+                    
+                    match connect_result {
+                        Ok(Ok(_)) => {
+                            // Connected, now try API call with timeout
+                            let api_result = tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                wrpc.get_block_dag_info()
+                            ).await;
+                            
+                            match api_result {
+                                Ok(Ok(info)) => {
                                     println!("[KASPA-MONITOR] ✓ Connected via wRPC! DAA Score: {}", info.virtual_daa_score);
                                     l1_state.set_connected(info.virtual_daa_score).await;
                                     retry_delay_secs = 5;
@@ -24553,17 +24564,28 @@ impl KaspaFluxNode {
                                         }
                                     }
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     println!("[KASPA-MONITOR] ⚠ wRPC connected but API not responding: {}", e);
                                     l1_state.set_status(L1ConnectionStatus::Syncing { progress_percent: 0.0 }).await;
                                     let _ = wrpc.disconnect().await;
                                 }
+                                Err(_) => {
+                                    println!("[KASPA-MONITOR] ⚠ wRPC API call timed out (10s)");
+                                    let _ = wrpc.disconnect().await;
+                                }
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             println!("[KASPA-MONITOR] ❌ wRPC connection failed: {}. Retry in {}s...", e, retry_delay_secs);
                             l1_state.set_status(L1ConnectionStatus::Disconnected {
                                 reason: e.to_string(),
+                                retry_in_secs: retry_delay_secs,
+                            }).await;
+                        }
+                        Err(_) => {
+                            println!("[KASPA-MONITOR] ⚠ wRPC connect timed out (10s). Retry in {}s...", retry_delay_secs);
+                            l1_state.set_status(L1ConnectionStatus::Disconnected {
+                                reason: "Connection timeout".to_string(),
                                 retry_in_secs: retry_delay_secs,
                             }).await;
                         }

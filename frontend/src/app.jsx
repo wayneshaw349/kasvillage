@@ -1,4 +1,4 @@
-// KasVillage Frontend v16 — Patched 2026-02-01 — storefront/save: host_id + theme fix
+// KasVillage Frontend v16 — Patched 2026-02-01 — storefront/save: host_id + theme fix 
 import React, { createContext, useContext, useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion"; 
 import {   
@@ -18,7 +18,7 @@ import Countdown from "react-countdown";
 // --- 1. UTILITIES & CONFIGURATION ---
 
 // ============================================================================
-// ERROR BOUNDARY - Production Crash Recovery
+// ERROR BOUNDARY - Production Crash Recovery God willing this works 
 // ============================================================================
 class ErrorBoundary extends React.Component {
   constructor(props) {

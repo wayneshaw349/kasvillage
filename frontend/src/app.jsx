@@ -92,7 +92,7 @@ function cn(...inputs) {
 // Akash Network Backend
 const API_BASE = typeof window !== 'undefined' && window.KASVILLAGE_API_URL 
   ? window.KASVILLAGE_API_URL 
-  : 'https://134ucrb1rpek78b8ev55521u78.ingress.akash-palmito.org';
+  : 'https://api.kasvillage.com';
 
 
 // CoinGecko API (free, no key needed) for live KASPA price
@@ -2627,11 +2627,14 @@ export const AppProvider = ({ children }) => {
 
   // Background Services
   useEffect(() => {
-    const interval = setInterval(() => api.getHealth().then(data => setSystemHealth(data.health_level)), 5000);
+    if (!isAuthenticated) return;
+    const interval = setInterval(() => api.getHealth().then(data => setSystemHealth(data.health_level)).catch(() => {}), 30000);
+    api.getHealth().then(data => setSystemHealth(data.health_level)).catch(() => {});
     return () => clearInterval(interval);
-  }, []);
+  }, [isAuthenticated]);
 
   useEffect(() => {
+    if (!isAuthenticated) return;
     const checkCircuitBreaker = async () => {
       const status = await api.getCircuitBreakerStatus();
       setCircuitBreakerStatus(status);
@@ -2639,7 +2642,7 @@ export const AppProvider = ({ children }) => {
     checkCircuitBreaker();
     const interval = setInterval(checkCircuitBreaker, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [isAuthenticated]);
 
   const submitExit = async (amount, destAddress, signatureProof = null) => {
     if (circuitBreakerStatus.is_tripped) return alert('Protocol halted: Circuit breaker active.') || null;

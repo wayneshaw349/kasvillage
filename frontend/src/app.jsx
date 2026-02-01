@@ -193,7 +193,7 @@ function cn(...inputs) {
 // Akash Network Backend
 const API_BASE = typeof window !== 'undefined' && window.KASVILLAGE_API_URL 
   ? window.KASVILLAGE_API_URL 
-  : 'https://134ucrb1rpek78b8ev55521u78.ingress.akash-palmito.org';
+  : 'https://api.kasvillage.com';
 
 
 // CoinGecko API (free, no key needed) for live KASPA price

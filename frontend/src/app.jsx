@@ -1408,8 +1408,9 @@ donateToReserves: async (pubkey, amount) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          merchant_pubkey: merchantPubkey,
+          host_id: merchantPubkey,
           layout: layout,
+          theme: layout.theme || 'default',
           timestamp: Date.now()
         }),
       });

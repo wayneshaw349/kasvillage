@@ -19223,16 +19223,67 @@ pub async fn start_api_server(
     // APP STATE - Storefronts, Consignments, Onboarding, Stats
     // ========================================================================
     let app_state = web::Data::new(AppStateAdditions {
-        circuit_breaker: RwLock::new(CircuitBreakerState::new()),
-        consignment_agreements: RwLock::new(HashMap::new()),
-        storefronts: RwLock::new(HashMap::new()),
-        storefront_visits: RwLock::new(HashMap::new()),
-        storefront_click_counts: RwLock::new(HashMap::new()),
-        merchant_balances: RwLock::new(HashMap::new()),
-        onboarding_sessions: RwLock::new(HashMap::new()),
-        onboarding_scores: RwLock::new(HashMap::new()),
+        circuit_breaker: std::sync::RwLock::new(CircuitBreakerState::new()),
+        consignment_agreements: std::sync::RwLock::new(HashMap::new()),
+        storefronts: std::sync::RwLock::new(HashMap::new()),
+        storefront_visits: std::sync::RwLock::new(HashMap::new()),
+        storefront_click_counts: std::sync::RwLock::new(HashMap::new()),
+        merchant_balances: std::sync::RwLock::new(HashMap::new()),
+        onboarding_sessions: std::sync::RwLock::new(HashMap::new()),
+        onboarding_scores: std::sync::RwLock::new(HashMap::new()),
         sanctions: SanctionsState::new(),
     });
+
+    // ========================================================================
+    // FRONTEND APP STATE - FROST wallet, users, consignments, compliance
+    // ========================================================================
+    let frontend_state = web::Data::new(FrontendAppState::new());
+    println!("[FRONTEND] ✓ Frontend app state initialized (FROST wallet, compliance, users)");
+
+    // ========================================================================
+    // FULL APP STATE - Validators, XP, Supply Chain, Bridge, Research
+    // ========================================================================
+    let l1_client = KaspaL1Client::new(KaspaNetworkInfra::Mainnet);
+    let full_db: Arc<dyn DatabaseStore> = Arc::new(FirestoreDb::new("kasvillage-l2", "prod"));
+    let relay = Arc::new(RwLock::new(WebSocketRelay::new("relay-001", true)));
+    let rate_limiter = Arc::new(RwLock::new(RedisRateLimiter::new(false)));
+    let frost = FrostCoordinator::new(FrostConfig::new(8, 14).expect("valid config"));
+
+    let full_app_state = web::Data::new(AppState {
+        db: full_db,
+        l1_client,
+        relay,
+        rate_limiter,
+        frost_coordinator: Arc::new(RwLock::new(frost)),
+        circuit_breaker: Arc::new(std::sync::RwLock::new(CircuitBreakerState::new())),
+        consignment_agreements: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        storefronts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        storefront_visits: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        merchant_balances: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        storefront_click_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        onboarding_sessions: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        onboarding_scores: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        supply_chain: Arc::new(std::sync::RwLock::new(SupplyChainManager::new())),
+        graduated_breaker: Arc::new(std::sync::RwLock::new(GraduatedCircuitBreaker::new())),
+        total_user_ledger: Arc::new(std::sync::RwLock::new(0)),
+        protocol_reserves: Arc::new(std::sync::RwLock::new(0)),
+        xp_registry: Arc::new(std::sync::RwLock::new(XPRegistry::new())),
+        bridge_manager: Arc::new(std::sync::RwLock::new(BridgeTicketManager::new("kaspa:vault_address_placeholder".to_string()))),
+        validators: Arc::new(std::sync::RwLock::new(Vec::new())),
+        validator_rewards: Arc::new(std::sync::RwLock::new(Vec::new())),
+        fee_distributions: Arc::new(std::sync::RwLock::new(Vec::new())),
+        transaction_history: Arc::new(std::sync::RwLock::new(Vec::new())),
+        withdrawal_history: Arc::new(std::sync::RwLock::new(Vec::new())),
+        notifications: Arc::new(std::sync::RwLock::new(Vec::new())),
+        inventory: Arc::new(std::sync::RwLock::new(Vec::new())),
+        account_registry: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        pending_verifications: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        researcher_profiles: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        research_abstracts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        research_questions: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        kaspa_wrpc: Arc::new(KaspaWrpcClient::from_env()),
+    });
+    println!("[APPSTATE] ✓ Full app state initialized (validators, XP, supply chain, bridge)");
 
     // ========================================================================
     // IDENTITY MERKLE TREE - Avatar commitments (ZK-Identity)
@@ -19279,6 +19330,8 @@ pub async fn start_api_server(
             .app_data(state.clone())
             .app_data(sanctions_state.clone())
             .app_data(app_state.clone())
+            .app_data(frontend_state.clone())
+            .app_data(full_app_state.clone())
             .app_data(main_tree_data.clone())
             .app_data(sanctions_tree_data.clone())
             .app_data(identity_tree.clone())
@@ -49152,15 +49205,24 @@ pub async fn api_user_stats(
     pubkey: web::Path<String>,
 ) -> impl Responder {
     let pubkey_str = pubkey.into_inner();
-    
     let inner = state.inner.read().await;
     
-    let user: FrontendUser = match inner.users.get(&pubkey_str) {
+    let user = match inner.users.get(&pubkey_str) {
         Some(u) => u.clone(),
-        None => return HttpResponse::NotFound().json(serde_json::json!({
-            "success": false,
-            "error": "User not found"
-        })),
+        None => {
+            // Return defaults for unknown users instead of 404
+            return HttpResponse::Ok().json(UserStatsResponse {
+                pubkey: pubkey_str,
+                xp_balance: 0,
+                tier: "Newcomer".to_string(),
+                transactions_completed: 0,
+                transactions_failed: 0,
+                deadlock_count: 0,
+                p_complete: 0.5,
+                p_dispute: 0.0,
+                p_hist: 0.5,
+            });
+        }
     };
     
     let mut deadlock_count = 0u64;
@@ -49171,7 +49233,6 @@ pub async fn api_user_stats(
         let is_participant = hex::encode(agreement.seller_pubkey) == pubkey_str 
             || hex::encode(agreement.consigner_pubkey) == pubkey_str
             || hex::encode(agreement.buyer_pubkey) == pubkey_str;
-        
         if is_participant {
             match agreement.state {
                 ConsignmentAgreementState::Deadlocked => deadlock_count += 1,
@@ -49183,12 +49244,7 @@ pub async fn api_user_stats(
     }
     
     let total_tx = tx_completed.saturating_add(tx_failed);
-    let p_hist = if total_tx > 0 {
-        (tx_completed as f64) / (total_tx as f64)
-    } else {
-        0.5
-    };
-    
+    let p_hist = if total_tx > 0 { tx_completed as f64 / total_tx as f64 } else { 0.5 };
     let p_complete = (p_hist * 0.85).min(1.0);
     let p_dispute = (1.0 - p_hist) * 0.35;
     
@@ -49210,26 +49266,20 @@ pub async fn api_deadlock_stats(
     state: web::Data<FrontendAppState>,
 ) -> impl Responder {
     let inner = state.inner.read().await;
-    
     let total_deadlocks = inner.consignments.values()
         .filter(|a| a.state == ConsignmentAgreementState::Deadlocked)
         .count() as u64;
-    
     let recovered = inner.consignments.values()
         .filter(|a| a.state == ConsignmentAgreementState::Completed || a.state == ConsignmentAgreementState::CompletedWithSlash)
         .count() as u64;
-    
-    let frozen = total_deadlocks;
     let recovery_rate = if total_deadlocks > 0 {
-        (recovered as f64) / ((total_deadlocks + recovered) as f64)
-    } else {
-        0.0
-    };
+        recovered as f64 / (total_deadlocks + recovered) as f64
+    } else { 0.0 };
     
     HttpResponse::Ok().json(DeadlockStatsResponse {
         total_deadlocks,
         recovered_count: recovered,
-        frozen_count: frozen,
+        frozen_count: total_deadlocks,
         recovery_rate,
     })
 }
@@ -49239,17 +49289,11 @@ pub async fn api_completion_stats(
     state: web::Data<FrontendAppState>,
 ) -> impl Responder {
     let inner = state.inner.read().await;
-    
     let completed = inner.consignments.values()
         .filter(|a| a.state == ConsignmentAgreementState::Completed || a.state == ConsignmentAgreementState::CompletedWithSlash)
         .count() as u64;
-    
     let total = inner.consignments.len() as u64;
-    let success_rate = if total > 0 {
-        (completed as f64) / (total as f64)
-    } else {
-        0.0
-    };
+    let success_rate = if total > 0 { completed as f64 / total as f64 } else { 0.0 };
     
     HttpResponse::Ok().json(CompletionStatsResponse {
         total_transactions: total,
@@ -49264,15 +49308,7 @@ pub async fn api_bayesian_stats(
     pubkey: web::Path<String>,
 ) -> impl Responder {
     let pubkey_str = pubkey.into_inner();
-    
     let inner = state.inner.read().await;
-    
-    if !inner.users.contains_key(&pubkey_str) {
-        return HttpResponse::NotFound().json(serde_json::json!({
-            "success": false,
-            "error": "User not found"
-        }));
-    }
     
     let mut tx_completed = 0u64;
     let mut tx_failed = 0u64;
@@ -49281,7 +49317,6 @@ pub async fn api_bayesian_stats(
         let is_participant = hex::encode(agreement.seller_pubkey) == pubkey_str 
             || hex::encode(agreement.consigner_pubkey) == pubkey_str
             || hex::encode(agreement.buyer_pubkey) == pubkey_str;
-        
         if is_participant {
             match agreement.state {
                 ConsignmentAgreementState::Completed | ConsignmentAgreementState::CompletedWithSlash => tx_completed += 1,
@@ -49294,17 +49329,11 @@ pub async fn api_bayesian_stats(
     let alpha = 1.0 + tx_completed as f64;
     let beta = 1.0 + tx_failed as f64;
     let p_hist = alpha / (alpha + beta);
-    
     let p_complete = (p_hist * 0.90).min(1.0);
     let p_dispute = ((1.0 - p_hist) * 0.40).min(1.0);
-    
-    let risk_band = if p_complete >= 0.80 {
-        "🟢 GREEN".to_string()
-    } else if p_complete >= 0.50 {
-        "🟡 YELLOW".to_string()
-    } else {
-        "🔴 RED".to_string()
-    };
+    let risk_band = if p_complete >= 0.80 { "🟢 GREEN" }
+        else if p_complete >= 0.50 { "🟡 YELLOW" }
+        else { "🔴 RED" }.to_string();
     
     HttpResponse::Ok().json(BayesianStatsResponse {
         p_complete,
@@ -51177,7 +51206,7 @@ pub struct CircuitBreakerResponse {
 }
 
 pub async fn api_circuit_breaker_status(
-    state: web::Data<AppState>,
+    state: web::Data<AppStateAdditions>,
 ) -> impl Responder {
     let cb = state.circuit_breaker.read().unwrap();
     HttpResponse::Ok().json(CircuitBreakerResponse {
@@ -51209,7 +51238,7 @@ pub struct ConsignmentReleaseResponse {
 }
 
 pub async fn api_consignment_release(
-    state: web::Data<AppState>,
+    state: web::Data<AppStateAdditions>,
     req: web::Json<ConsignmentReleaseRequest>,
 ) -> impl Responder {
     let mut agreements = state.consignment_agreements.write().unwrap();
@@ -51270,7 +51299,7 @@ pub struct ConsignmentDeadlockResponse {
 }
 
 pub async fn api_consignment_deadlock(
-    state: web::Data<AppState>,
+    state: web::Data<AppStateAdditions>,
     req: web::Json<ConsignmentDeadlockRequest>,
 ) -> impl Responder {
     let mut agreements = state.consignment_agreements.write().unwrap();
@@ -51314,7 +51343,7 @@ pub struct StorefrontSaveResponse {
 }
 
 pub async fn api_storefront_save(
-    state: web::Data<AppState>,
+    state: web::Data<AppStateAdditions>,
     req: web::Json<StorefrontSaveRequest>,
 ) -> impl Responder {
     // Hash the layout for Merkle tree
@@ -51360,7 +51389,7 @@ pub struct StorefrontVisitResponse {
 }
 
 pub async fn api_storefront_visit(
-    state: web::Data<AppState>,
+    state: web::Data<AppStateAdditions>,
     req: web::Json<StorefrontVisitRequest>,
 ) -> impl Responder {
     const PAGE_VIEW_FEE_SOMPI: u64 = 500_000; // 0.005 KAS
@@ -51409,7 +51438,7 @@ pub struct StorefrontClickResponse {
 }
 
 pub async fn api_storefront_click(
-    state: web::Data<AppState>,
+    state: web::Data<AppStateAdditions>,
     req: web::Json<StorefrontClickRequest>,
 ) -> impl Responder {
     // Generate anonymous click ID (no visitor info)
@@ -51575,7 +51604,7 @@ pub struct OnboardingAnswerResponse {
 
 const ONBOARDING_TIME_LIMIT_MS: u64 = 15_000; // 15 seconds
 const ONBOARDING_MIN_TIME_MS: u64 = 500;      // Too fast = bot
-const ONBOARDING_PASS_THRESHOLD: u8 = 8;     // 80% = 8/10
+const ONBOARDING_PASS_THRESHOLD: u32 = 8;     // 80% = 8/10
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OnboardingSessionV2 {
@@ -51607,7 +51636,7 @@ pub async fn api_onboarding_start() -> impl Responder {
 }
 
 pub async fn api_onboarding_answer(
-    state: web::Data<AppState>,
+    state: web::Data<AppStateAdditions>,
     req: web::Json<OnboardingAnswerRequest>,
 ) -> impl Responder {
     let sessions = state.onboarding_sessions.read().unwrap();
@@ -51885,7 +51914,7 @@ pub async fn api_sanctions_status(
 /// GET /api/host-node/:pubkey - Get user's host node (storefront)
 pub async fn api_get_host_node(
     pubkey: web::Path<String>,
-    _state: web::Data<AppState>,
+    _state: web::Data<AppStateAdditions>,
 ) -> impl Responder {
     // TODO: Implement database query
     // Query from host_nodes table WHERE owner_pubkey = pubkey
@@ -51914,7 +51943,7 @@ pub async fn api_get_host_node(
 
 /// GET /api/host-nodes - Get all public host nodes
 pub async fn api_get_host_nodes(
-    _state: web::Data<AppState>,
+    _state: web::Data<AppStateAdditions>,
 ) -> impl Responder {
     // TODO: Implement database query
     // Query all active host_nodes from database
@@ -51930,7 +51959,7 @@ pub async fn api_get_host_nodes(
 
 /// GET /api/dapps - Get all DApps for marketplace
 pub async fn api_get_dapps(
-    _state: web::Data<AppState>,
+    _state: web::Data<AppStateAdditions>,
 ) -> impl Responder {
     // TODO: Implement database query
     // Query dapps table
@@ -51947,7 +51976,7 @@ pub async fn api_get_dapps(
 
 /// GET /api/coupons - Get all active coupons
 pub async fn api_get_coupons(
-    _state: web::Data<AppState>,
+    _state: web::Data<AppStateAdditions>,
 ) -> impl Responder {
     // TODO: Implement database query
     // Query coupons table
@@ -51965,7 +51994,7 @@ pub async fn api_get_coupons(
 /// GET /api/storefront/:pubkey - Get saved storefront layout
 pub async fn api_get_storefront(
     pubkey: web::Path<String>,
-    _state: web::Data<AppState>,
+    _state: web::Data<AppStateAdditions>,
 ) -> impl Responder {
     // TODO: Implement database query
     // Query storefront_layouts table WHERE owner_pubkey = pubkey
@@ -52004,29 +52033,19 @@ pub async fn api_stats_global(
 ) -> impl Responder {
     let inner = state.inner.read().await;
     
-    // Compute from actual consignment data
     let total_transactions = inner.consignments.len() as u64;
-    
     let completed_count = inner.consignments.values()
         .filter(|a| a.state == ConsignmentAgreementState::Completed || a.state == ConsignmentAgreementState::CompletedWithSlash)
         .count() as u64;
-    
     let total_deadlocks = inner.consignments.values()
         .filter(|a| a.state == ConsignmentAgreementState::Deadlocked)
         .count() as u64;
-    
-    // Recovered = previously deadlocked but now resolved (approximation: completed with slash)
     let recovered_count = inner.consignments.values()
         .filter(|a| a.state == ConsignmentAgreementState::CompletedWithSlash)
         .count() as u64;
-    
     let success_rate = if total_transactions > 0 {
         completed_count as f64 / total_transactions as f64
-    } else {
-        0.0
-    };
-    
-    // Sum total volume from completed transactions
+    } else { 0.0 };
     let total_volume_sompi: u64 = inner.consignments.values()
         .filter(|a| a.state == ConsignmentAgreementState::Completed || a.state == ConsignmentAgreementState::CompletedWithSlash)
         .map(|a| a.locked_sompi)
@@ -52048,43 +52067,33 @@ pub async fn api_stats_bayesian_network(
 ) -> impl Responder {
     let inner = state.inner.read().await;
     
-    // Compute successes and failures from all consignments
     let network_successes = inner.consignments.values()
         .filter(|a| a.state == ConsignmentAgreementState::Completed || a.state == ConsignmentAgreementState::CompletedWithSlash)
         .count() as u64;
-    
     let network_deadlocks = inner.consignments.values()
         .filter(|a| a.state == ConsignmentAgreementState::Deadlocked)
         .count() as u64;
-    
     let network_cancelled = inner.consignments.values()
         .filter(|a| a.state == ConsignmentAgreementState::Cancelled)
         .count() as u64;
     
-    // Beta distribution mean: (alpha) / (alpha + beta) where alpha = successes + 1, beta = failures + 1
     let total_resolved = network_successes + network_deadlocks + network_cancelled;
     let avg_p_complete = if total_resolved > 0 {
         (network_successes as f64 + 1.0) / (total_resolved as f64 + 2.0)
-    } else {
-        0.5 // Uninformed prior
-    };
+    } else { 0.5 };
     
-    // Calculate trust distribution from user data
     let total_users = inner.users.len() as f64;
     let mut high_trust = 0u64;
     let mut medium_trust = 0u64;
     let mut low_trust = 0u64;
     
     for (pubkey, _user) in &inner.users {
-        // Calculate per-user p_complete
         let mut user_successes = 0u64;
         let mut user_failures = 0u64;
-        
         for agreement in inner.consignments.values() {
             let is_participant = hex::encode(agreement.seller_pubkey) == *pubkey 
                 || hex::encode(agreement.consigner_pubkey) == *pubkey
                 || hex::encode(agreement.buyer_pubkey) == *pubkey;
-            
             if is_participant {
                 match agreement.state {
                     ConsignmentAgreementState::Completed | ConsignmentAgreementState::CompletedWithSlash => user_successes += 1,
@@ -52093,16 +52102,13 @@ pub async fn api_stats_bayesian_network(
                 }
             }
         }
-        
         let user_total = user_successes + user_failures;
         if user_total > 0 {
             let user_p = user_successes as f64 / user_total as f64;
             if user_p > 0.9 { high_trust += 1; }
             else if user_p > 0.5 { medium_trust += 1; }
             else { low_trust += 1; }
-        } else {
-            medium_trust += 1; // New users start at medium
-        }
+        } else { medium_trust += 1; }
     }
     
     HttpResponse::Ok().json(json!({
@@ -52277,14 +52283,14 @@ pub fn configure_routes_additions(cfg: &mut web::ServiceConfig) {
 // ============================================================================
 
 pub struct AppStateAdditions {
-    pub circuit_breaker: RwLock<CircuitBreakerState>,
-    pub consignment_agreements: RwLock<std::collections::HashMap<String, ConsignmentAgreement>>,
-    pub storefronts: RwLock<std::collections::HashMap<String, StorefrontData>>,
-    pub storefront_visits: RwLock<std::collections::HashMap<String, u64>>,
-    pub storefront_click_counts: RwLock<std::collections::HashMap<String, u64>>, // Aggregate only: "host:platform" -> count
-    pub merchant_balances: RwLock<std::collections::HashMap<String, u64>>,
-    pub onboarding_sessions: RwLock<std::collections::HashMap<String, OnboardingSession>>,
-    pub onboarding_scores: RwLock<std::collections::HashMap<String, u32>>,
+    pub circuit_breaker: std::sync::RwLock<CircuitBreakerState>,
+    pub consignment_agreements: std::sync::RwLock<std::collections::HashMap<String, ConsignmentAgreement>>,
+    pub storefronts: std::sync::RwLock<std::collections::HashMap<String, StorefrontData>>,
+    pub storefront_visits: std::sync::RwLock<std::collections::HashMap<String, u64>>,
+    pub storefront_click_counts: std::sync::RwLock<std::collections::HashMap<String, u64>>,
+    pub merchant_balances: std::sync::RwLock<std::collections::HashMap<String, u64>>,
+    pub onboarding_sessions: std::sync::RwLock<std::collections::HashMap<String, OnboardingSession>>,
+    pub onboarding_scores: std::sync::RwLock<std::collections::HashMap<String, u32>>,
     pub sanctions: SanctionsState,
 }
 

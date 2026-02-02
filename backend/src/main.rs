@@ -53329,69 +53329,6 @@ pub async fn fe_api_get_host_node(
     }
 }
 
-// --- Coupons (from coupon_store) ---
-pub async fn fe_api_get_coupons(
-    state: web::Data<FrontendAppState>,
-) -> impl Responder {
-    let store = state.coupon_store.read().unwrap();
-    let coupons: Vec<&StoredCoupon> = store.values().filter(|c| c.active).collect();
-    let village = state.village.read().unwrap();
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": coupons,
-        "count": coupons.len(),
-        "global_root": village.global_root
-    }))
-}
-
-pub async fn fe_api_coupon_create(
-    state: web::Data<FrontendAppState>,
-    req: web::Json<serde_json::Value>,
-) -> impl Responder {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let code = req.get("code").and_then(|v| v.as_str()).unwrap_or("AUTO").to_string();
-    let coupon_id = format!("coupon_{}_{}", now, code);
-    let coupon = StoredCoupon {
-        coupon_id: coupon_id.clone(),
-        host_id: req.get("host_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        host_name: req.get("host_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        code: code.clone(),
-        coupon_type: req.get("type").and_then(|v| v.as_str()).unwrap_or("PercentOff").to_string(),
-        value: req.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        title: req.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        item_name: req.get("item_name").and_then(|v| v.as_str()).unwrap_or("Any Item").to_string(),
-        description: req.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        link: req.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        dollar_price: req.get("dollar_price").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        discounted_kaspa: req.get("discounted_kaspa").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        discount_percent: req.get("discount_percent").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        max_uses: req.get("max_uses").and_then(|v| v.as_u64()).unwrap_or(100) as u32,
-        times_redeemed: 0,
-        created_at: now,
-        expires_at: now + 30 * 86400,
-        active: true,
-    };
-    state.coupon_store.write().unwrap().insert(coupon_id.clone(), coupon);
-    HttpResponse::Ok().json(serde_json::json!({"success": true, "coupon_id": coupon_id, "code": code}))
-}
-
-pub async fn fe_api_coupon_redeem(
-    state: web::Data<FrontendAppState>,
-    path: web::Path<String>,
-) -> impl Responder {
-    let code = path.into_inner();
-    let mut store = state.coupon_store.write().unwrap();
-    if let Some(coupon) = store.values_mut().find(|c| c.code == code && c.active) {
-        coupon.times_redeemed += 1;
-        if coupon.times_redeemed >= coupon.max_uses {
-            coupon.active = false;
-        }
-        HttpResponse::Ok().json(serde_json::json!({"success": true, "redeemed": true}))
-    } else {
-        HttpResponse::NotFound().json(serde_json::json!({"success": false, "error": "Coupon not found or inactive"}))
-    }
-}
-
 // --- Bookshelf ---
 pub async fn fe_api_get_bookshelf(
     state: web::Data<FrontendAppState>,

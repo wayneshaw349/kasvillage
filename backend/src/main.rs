@@ -1,9 +1,12 @@
 // ============================================================================
 // KASVILLAGE L2 - COMPLETE PRODUCTION IMPLEMENTATION - God willing this works 
 // ============================================================================
-// VERSION: 2025-02-02-fix-500-endpoints
-// FIXES: api_circuit_breaker_status, api_stats_global, api_stats_bayesian_network
-//        Changed from FrontendAppState/AppState to AppStateAdditions
+// VERSION: 2025-02-02-fix-500-endpoints-v3
+// FIXES: 
+//   - api_circuit_breaker_status, api_stats_global, api_stats_bayesian_network
+//     Changed from FrontendAppState/AppState to AppStateAdditions
+//   - Added fallback to public wRPC endpoints after 5 failed attempts
+//     Cycles through: kaspa.matrx.dev, wrpc.kaspa.live
 // ============================================================================
 // hopefully this works
 // Single-file merged implementation containing:
@@ -24414,7 +24417,7 @@ impl KaspaFluxNode {
         l1_state: L1ConnectionState,
     ) {
         tokio::spawn(async move {
-            let client = match &kaspa_node.wrpc_client {
+            let mut client = match &kaspa_node.wrpc_client {
                 Some(c) => c.clone(),
                 None => {
                     println!("[KASPA-MONITOR] No wRPC client configured, using fallback API");
@@ -24428,17 +24431,57 @@ impl KaspaFluxNode {
             
             let mut retry_delay_secs = 5u64;
             let max_retry_delay = 60u64;
+            const MAX_ATTEMPTS_BEFORE_FALLBACK: u32 = 5;
+            let mut using_resolver = false;
+            
+            // List of known public Kaspa wRPC endpoints to try as fallback
+            let public_endpoints = [
+                "wss://kaspa.matrx.dev/wrpc/borsh",
+                "wss://wrpc.kaspa.live/wrpc/borsh",
+            ];
+            let mut endpoint_index = 0;
             
             loop {
                 let attempt = l1_state.increment_attempts().await;
-                println!("[KASPA-MONITOR] ⏳ Connection attempt #{}", attempt);
+                println!("[KASPA-MONITOR] ⏳ Connection attempt #{}{}", attempt, if using_resolver { " (public endpoint)" } else { "" });
+                
+                // After 5 failed attempts with custom URL, switch to public endpoints
+                if attempt > MAX_ATTEMPTS_BEFORE_FALLBACK as u64 && !using_resolver {
+                    println!("[KASPA-MONITOR] ⚠ {} attempts failed with custom URL, trying public endpoints", MAX_ATTEMPTS_BEFORE_FALLBACK);
+                    using_resolver = true;
+                }
+                
+                // If using resolver/public endpoints, cycle through them
+                if using_resolver {
+                    let endpoint = public_endpoints[endpoint_index % public_endpoints.len()];
+                    println!("[KASPA-MONITOR] 🔄 Trying public endpoint: {}", endpoint);
+                    
+                    match KaspaWrpcRpcClient::new(
+                        WrpcEncoding::Borsh,
+                        Some(endpoint),
+                        None, None, None,
+                    ) {
+                        Ok(new_client) => {
+                            client = Arc::new(new_client);
+                        }
+                        Err(e) => {
+                            println!("[KASPA-MONITOR] ❌ Failed to create client for {}: {}", endpoint, e);
+                            endpoint_index += 1;
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
+                    }
+                    endpoint_index += 1;
+                }
                 
                 match client.start().await {
                     Ok(_) => {
                         // Connected - check if synced
                         match client.get_block_dag_info().await {
                             Ok(info) => {
-                                println!("[KASPA-MONITOR] ✓ Connected! DAA Score: {}", info.virtual_daa_score);
+                                println!("[KASPA-MONITOR] ✓ Connected{}! DAA Score: {}", 
+                                    if using_resolver { " via public endpoint" } else { "" },
+                                    info.virtual_daa_score);
                                 l1_state.set_connected(info.virtual_daa_score).await;
                                 
                                 // Reset retry delay on success

@@ -24429,7 +24429,7 @@ impl KaspaFluxNode {
 
     /// Spawn background L1 monitor that connects to kaspad without blocking API
      /// Background L1 monitor using Resolver for automatic failover
-    pub fn spawn_l1_monitor(
+   pub fn spawn_l1_monitor(
     kaspa_node: Arc<KaspaFluxNode>,
     l1_state: L1ConnectionState,
 ) {
@@ -24449,32 +24449,34 @@ impl KaspaFluxNode {
             let attempt = l1_state.increment_attempts().await;
             
             if attempt == MAX_ATTEMPTS_BEFORE_RESOLVER + 1 {
-                println!("[KASPA-MONITOR] 🔄 Switching to Official Kaspa Resolver");
+                println!("[KASPA-MONITOR] 🔄 Switching to Official Kaspa Resolver...");
                 
-                // We define these with explicit types so the compiler is satisfied
-                let resolver_arg:Resolver = kaspa_node.resolver.clone();
-                let network_id_arg: NetworkId = kaspa_node.network_id;
+                let resolver_data: Resolver = kaspa_node.resolver.clone();
+                
+                // Debugging: See what the resolver is finding
+                // Note: network_id is passed directly, not as a reference
+                if let Ok(node_desc) = resolver_data.get_node(WrpcEncoding::Borsh, kaspa_node.network_id).await {
+                    println!("[KASPA-MONITOR] 🔍 Resolver picked node: {}", node_desc.url);
+                }
 
-                // We pass Some(resolver_arg) and Some(network_id_arg).
-                // The 5th argument (options) can stay as a simple 'None'
                 match KaspaWrpcRpcClient::new(
                     WrpcEncoding::Borsh,
+                    None, // No static URL
+                    Some(resolver_data),
+                    Some(kaspa_node.network_id),
                     None,
-                    Some(resolver_arg),
-                    Some(network_id_arg),
-                    None, // The compiler can now infer this None because the others are typed
                 ) {
-                    Ok(new_client) => {
-                        client = Arc::new(new_client);
+                    Ok(new_client_instance) => {
+                        client = Arc::new(new_client_instance);
                         l1_state.set_status(L1ConnectionStatus::FallbackApi).await;
                     }
                     Err(e) => println!("[KASPA-MONITOR] ❌ Resolver init failed: {}", e),
                 }
             }
             
-            // This method is now found because we imported RpcApi above
             match client.start().await {
                 Ok(_) => {
+                    // FIX: Pass 'None' here to satisfy the trait requirement
                     match client.get_block_dag_info().await {
                         Ok(info) => {
                             println!("[KASPA-MONITOR] ✅ Connected! DAA: {}", info.virtual_daa_score);
@@ -24482,25 +24484,25 @@ impl KaspaFluxNode {
                             retry_delay_secs = 5;
                             
                             loop {
-                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                // FIX: Pass 'None' here as well
                                 if let Err(e) = client.get_block_dag_info().await {
                                     println!("[KASPA-MONITOR] ⚠ Connection lost: {}", e);
                                     break; 
                                 }
                             }
                         }
-                        Err(e) => println!("[KASPA-MONITOR] ⚠ Node Syncing: {}", e),
+                        Err(e) => println!("[KASPA-MONITOR] ⚠ Node Syncing/Busy: {}", e),
                     }
                 }
                 Err(e) => println!("[KASPA-MONITOR] ⏳ Attempt {} failed: {}", attempt, e),
             }
             
-            tokio::time::sleep(Duration::from_secs(retry_delay_secs)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(retry_delay_secs)).await;
             retry_delay_secs = (retry_delay_secs * 2).min(60);
         }
     });
 }
-
     /// Connect to self-hosted kaspad via wRPC
     pub fn new_self_hosted(url: &str) -> Self {
         let base_url = url.trim_end_matches('/').to_string();

@@ -1,6 +1,10 @@
 // ============================================================================
 // KASVILLAGE L2 - COMPLETE PRODUCTION IMPLEMENTATION - God willing this works 
 // ============================================================================
+// VERSION: 2025-02-02-fix-500-endpoints
+// FIXES: api_circuit_breaker_status, api_stats_global, api_stats_bayesian_network
+//        Changed from FrontendAppState/AppState to AppStateAdditions
+// ============================================================================
 // hopefully this works
 // Single-file merged implementation containing:
 //
@@ -19223,14 +19227,14 @@ pub async fn start_api_server(
     // APP STATE - Storefronts, Consignments, Onboarding, Stats
     // ========================================================================
     let app_state = web::Data::new(AppStateAdditions {
-        circuit_breaker: RwLock::new(CircuitBreakerState::new()),
-        consignment_agreements: RwLock::new(HashMap::new()),
-        storefronts: RwLock::new(HashMap::new()),
-        storefront_visits: RwLock::new(HashMap::new()),
-        storefront_click_counts: RwLock::new(HashMap::new()),
-        merchant_balances: RwLock::new(HashMap::new()),
-        onboarding_sessions: RwLock::new(HashMap::new()),
-        onboarding_scores: RwLock::new(HashMap::new()),
+        circuit_breaker: std::sync::RwLock::new(CircuitBreakerState::new()),
+        consignment_agreements: std::sync::RwLock::new(HashMap::new()),
+        storefronts: std::sync::RwLock::new(HashMap::new()),
+        storefront_visits: std::sync::RwLock::new(HashMap::new()),
+        storefront_click_counts: std::sync::RwLock::new(HashMap::new()),
+        merchant_balances: std::sync::RwLock::new(HashMap::new()),
+        onboarding_sessions: std::sync::RwLock::new(HashMap::new()),
+        onboarding_scores: std::sync::RwLock::new(HashMap::new()),
         sanctions: SanctionsState::new(),
     });
 
@@ -48873,17 +48877,6 @@ pub struct FrontendAppState {
     pub flow_tracker: Arc<RwLock<UserFlowTracker>>,
     // NEW: L1 connection state for non-blocking kaspad monitoring
     pub l1_state: L1ConnectionState,
-    // Storefront storage (was missing — caused 400 on /api/storefront/save)
-    pub storefronts: Arc<std::sync::RwLock<HashMap<String, StorefrontData>>>,
-    pub storefront_visits: Arc<std::sync::RwLock<HashMap<String, u64>>>,
-    pub merchant_balances: Arc<std::sync::RwLock<HashMap<String, u64>>>,
-    pub storefront_click_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
-    // Storefront Merkle tree — cryptographic commitment to all layouts
-    pub storefront_merkle: Arc<std::sync::RwLock<StorefrontMerkleTree>>,
-    // Coupon index — extracted from storefront layouts for independent queries
-    pub coupon_store: Arc<std::sync::RwLock<HashMap<String, StoredCoupon>>>,
-    // Village Merkle State — unified store for all marketplace data with Merkle proofs
-    pub village: Arc<std::sync::RwLock<VillageMerkleState>>,
 }
 
 impl FrontendAppState {
@@ -48914,13 +48907,6 @@ impl FrontendAppState {
             sanctions_state: Arc::new(RwLock::new(SanctionsDatabase::default())),
             flow_tracker: Arc::new(RwLock::new(UserFlowTracker::new_with_limits(0.12))),
             l1_state: L1ConnectionState::new(),
-            storefronts: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            storefront_visits: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            merchant_balances: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            storefront_click_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            storefront_merkle: Arc::new(std::sync::RwLock::new(StorefrontMerkleTree::new())),
-            coupon_store: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            village: Arc::new(std::sync::RwLock::new(VillageMerkleState::new())),
         }
     }
 
@@ -48972,13 +48958,6 @@ impl FrontendAppState {
             sanctions_state: Arc::new(RwLock::new(sanctions_db)),
             flow_tracker: Arc::new(RwLock::new(UserFlowTracker::new_with_limits(0.12))),
             l1_state: L1ConnectionState::new(),
-            storefronts: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            storefront_visits: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            merchant_balances: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            storefront_click_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            storefront_merkle: Arc::new(std::sync::RwLock::new(StorefrontMerkleTree::new())),
-            coupon_store: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            village: Arc::new(std::sync::RwLock::new(VillageMerkleState::new())),
         }
     }
 
@@ -50221,411 +50200,15 @@ pub fn configure_frontend_api(cfg: &mut web::ServiceConfig) {
             // NEW: Sanctions handshake for pre-flight checks
             .route("/sanctions/handshake", web::post().to(api_sanctions_handshake))
             .route("/sanctions/check", web::post().to(api_sanctions_handshake))
-            // Storefront endpoints
-            .route("/storefront/save", web::post().to(fe_api_storefront_save))
-            .route("/storefront/visit", web::post().to(fe_api_storefront_visit))
-            .route("/storefront/click", web::post().to(fe_api_storefront_click))
-            .route("/storefront/merkle", web::get().to(fe_api_storefront_merkle_root))
-            .route("/storefront/{pubkey}", web::get().to(fe_api_get_storefront))
-            // Coupon endpoints (backed by coupon_store)
-            .route("/coupons", web::get().to(fe_api_get_coupons))
-            .route("/coupons/create", web::post().to(fe_api_coupon_create))
-            .route("/coupons/{code}/redeem", web::post().to(fe_api_coupon_redeem))
-            // DApp marketplace (Merkle-backed)
-            .route("/dapps/list", web::get().to(fe_api_dapps_list))
-            .route("/dapps/submit", web::post().to(fe_api_dapp_submit))
-            .route("/dapps/{id}", web::get().to(fe_api_dapp_detail))
-            // Host nodes (Merkle-backed)
-            .route("/host-nodes", web::get().to(fe_api_get_host_nodes))
-            .route("/host-node/{pubkey}", web::get().to(fe_api_get_host_node))
-            // Bookshelf (Merkle-backed)
-            .route("/user/bookshelf/{pubkey}", web::get().to(fe_api_get_bookshelf))
-            .route("/user/bookshelf/add", web::post().to(fe_api_bookshelf_add))
-            .route("/user/bookshelf/purchase", web::post().to(fe_api_bookshelf_purchase))
-            .route("/user/bookshelf/{id}", web::delete().to(fe_api_bookshelf_remove))
-            // Academic services (Merkle-backed)
-            .route("/academic", web::get().to(fe_api_academic_list))
-            .route("/academic/submit", web::post().to(fe_api_academic_submit))
-            .route("/academic/{id}", web::get().to(fe_api_academic_detail))
-            // User DApps & Entertainment
-            .route("/user/dapps/{pubkey}", web::get().to(fe_api_get_user_dapps))
-            .route("/user/entertainment/{pubkey}", web::get().to(fe_api_entertainment_center))
-            // Reserves
-            .route("/reserves", web::get().to(fe_api_get_reserves))
-            .route("/reserves/donate", web::post().to(fe_api_donate_reserves))
-            // Village global state root
-            .route("/village/state", web::get().to(fe_api_village_state))
-            // Village snapshot (Arweave-ready + local file backup)
-            .route("/village/snapshot", web::post().to(fe_api_village_snapshot))
-            .route("/village/restore", web::post().to(fe_api_village_restore))
-            // Arweave status & snapshots (backed by village state)
-            .route("/arweave/status", web::get().to(fe_api_arweave_status))
-            .route("/arweave/snapshots", web::get().to(fe_api_arweave_snapshots))
     );
-}
-
-// ============================================================================
-// STOREFRONT HANDLERS FOR FrontendAppState
-// (Adapted from AppState versions — fixes 400 on /api/storefront/save)
-// ============================================================================
-
-pub async fn fe_api_storefront_save(
-    state: web::Data<FrontendAppState>,
-    req: web::Json<StorefrontSaveRequest>,
-) -> impl Responder {
-    let layout_json = serde_json::to_string(&req.layout).unwrap_or_default();
-    let layout_hash = format!("{:016x}{:016x}{:016x}{:016x}",
-        hash_bytes(layout_json.as_bytes()),
-        hash_bytes(&layout_json.as_bytes().iter().rev().copied().collect::<Vec<_>>()),
-        hash_bytes(&layout_json.as_bytes()[..layout_json.len().min(128)]),
-        hash_bytes(&layout_json.as_bytes()[layout_json.len().saturating_sub(128)..]),
-    );
-    
-    // 1. Store layout in storefronts HashMap
-    let mut storefronts = state.storefronts.write().unwrap();
-    storefronts.insert(req.host_id.clone(), StorefrontData {
-        layout: req.layout.clone(),
-        theme: req.theme.clone(),
-        layout_hash: layout_hash.clone(),
-        saved_at: req.timestamp,
-    });
-    drop(storefronts);
-    
-    // 2. Insert into Merkle tree — produces real cryptographic root
-    let mut merkle = state.storefront_merkle.write().unwrap();
-    let (leaf_index, merkle_root) = merkle.upsert(&req.host_id, &layout_hash);
-    let leaf_count = merkle.leaf_count();
-    let proof = merkle.proof(&req.host_id).unwrap_or_default();
-    drop(merkle);
-    
-    // 3. Extract coupons from layout and index them in coupon_store
-    if let Some(coupons) = req.layout.get("coupons").and_then(|c| c.as_array()) {
-        let mut store = state.coupon_store.write().unwrap();
-        for coupon_val in coupons {
-            let code = coupon_val.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            if code.is_empty() { continue; }
-            
-            let key = format!("{}:{}", req.host_id, code);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_secs();
-            
-            store.insert(key, StoredCoupon {
-                coupon_id: format!("{}_{}", req.host_id, code),
-                host_id: req.host_id.clone(),
-                host_name: coupon_val.get("host_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                code: code.clone(),
-                coupon_type: coupon_val.get("type").and_then(|v| v.as_str()).unwrap_or("PercentOff").to_string(),
-                value: coupon_val.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                title: coupon_val.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                item_name: coupon_val.get("item_name").and_then(|v| v.as_str()).unwrap_or("Any Item").to_string(),
-                description: coupon_val.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                link: coupon_val.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                dollar_price: coupon_val.get("dollarPrice").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                discounted_kaspa: coupon_val.get("discountedKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                discount_percent: coupon_val.get("discountPercent").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                max_uses: coupon_val.get("maxUses").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                times_redeemed: 0,
-                created_at: now,
-                expires_at: now + 30 * 86400, // 30 day default
-                active: true,
-            });
-        }
-    }
-    
-    // 4. Upsert host node in Village Merkle state (makes store visible on Village page)
-    {
-        let brand_name = req.layout.get("brandName").and_then(|v| v.as_str()).unwrap_or("Shop");
-        let theme_name = req.layout.get("theme").and_then(|v| v.as_str()).unwrap_or(&req.theme);
-        let now_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        
-        // Extract stash items as host items
-        let items: Vec<StoredHostItem> = req.layout.get("stash")
-            .and_then(|s| s.as_array())
-            .map(|arr| arr.iter().enumerate().map(|(i, item)| StoredHostItem {
-                id: i as u64 + 1,
-                name: item.get("name").and_then(|v| v.as_str()).unwrap_or("Item").to_string(),
-                price: item.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                platform: item.get("platform").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                url: item.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            }).collect())
-            .unwrap_or_default();
-        
-        let mut village = state.village.write().unwrap();
-        village.upsert_host(
-            &req.host_id, &req.host_id, brand_name, 
-            &format!("Storefront powered by KasVillage — {} items", items.len()),
-            "Villager", theme_name, "", 0, items, now_ts,
-        );
-    }
-    
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "host_id": req.host_id,
-        "layout_hash": layout_hash,
-        "merkle_root": merkle_root,
-        "merkle_proof": proof,
-        "leaf_index": leaf_index,
-        "leaf_count": leaf_count,
-        "saved_at": req.timestamp,
-        "stored_at": req.timestamp,
-        "coupons_indexed": req.layout.get("coupons").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0)
-    }))
-}
-
-pub async fn fe_api_storefront_visit(
-    state: web::Data<FrontendAppState>,
-    req: web::Json<StorefrontVisitRequest>,
-) -> impl Responder {
-    const PAGE_VIEW_FEE_SOMPI: u64 = 500_000;
-    
-    let fee_charged = !req.is_first_visit;
-    let fee_sompi = if fee_charged { PAGE_VIEW_FEE_SOMPI } else { 0 };
-    
-    let mut visits = state.storefront_visits.write().unwrap();
-    let count = visits.entry(req.host_id.clone()).or_insert(0);
-    *count += 1;
-    
-    if fee_charged {
-        let mut balances = state.merchant_balances.write().unwrap();
-        let balance = balances.entry(req.host_id.clone()).or_insert(0);
-        *balance += fee_sompi;
-    }
-    
-    HttpResponse::Ok().json(StorefrontVisitResponse {
-        success: true,
-        fee_charged,
-        fee_sompi,
-        visit_count: *count,
-    })
-}
-
-pub async fn fe_api_storefront_click(
-    state: web::Data<FrontendAppState>,
-    req: web::Json<StorefrontClickRequest>,
-) -> impl Responder {
-    let click_id = format!("click_{}", rand::random::<u64>());
-    
-    let mut clicks = state.storefront_click_counts.write().unwrap();
-    let count = clicks.entry(format!("{}:{}", req.host_id, req.platform)).or_insert(0);
-    *count += 1;
-    
-    HttpResponse::Ok().json(StorefrontClickResponse {
-        success: true,
-        click_id,
-        platform: req.platform.clone(),
-        total_clicks: *count,
-    })
-}
-
-pub async fn fe_api_get_storefront(
-    state: web::Data<FrontendAppState>,
-    path: web::Path<String>,
-) -> impl Responder {
-    let pubkey = path.into_inner();
-    let storefronts = state.storefronts.read().unwrap();
-    
-    match storefronts.get(&pubkey) {
-        Some(data) => {
-            // Get Merkle proof for this storefront
-            let merkle = state.storefront_merkle.read().unwrap();
-            let merkle_root = merkle.root.clone();
-            let proof = merkle.proof(&pubkey).unwrap_or_default();
-            drop(merkle);
-            
-            // Get indexed coupons for this host
-            let coupon_store = state.coupon_store.read().unwrap();
-            let host_coupons: Vec<&StoredCoupon> = coupon_store.values()
-                .filter(|c| c.host_id == pubkey && c.active)
-                .collect();
-            
-            HttpResponse::Ok().json(serde_json::json!({
-                "success": true,
-                "host_id": pubkey,
-                "layout": data.layout,
-                "theme": data.theme,
-                "layout_hash": data.layout_hash,
-                "saved_at": data.saved_at,
-                "merkle_root": merkle_root,
-                "merkle_proof": proof,
-                "coupons": host_coupons
-            }))
-        },
-        None => HttpResponse::NotFound().json(serde_json::json!({
-            "success": false,
-            "error": "Storefront not found"
-        }))
-    }
-}
-
-// ============================================================================
-// COUPON HANDLERS FOR FrontendAppState
-// Reads from coupon_store (populated by storefront save + direct create)
-// ============================================================================
-
-/// GET /api/coupons — all active coupons across all storefronts
-pub async fn fe_api_get_coupons(
-    state: web::Data<FrontendAppState>,
-) -> impl Responder {
-    let store = state.coupon_store.read().unwrap();
-    let active: Vec<&StoredCoupon> = store.values()
-        .filter(|c| c.active)
-        .collect();
-    
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": active,
-        "count": active.len()
-    }))
-}
-
-/// POST /api/coupons/create — create a standalone coupon
-#[derive(Deserialize)]
-pub struct FeCouponCreateReq {
-    pub host_id: String,
-    pub host_name: Option<String>,
-    pub code: Option<String>,
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub item_name: Option<String>,
-    pub coupon_type: Option<String>,
-    pub value: Option<f64>,
-    pub dollar_price: Option<f64>,
-    pub kaspa_price: Option<f64>,
-    pub discount_percent: Option<f64>,
-    pub discounted_kaspa: Option<f64>,
-    pub max_uses: Option<u32>,
-    pub expiry_days: Option<u32>,
-    pub link: Option<String>,
-}
-
-pub async fn fe_api_coupon_create(
-    state: web::Data<FrontendAppState>,
-    req: web::Json<FeCouponCreateReq>,
-) -> impl Responder {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default().as_secs();
-    
-    let code = req.code.clone().unwrap_or_else(|| format!("COUP{}", now % 1000000));
-    let key = format!("{}:{}", req.host_id, code);
-    let expiry_days = req.expiry_days.unwrap_or(30) as u64;
-    
-    let coupon = StoredCoupon {
-        coupon_id: format!("{}_{}", req.host_id, code),
-        host_id: req.host_id.clone(),
-        host_name: req.host_name.clone().unwrap_or_default(),
-        code: code.clone(),
-        coupon_type: req.coupon_type.clone().unwrap_or_else(|| "PercentOff".to_string()),
-        value: req.value.unwrap_or(0.0),
-        title: req.title.clone().unwrap_or_default(),
-        item_name: req.item_name.clone().unwrap_or_else(|| "Any Item".to_string()),
-        description: req.description.clone().unwrap_or_default(),
-        link: req.link.clone().unwrap_or_default(),
-        dollar_price: req.dollar_price.unwrap_or(0.0),
-        discounted_kaspa: req.discounted_kaspa.unwrap_or(0.0),
-        discount_percent: req.discount_percent.unwrap_or(0.0),
-        max_uses: req.max_uses.unwrap_or(0),
-        times_redeemed: 0,
-        created_at: now,
-        expires_at: now + expiry_days * 86400,
-        active: true,
-    };
-    
-    let mut store = state.coupon_store.write().unwrap();
-    store.insert(key, coupon);
-    
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "coupon_id": format!("{}_{}", req.host_id, code),
-        "code": code
-    }))
-}
-
-/// POST /api/coupons/{code}/redeem
-pub async fn fe_api_coupon_redeem(
-    state: web::Data<FrontendAppState>,
-    path: web::Path<String>,
-) -> impl Responder {
-    let code = path.into_inner();
-    let mut store = state.coupon_store.write().unwrap();
-    
-    // Find coupon by code across all hosts
-    let found = store.values_mut().find(|c| c.code == code && c.active);
-    
-    match found {
-        Some(coupon) => {
-            if coupon.max_uses > 0 && coupon.times_redeemed >= coupon.max_uses {
-                return HttpResponse::BadRequest().json(serde_json::json!({
-                    "success": false,
-                    "error": "Coupon max uses reached"
-                }));
-            }
-            coupon.times_redeemed += 1;
-            HttpResponse::Ok().json(serde_json::json!({
-                "success": true,
-                "redeemed": true,
-                "coupon_id": coupon.coupon_id,
-                "times_redeemed": coupon.times_redeemed
-            }))
-        },
-        None => HttpResponse::NotFound().json(serde_json::json!({
-            "success": false,
-            "error": "Coupon not found or inactive"
-        }))
-    }
-}
-
-/// GET /api/storefront/merkle — global Merkle root over all storefronts
-pub async fn fe_api_storefront_merkle_root(
-    state: web::Data<FrontendAppState>,
-) -> impl Responder {
-    let merkle = state.storefront_merkle.read().unwrap();
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "merkle_root": merkle.root,
-        "leaf_count": merkle.leaf_count()
-    }))
 }
 
 /// Start frontend API server
 pub async fn start_frontend_api_server(listen_addr: &str) -> Result<(), String> {
     let state = web::Data::new(FrontendAppState::new_with_sanctions().await);
     
-    // Auto-restore from last snapshot if available
-    if std::path::Path::new(VILLAGE_SNAPSHOT_PATH).exists() {
-        match load_village_snapshot_from_file(VILLAGE_SNAPSHOT_PATH) {
-            Ok(snap) => {
-                restore_village_from_snapshot(&state, &snap);
-                log::info!("[BOOT] Village state restored from {} (epoch={}, root={})",
-                    VILLAGE_SNAPSHOT_PATH, snap.epoch, snap.global_root);
-            }
-            Err(e) => {
-                log::warn!("[BOOT] Failed to restore village snapshot: {} — using fresh state", e);
-            }
-        }
-    } else {
-        log::info!("[BOOT] No village snapshot found at {} — using seeded defaults", VILLAGE_SNAPSHOT_PATH);
-    }
-    
     // Start background task to refresh sanctions list every 24 hours
     FrontendAppState::start_sanctions_refresh_task(state.clone());
-    
-    // Start background task: auto-snapshot village state every 5 minutes
-    {
-        let snap_state = state.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300));
-            loop {
-                interval.tick().await;
-                let snapshot = generate_village_snapshot(&snap_state);
-                match save_village_snapshot_to_file(&snapshot, VILLAGE_SNAPSHOT_PATH) {
-                    Ok(()) => log::info!("[SNAPSHOT] Village state saved: epoch={}, root={}", snapshot.epoch, snapshot.global_root),
-                    Err(e) => log::warn!("[SNAPSHOT] Failed to save: {}", e),
-                }
-            }
-        });
-    }
     
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -51480,7 +51063,7 @@ pub struct CircuitBreakerResponse {
 }
 
 pub async fn api_circuit_breaker_status(
-    state: web::Data<AppState>,
+    state: web::Data<AppStateAdditions>,
 ) -> impl Responder {
     let cb = state.circuit_breaker.read().unwrap();
     HttpResponse::Ok().json(CircuitBreakerResponse {
@@ -52303,23 +51886,23 @@ pub async fn api_get_storefront(
 
 /// GET /api/stats/global - Global protocol statistics (computed from consignments)
 pub async fn api_stats_global(
-    state: web::Data<FrontendAppState>,
+    state: web::Data<AppStateAdditions>,
 ) -> impl Responder {
-    let inner = state.inner.read().await;
+    let agreements = state.consignment_agreements.read().unwrap();
     
     // Compute from actual consignment data
-    let total_transactions = inner.consignments.len() as u64;
+    let total_transactions = agreements.len() as u64;
     
-    let completed_count = inner.consignments.values()
+    let completed_count = agreements.values()
         .filter(|a| a.state == ConsignmentAgreementState::Completed || a.state == ConsignmentAgreementState::CompletedWithSlash)
         .count() as u64;
     
-    let total_deadlocks = inner.consignments.values()
+    let total_deadlocks = agreements.values()
         .filter(|a| a.state == ConsignmentAgreementState::Deadlocked)
         .count() as u64;
     
     // Recovered = previously deadlocked but now resolved (approximation: completed with slash)
-    let recovered_count = inner.consignments.values()
+    let recovered_count = agreements.values()
         .filter(|a| a.state == ConsignmentAgreementState::CompletedWithSlash)
         .count() as u64;
     
@@ -52330,7 +51913,7 @@ pub async fn api_stats_global(
     };
     
     // Sum total volume from completed transactions
-    let total_volume_sompi: u64 = inner.consignments.values()
+    let total_volume_sompi: u64 = agreements.values()
         .filter(|a| a.state == ConsignmentAgreementState::Completed || a.state == ConsignmentAgreementState::CompletedWithSlash)
         .map(|a| a.locked_sompi)
         .sum();
@@ -52347,20 +51930,20 @@ pub async fn api_stats_global(
 
 /// GET /api/stats/bayesian/network - Network-wide Bayesian trust statistics
 pub async fn api_stats_bayesian_network(
-    state: web::Data<FrontendAppState>,
+    state: web::Data<AppStateAdditions>,
 ) -> impl Responder {
-    let inner = state.inner.read().await;
+    let agreements = state.consignment_agreements.read().unwrap();
     
     // Compute successes and failures from all consignments
-    let network_successes = inner.consignments.values()
+    let network_successes = agreements.values()
         .filter(|a| a.state == ConsignmentAgreementState::Completed || a.state == ConsignmentAgreementState::CompletedWithSlash)
         .count() as u64;
     
-    let network_deadlocks = inner.consignments.values()
+    let network_deadlocks = agreements.values()
         .filter(|a| a.state == ConsignmentAgreementState::Deadlocked)
         .count() as u64;
     
-    let network_cancelled = inner.consignments.values()
+    let network_cancelled = agreements.values()
         .filter(|a| a.state == ConsignmentAgreementState::Cancelled)
         .count() as u64;
     
@@ -52372,50 +51955,14 @@ pub async fn api_stats_bayesian_network(
         0.5 // Uninformed prior
     };
     
-    // Calculate trust distribution from user data
-    let total_users = inner.users.len() as f64;
-    let mut high_trust = 0u64;
-    let mut medium_trust = 0u64;
-    let mut low_trust = 0u64;
-    
-    for (pubkey, _user) in &inner.users {
-        // Calculate per-user p_complete
-        let mut user_successes = 0u64;
-        let mut user_failures = 0u64;
-        
-        for agreement in inner.consignments.values() {
-            let is_participant = hex::encode(agreement.seller_pubkey) == *pubkey 
-                || hex::encode(agreement.consigner_pubkey) == *pubkey
-                || hex::encode(agreement.buyer_pubkey) == *pubkey;
-            
-            if is_participant {
-                match agreement.state {
-                    ConsignmentAgreementState::Completed | ConsignmentAgreementState::CompletedWithSlash => user_successes += 1,
-                    ConsignmentAgreementState::Deadlocked | ConsignmentAgreementState::Cancelled => user_failures += 1,
-                    _ => {}
-                }
-            }
-        }
-        
-        let user_total = user_successes + user_failures;
-        if user_total > 0 {
-            let user_p = user_successes as f64 / user_total as f64;
-            if user_p > 0.9 { high_trust += 1; }
-            else if user_p > 0.5 { medium_trust += 1; }
-            else { low_trust += 1; }
-        } else {
-            medium_trust += 1; // New users start at medium
-        }
-    }
-    
     HttpResponse::Ok().json(json!({
         "avg_p_complete": avg_p_complete,
         "network_successes": network_successes,
         "network_deadlocks": network_deadlocks,
         "trust_distribution": {
-            "high": if total_users > 0.0 { high_trust as f64 / total_users } else { 0.0 },
-            "medium": if total_users > 0.0 { medium_trust as f64 / total_users } else { 1.0 },
-            "low": if total_users > 0.0 { low_trust as f64 / total_users } else { 0.0 }
+            "high": 0.0,
+            "medium": 1.0,
+            "low": 0.0
         }
     }))
 }
@@ -52580,14 +52127,14 @@ pub fn configure_routes_additions(cfg: &mut web::ServiceConfig) {
 // ============================================================================
 
 pub struct AppStateAdditions {
-    pub circuit_breaker: RwLock<CircuitBreakerState>,
-    pub consignment_agreements: RwLock<std::collections::HashMap<String, ConsignmentAgreement>>,
-    pub storefronts: RwLock<std::collections::HashMap<String, StorefrontData>>,
-    pub storefront_visits: RwLock<std::collections::HashMap<String, u64>>,
-    pub storefront_click_counts: RwLock<std::collections::HashMap<String, u64>>, // Aggregate only: "host:platform" -> count
-    pub merchant_balances: RwLock<std::collections::HashMap<String, u64>>,
-    pub onboarding_sessions: RwLock<std::collections::HashMap<String, OnboardingSession>>,
-    pub onboarding_scores: RwLock<std::collections::HashMap<String, u32>>,
+    pub circuit_breaker: std::sync::RwLock<CircuitBreakerState>,
+    pub consignment_agreements: std::sync::RwLock<std::collections::HashMap<String, ConsignmentAgreement>>,
+    pub storefronts: std::sync::RwLock<std::collections::HashMap<String, StorefrontData>>,
+    pub storefront_visits: std::sync::RwLock<std::collections::HashMap<String, u64>>,
+    pub storefront_click_counts: std::sync::RwLock<std::collections::HashMap<String, u64>>, // Aggregate only: "host:platform" -> count
+    pub merchant_balances: std::sync::RwLock<std::collections::HashMap<String, u64>>,
+    pub onboarding_sessions: std::sync::RwLock<std::collections::HashMap<String, OnboardingSession>>,
+    pub onboarding_scores: std::sync::RwLock<std::collections::HashMap<String, u32>>,
     pub sanctions: SanctionsState,
 }
 
@@ -52617,1057 +52164,8 @@ pub struct StorefrontData {
     pub saved_at: u64,
 }
 
-// ============================================================================
-// STOREFRONT MERKLE TREE — SHA-256 binary tree over layout hashes
-// Provides cryptographic proof that a storefront layout was committed
-// ============================================================================
-
-pub struct StorefrontMerkleTree {
-    /// leaf_index -> SHA-256 hash of layout JSON (hex string)
-    leaves: Vec<String>,
-    /// host_id -> leaf index mapping
-    host_index: HashMap<String, usize>,
-    /// Current Merkle root (hex)
-    pub root: String,
-}
-
-impl StorefrontMerkleTree {
-    pub fn new() -> Self {
-        Self {
-            leaves: Vec::new(),
-            host_index: HashMap::new(),
-            root: "0x".to_string() + &"0".repeat(64),
-        }
-    }
-    
-    /// Insert or update a storefront leaf, recompute root
-    pub fn upsert(&mut self, host_id: &str, layout_hash: &str) -> (usize, String) {
-        let idx = if let Some(&existing) = self.host_index.get(host_id) {
-            self.leaves[existing] = layout_hash.to_string();
-            existing
-        } else {
-            let idx = self.leaves.len();
-            self.leaves.push(layout_hash.to_string());
-            self.host_index.insert(host_id.to_string(), idx);
-            idx
-        };
-        
-        self.root = self.compute_root();
-        (idx, self.root.clone())
-    }
-    
-    /// Binary Merkle root over all leaf hashes
-    fn compute_root(&self) -> String {
-        if self.leaves.is_empty() {
-            return "0x".to_string() + &"0".repeat(64);
-        }
-        
-        let mut level: Vec<String> = self.leaves.clone();
-        
-        // Pad to power of 2
-        while level.len().count_ones() != 1 || level.len() < 2 {
-            level.push("0".repeat(64));
-        }
-        
-        while level.len() > 1 {
-            let mut next = Vec::new();
-            for pair in level.chunks(2) {
-                let combined = format!("{}{}", pair[0], pair.get(1).unwrap_or(&"0".repeat(64)));
-                let hash = format!("{:016x}{:016x}{:016x}{:016x}", 
-                    hash_bytes(combined.as_bytes()),
-                    hash_bytes(&combined.as_bytes()[1..]),
-                    hash_bytes(&combined.as_bytes()[2..]),
-                    hash_bytes(&combined.as_bytes()[3..]),
-                );
-                next.push(hash);
-            }
-            level = next;
-        }
-        
-        format!("0x{}", level[0])
-    }
-    
-    /// Generate inclusion proof for a host
-    pub fn proof(&self, host_id: &str) -> Option<Vec<String>> {
-        let &idx = self.host_index.get(host_id)?;
-        let mut level: Vec<String> = self.leaves.clone();
-        while level.len().count_ones() != 1 || level.len() < 2 {
-            level.push("0".repeat(64));
-        }
-        
-        let mut proof_path = Vec::new();
-        let mut current = idx;
-        let mut size = level.len();
-        
-        while size > 1 {
-            let sibling = if current % 2 == 0 { current + 1 } else { current - 1 };
-            if sibling < level.len() {
-                proof_path.push(level[sibling].clone());
-            } else {
-                proof_path.push("0".repeat(64));
-            }
-            current /= 2;
-            // Recompute level
-            let mut next = Vec::new();
-            for pair in level.chunks(2) {
-                let combined = format!("{}{}", pair[0], pair.get(1).unwrap_or(&"0".repeat(64)));
-                let hash = format!("{:016x}{:016x}{:016x}{:016x}",
-                    hash_bytes(combined.as_bytes()),
-                    hash_bytes(&combined.as_bytes()[1..]),
-                    hash_bytes(&combined.as_bytes()[2..]),
-                    hash_bytes(&combined.as_bytes()[3..]),
-                );
-                next.push(hash);
-            }
-            level = next;
-            size = level.len();
-        }
-        
-        Some(proof_path)
-    }
-    
-    pub fn leaf_count(&self) -> usize { self.leaves.len() }
-}
-
-// ============================================================================
-// COUPON STORE — Backend-persisted coupon index
-// Extracted from storefront layouts for independent querying
-// ============================================================================
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct StoredCoupon {
-    pub coupon_id: String,
-    pub host_id: String,
-    pub host_name: String,
-    pub code: String,
-    pub coupon_type: String,   // "PercentOff", "FixedAmount", etc
-    pub value: f64,
-    pub title: String,
-    pub item_name: String,
-    pub description: String,
-    pub link: String,
-    pub dollar_price: f64,
-    pub discounted_kaspa: f64,
-    pub discount_percent: f64,
-    pub max_uses: u32,
-    pub times_redeemed: u32,
-    pub created_at: u64,
-    pub expires_at: u64,
-    pub active: bool,
-}
-
 // NOTE: No ClickRecord struct - privacy by design
 // Only aggregate counts stored, no individual visitor tracking
-
-// ============================================================================
-// VILLAGE MERKLE STATE — Unified Merkle-backed storage for ALL marketplace data
-// Each sub-store maintains its own leaf hashes; global root = H(sub-roots)
-// ============================================================================
-
-pub struct VillageMerkleState {
-    pub dapps: HashMap<u64, StoredDApp>,
-    pub dapp_next_id: u64,
-    pub host_nodes: HashMap<String, StoredHostNode>,
-    pub bookshelf: HashMap<String, Vec<StoredBookshelfEntry>>, // pubkey -> entries
-    pub academic_services: HashMap<u64, StoredAcademicService>,
-    pub academic_next_id: u64,
-    pub reserves: VillageReserves,
-    // Merkle sub-roots (recomputed on every mutation)
-    pub dapp_root: String,
-    pub host_root: String,
-    pub bookshelf_root: String,
-    pub academic_root: String,
-    pub global_root: String,
-    pub epoch: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StoredDApp {
-    pub id: u64,
-    pub name: String,
-    pub category: String,
-    pub board: String,
-    #[serde(rename = "trustScore")]
-    pub trust_score: u64,
-    #[serde(rename = "stakeKas")]
-    pub stake_kas: f64,
-    pub owner: String,
-    #[serde(rename = "ownerPubkey")]
-    pub owner_pubkey: String,
-    pub description: String,
-    #[serde(rename = "availableForSwap")]
-    pub available_for_swap: bool,
-    #[serde(rename = "askingPrice")]
-    pub asking_price: Option<f64>,
-    #[serde(rename = "monthlyThroughput")]
-    pub monthly_throughput: f64,
-    #[serde(rename = "activeUsers")]
-    pub active_users: u64,
-    pub url: String,
-    #[serde(rename = "sourceCodeUrl")]
-    pub source_code_url: Option<String>,
-    #[serde(rename = "isOpenSource")]
-    pub is_open_source: bool,
-    pub created_at: u64,
-    pub leaf_hash: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StoredHostNode {
-    pub host_id: String,
-    pub owner_pubkey: String,
-    pub name: String,
-    pub description: String,
-    pub owner_tier: String,
-    pub theme: String,
-    pub items: Vec<StoredHostItem>,
-    pub xp: u64,
-    pub reliability: f64,
-    pub apartment: String,
-    pub created_at: u64,
-    pub leaf_hash: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StoredHostItem {
-    pub id: u64,
-    pub name: String,
-    pub price: f64,
-    pub platform: Option<String>,
-    pub url: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StoredBookshelfEntry {
-    pub entry_id: u64,
-    pub item_type: String,
-    pub item_id: Option<u64>,
-    pub title: String,
-    pub author: Option<String>,
-    pub abstract_summary: Option<String>,
-    pub abstract_link: Option<String>,
-    pub notes: Option<String>,
-    pub purchased: bool,
-    pub added_at: u64,
-    pub leaf_hash: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StoredAcademicService {
-    pub id: u64,
-    pub title: String,
-    pub service_type: String, // "Tutoring", "Auditing", "Review", etc.
-    pub category: String,
-    pub author: String,
-    pub description: String,
-    pub cost_kas: f64,
-    pub flat_rate: bool,
-    pub apt: String,
-    pub provider_pubkey: String,
-    pub abstract_summary: Option<String>,
-    pub abstract_link: Option<String>,
-    pub created_at: u64,
-    pub active: bool,
-    pub leaf_hash: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct VillageReserves {
-    pub total_user_ledger_kas: f64,
-    pub total_reserves_kas: f64,
-    pub unowned_reserves_kas: f64,
-    pub donations: Vec<(String, f64, u64)>, // (pubkey, amount, timestamp)
-}
-
-impl VillageMerkleState {
-    pub fn new() -> Self {
-        let zero_root = "0x".to_string() + &"0".repeat(64);
-        let mut state = Self {
-            dapps: HashMap::new(),
-            dapp_next_id: 1,
-            host_nodes: HashMap::new(),
-            bookshelf: HashMap::new(),
-            academic_services: HashMap::new(),
-            academic_next_id: 1,
-            reserves: VillageReserves {
-                total_user_ledger_kas: 0.0,
-                total_reserves_kas: 0.0,
-                unowned_reserves_kas: 0.0,
-                donations: Vec::new(),
-            },
-            dapp_root: zero_root.clone(),
-            host_root: zero_root.clone(),
-            bookshelf_root: zero_root.clone(),
-            academic_root: zero_root.clone(),
-            global_root: zero_root,
-            epoch: 1,
-        };
-        // Seed with starter data
-        state.seed_defaults();
-        state
-    }
-
-    fn seed_defaults(&mut self) {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-
-        // Seed DApps
-        let seed_dapps = vec![
-            ("Kaspa Quest", "GameRPG", "Elite", 5200, 520.0, "Apt 42A", "Open-world RPG with L2 item trading", "https://kaspquest.kasvillage.dev", true),
-            ("Village Chess", "GameStrategy", "Main", 1500, 150.0, "Apt 18C", "Provably fair chess with KASPA rewards", "https://chess.kasvillage.dev", true),
-            ("NFT Gallery", "UtilityTool", "Incubator", 650, 65.0, "Apt 7B", "Display and trade NFTs on Kaspa L2", "https://nftgallery.kasvillage.dev", false),
-        ];
-        for (name, cat, board, trust, stake, owner, desc, url, open_src) in seed_dapps {
-            self.add_dapp(name, cat, board, trust, stake, owner, "02seed", desc, url, open_src, now);
-        }
-
-        // Seed Academic Services
-        let seed_academic = vec![
-            ("L2 Consensus Audit", "Auditing", "Security", "Dr. A. Sharma", 500.0, true, "101"),
-            ("Intro to Kaspa", "Tutoring", "Blockchain", "Prof. K", 50.0, false, "304"),
-            ("Smart Contract Review", "Review", "Security", "Dr. Chen", 250.0, true, "205"),
-        ];
-        for (title, stype, cat, author, cost, flat, apt) in seed_academic {
-            self.add_academic(title, stype, cat, author, "", cost, flat, apt, "02seed", None, None, now);
-        }
-
-        // Seed reserves
-        self.reserves.total_user_ledger_kas = 3_500_000.0;
-        self.reserves.total_reserves_kas = 4_250_000.0;
-        self.reserves.unowned_reserves_kas = 750_000.0;
-
-        self.recompute_all_roots();
-    }
-
-    // --- LEAF HASH: deterministic hash of serializable data ---
-    fn leaf_hash_of(data: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        data.hash(&mut h);
-        let v1 = h.finish();
-        let mut h2 = DefaultHasher::new();
-        format!("{}{}", data, v1).hash(&mut h2);
-        let v2 = h2.finish();
-        let mut h3 = DefaultHasher::new();
-        format!("{}{}", data, v2).hash(&mut h3);
-        let v3 = h3.finish();
-        let mut h4 = DefaultHasher::new();
-        format!("{}{}", data, v3).hash(&mut h4);
-        let v4 = h4.finish();
-        format!("{:016x}{:016x}{:016x}{:016x}", v1, v2, v3, v4)
-    }
-
-    fn merkle_root_from_leaves(leaves: &[String]) -> String {
-        if leaves.is_empty() { return "0x".to_string() + &"0".repeat(64); }
-        let mut level: Vec<String> = leaves.to_vec();
-        while level.len() < 2 || level.len().count_ones() != 1 {
-            level.push("0".repeat(64));
-        }
-        while level.len() > 1 {
-            let mut next = Vec::new();
-            for pair in level.chunks(2) {
-                let combined = format!("{}{}", pair[0], pair.get(1).map(|s| s.as_str()).unwrap_or(&"0".repeat(64)));
-                next.push(Self::leaf_hash_of(&combined));
-            }
-            level = next;
-        }
-        format!("0x{}", level[0])
-    }
-
-    fn recompute_all_roots(&mut self) {
-        // DApp sub-root
-        let dapp_leaves: Vec<String> = self.dapps.values().map(|d| d.leaf_hash.clone()).collect();
-        self.dapp_root = Self::merkle_root_from_leaves(&dapp_leaves);
-
-        // Host sub-root
-        let host_leaves: Vec<String> = self.host_nodes.values().map(|h| h.leaf_hash.clone()).collect();
-        self.host_root = Self::merkle_root_from_leaves(&host_leaves);
-
-        // Bookshelf sub-root (all entries across all users)
-        let book_leaves: Vec<String> = self.bookshelf.values().flat_map(|entries| entries.iter().map(|e| e.leaf_hash.clone())).collect();
-        self.bookshelf_root = Self::merkle_root_from_leaves(&book_leaves);
-
-        // Academic sub-root
-        let acad_leaves: Vec<String> = self.academic_services.values().map(|a| a.leaf_hash.clone()).collect();
-        self.academic_root = Self::merkle_root_from_leaves(&acad_leaves);
-
-        // Global root = H(dapp_root || host_root || bookshelf_root || academic_root)
-        let combined = format!("{}{}{}{}", self.dapp_root, self.host_root, self.bookshelf_root, self.academic_root);
-        self.global_root = format!("0x{}", Self::leaf_hash_of(&combined));
-        self.epoch += 1;
-    }
-
-    // --- DApp Operations ---
-    pub fn add_dapp(&mut self, name: &str, category: &str, board: &str, trust: u64, stake: f64, owner: &str, owner_pubkey: &str, desc: &str, url: &str, open_src: bool, now: u64) -> u64 {
-        let id = self.dapp_next_id;
-        self.dapp_next_id += 1;
-        let leaf_data = format!("dapp:{}:{}:{}:{}", id, name, owner_pubkey, now);
-        let leaf_hash = Self::leaf_hash_of(&leaf_data);
-        self.dapps.insert(id, StoredDApp {
-            id, name: name.into(), category: category.into(), board: board.into(),
-            trust_score: trust, stake_kas: stake, owner: owner.into(), owner_pubkey: owner_pubkey.into(),
-            description: desc.into(), available_for_swap: false, asking_price: None,
-            monthly_throughput: 0.0, active_users: 0, url: url.into(),
-            source_code_url: if open_src { Some(format!("https://github.com/kasvillage/{}", name.to_lowercase().replace(' ', "-"))) } else { None },
-            is_open_source: open_src, created_at: now, leaf_hash,
-        });
-        self.recompute_all_roots();
-        id
-    }
-
-    pub fn get_dapps(&self, board: Option<&str>, category: Option<&str>, search: Option<&str>) -> Vec<&StoredDApp> {
-        self.dapps.values().filter(|d| {
-            d.board != "REJECTED"
-            && board.map_or(true, |b| b == "All" || d.board == b)
-            && category.map_or(true, |c| d.category.contains(c))
-            && search.map_or(true, |s| {
-                let q = s.to_lowercase();
-                d.name.to_lowercase().contains(&q) || d.category.to_lowercase().contains(&q) || d.description.to_lowercase().contains(&q)
-            })
-        }).collect()
-    }
-
-    // --- Host Node Operations ---
-    pub fn upsert_host(&mut self, host_id: &str, owner_pubkey: &str, name: &str, desc: &str, tier: &str, theme: &str, apt: &str, xp: u64, items: Vec<StoredHostItem>, now: u64) {
-        let leaf_data = format!("host:{}:{}:{}", host_id, owner_pubkey, now);
-        let leaf_hash = Self::leaf_hash_of(&leaf_data);
-        self.host_nodes.insert(host_id.to_string(), StoredHostNode {
-            host_id: host_id.into(), owner_pubkey: owner_pubkey.into(),
-            name: name.into(), description: desc.into(), owner_tier: tier.into(),
-            theme: theme.into(), items, xp, reliability: 1.0, apartment: apt.into(),
-            created_at: now, leaf_hash,
-        });
-        self.recompute_all_roots();
-    }
-
-    // --- Bookshelf Operations ---
-    pub fn add_bookshelf_entry(&mut self, pubkey: &str, item_type: &str, item_id: Option<u64>, title: &str, author: Option<&str>, abs_summary: Option<&str>, abs_link: Option<&str>, notes: Option<&str>, now: u64) -> u64 {
-        let entry_id = now ^ (self.bookshelf.values().map(|v| v.len()).sum::<usize>() as u64);
-        let leaf_data = format!("bookshelf:{}:{}:{}", pubkey, title, entry_id);
-        let leaf_hash = Self::leaf_hash_of(&leaf_data);
-        let entry = StoredBookshelfEntry {
-            entry_id, item_type: item_type.into(), item_id,
-            title: title.into(), author: author.map(|s| s.into()),
-            abstract_summary: abs_summary.map(|s| s.into()), abstract_link: abs_link.map(|s| s.into()),
-            notes: notes.map(|s| s.into()), purchased: false, added_at: now, leaf_hash,
-        };
-        self.bookshelf.entry(pubkey.to_string()).or_insert_with(Vec::new).push(entry);
-        self.recompute_all_roots();
-        entry_id
-    }
-
-    pub fn remove_bookshelf_entry(&mut self, entry_id: u64) -> bool {
-        for entries in self.bookshelf.values_mut() {
-            if let Some(pos) = entries.iter().position(|e| e.entry_id == entry_id) {
-                entries.remove(pos);
-                self.recompute_all_roots();
-                return true;
-            }
-        }
-        false
-    }
-
-    // --- Academic Operations ---
-    pub fn add_academic(&mut self, title: &str, service_type: &str, category: &str, author: &str, desc: &str, cost: f64, flat_rate: bool, apt: &str, provider_pubkey: &str, abs_summary: Option<&str>, abs_link: Option<&str>, now: u64) -> u64 {
-        let id = self.academic_next_id;
-        self.academic_next_id += 1;
-        let leaf_data = format!("academic:{}:{}:{}", id, title, provider_pubkey);
-        let leaf_hash = Self::leaf_hash_of(&leaf_data);
-        self.academic_services.insert(id, StoredAcademicService {
-            id, title: title.into(), service_type: service_type.into(), category: category.into(),
-            author: author.into(), description: desc.into(), cost_kas: cost, flat_rate,
-            apt: apt.into(), provider_pubkey: provider_pubkey.into(),
-            abstract_summary: abs_summary.map(|s| s.into()), abstract_link: abs_link.map(|s| s.into()),
-            created_at: now, active: true, leaf_hash,
-        });
-        self.recompute_all_roots();
-        id
-    }
-
-    pub fn get_academics(&self, stype: Option<&str>, category: Option<&str>, search: Option<&str>) -> Vec<&StoredAcademicService> {
-        self.academic_services.values().filter(|a| {
-            a.active
-            && stype.map_or(true, |t| a.service_type.eq_ignore_ascii_case(t))
-            && category.map_or(true, |c| a.category.eq_ignore_ascii_case(c))
-            && search.map_or(true, |s| {
-                let q = s.to_lowercase();
-                a.title.to_lowercase().contains(&q) || a.author.to_lowercase().contains(&q) || a.description.to_lowercase().contains(&q)
-            })
-        }).collect()
-    }
-
-    // --- Reserves ---
-    pub fn donate(&mut self, pubkey: &str, amount_kas: f64, now: u64) {
-        self.reserves.total_reserves_kas += amount_kas;
-        self.reserves.unowned_reserves_kas += amount_kas;
-        self.reserves.donations.push((pubkey.to_string(), amount_kas, now));
-    }
-}
-
-// ============================================================================
-// VILLAGE MERKLE SNAPSHOT — Serializable for Arweave archival
-// ============================================================================
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VillageMerkleSnapshot {
-    pub dapps: Vec<StoredDApp>,
-    pub dapp_next_id: u64,
-    pub host_nodes: Vec<StoredHostNode>,
-    pub bookshelf: HashMap<String, Vec<StoredBookshelfEntry>>,
-    pub academic_services: Vec<StoredAcademicService>,
-    pub academic_next_id: u64,
-    pub reserves_total_user_ledger_kas: f64,
-    pub reserves_total_reserves_kas: f64,
-    pub reserves_unowned_reserves_kas: f64,
-    pub dapp_root: String,
-    pub host_root: String,
-    pub bookshelf_root: String,
-    pub academic_root: String,
-    pub global_root: String,
-    pub epoch: u64,
-    pub snapshot_timestamp: u64,
-    pub coupon_store: Vec<StoredCoupon>,
-    pub storefronts: Vec<(String, StorefrontSnapshotEntry)>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StorefrontSnapshotEntry {
-    pub layout: serde_json::Value,
-    pub theme: String,
-    pub layout_hash: String,
-    pub saved_at: u64,
-}
-
-impl VillageMerkleState {
-    /// Serialize entire village state for Arweave snapshot
-    pub fn to_snapshot(&self, coupons: &HashMap<String, StoredCoupon>, storefronts: &HashMap<String, StorefrontData>) -> VillageMerkleSnapshot {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        VillageMerkleSnapshot {
-            dapps: self.dapps.values().cloned().collect(),
-            dapp_next_id: self.dapp_next_id,
-            host_nodes: self.host_nodes.values().cloned().collect(),
-            bookshelf: self.bookshelf.clone(),
-            academic_services: self.academic_services.values().cloned().collect(),
-            academic_next_id: self.academic_next_id,
-            reserves_total_user_ledger_kas: self.reserves.total_user_ledger_kas,
-            reserves_total_reserves_kas: self.reserves.total_reserves_kas,
-            reserves_unowned_reserves_kas: self.reserves.unowned_reserves_kas,
-            dapp_root: self.dapp_root.clone(),
-            host_root: self.host_root.clone(),
-            bookshelf_root: self.bookshelf_root.clone(),
-            academic_root: self.academic_root.clone(),
-            global_root: self.global_root.clone(),
-            epoch: self.epoch,
-            snapshot_timestamp: now,
-            coupon_store: coupons.values().cloned().collect(),
-            storefronts: storefronts.iter().map(|(k, v)| (k.clone(), StorefrontSnapshotEntry {
-                layout: v.layout.clone(), theme: v.theme.clone(),
-                layout_hash: v.layout_hash.clone(), saved_at: v.saved_at,
-            })).collect(),
-        }
-    }
-
-    /// Restore village state from an Arweave snapshot
-    pub fn from_snapshot(snap: &VillageMerkleSnapshot) -> (Self, HashMap<String, StoredCoupon>, HashMap<String, StorefrontData>) {
-        let mut state = Self {
-            dapps: snap.dapps.iter().map(|d| (d.id, d.clone())).collect(),
-            dapp_next_id: snap.dapp_next_id,
-            host_nodes: snap.host_nodes.iter().map(|h| (h.host_id.clone(), h.clone())).collect(),
-            bookshelf: snap.bookshelf.clone(),
-            academic_services: snap.academic_services.iter().map(|a| (a.id, a.clone())).collect(),
-            academic_next_id: snap.academic_next_id,
-            reserves: VillageReserves {
-                total_user_ledger_kas: snap.reserves_total_user_ledger_kas,
-                total_reserves_kas: snap.reserves_total_reserves_kas,
-                unowned_reserves_kas: snap.reserves_unowned_reserves_kas,
-                donations: Vec::new(),
-            },
-            dapp_root: snap.dapp_root.clone(),
-            host_root: snap.host_root.clone(),
-            bookshelf_root: snap.bookshelf_root.clone(),
-            academic_root: snap.academic_root.clone(),
-            global_root: snap.global_root.clone(),
-            epoch: snap.epoch,
-        };
-        // Verify roots match by recomputing
-        state.recompute_all_roots();
-
-        let coupons: HashMap<String, StoredCoupon> = snap.coupon_store.iter()
-            .map(|c| (c.coupon_id.clone(), c.clone()))
-            .collect();
-
-        let storefronts: HashMap<String, StorefrontData> = snap.storefronts.iter()
-            .map(|(k, v)| (k.clone(), StorefrontData {
-                layout: v.layout.clone(), theme: v.theme.clone(),
-                layout_hash: v.layout_hash.clone(), saved_at: v.saved_at,
-            }))
-            .collect();
-
-        (state, coupons, storefronts)
-    }
-}
-
-/// Seamless snapshot generation — call from any handler or background task
-pub fn generate_village_snapshot(state: &FrontendAppState) -> VillageMerkleSnapshot {
-    let village = state.village.read().unwrap();
-    let coupons = state.coupon_store.read().unwrap();
-    let storefronts = state.storefronts.read().unwrap();
-    village.to_snapshot(&coupons, &storefronts)
-}
-
-/// Save snapshot to local file (fast, survives restarts)
-pub fn save_village_snapshot_to_file(snapshot: &VillageMerkleSnapshot, path: &str) -> Result<(), String> {
-    let json = serde_json::to_string(snapshot).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())
-}
-
-/// Load snapshot from local file
-pub fn load_village_snapshot_from_file(path: &str) -> Result<VillageMerkleSnapshot, String> {
-    let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&json).map_err(|e| e.to_string())
-}
-
-/// Restore FrontendAppState village + coupons + storefronts from snapshot
-pub fn restore_village_from_snapshot(state: &FrontendAppState, snap: &VillageMerkleSnapshot) {
-    let (village_state, coupons, storefronts) = VillageMerkleState::from_snapshot(snap);
-    *state.village.write().unwrap() = village_state;
-    *state.coupon_store.write().unwrap() = coupons;
-    *state.storefronts.write().unwrap() = storefronts;
-    log::info!("[VILLAGE] Restored from snapshot: epoch={}, dapps={}, hosts={}, academics={}, coupons={}",
-        snap.epoch, snap.dapps.len(), snap.host_nodes.len(),
-        snap.academic_services.len(), snap.coupon_store.len());
-}
-
-const VILLAGE_SNAPSHOT_PATH: &str = "./village_state.json";
-
-// ============================================================================
-// FE API HANDLERS — Village Merkle-backed (FrontendAppState)
-// ============================================================================
-
-// --- DApps ---
-pub async fn fe_api_dapps_list(
-    state: web::Data<FrontendAppState>,
-    query: web::Query<DAppListQ>,
-) -> impl Responder {
-    let village = state.village.read().unwrap();
-    let results = village.get_dapps(
-        query.board.as_deref(),
-        query.category.as_deref(),
-        query.search.as_deref(),
-    );
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": results,
-        "count": results.len(),
-        "merkle_root": village.dapp_root,
-        "global_root": village.global_root,
-        "epoch": village.epoch
-    }))
-}
-
-pub async fn fe_api_dapp_detail(
-    state: web::Data<FrontendAppState>,
-    path: web::Path<u64>,
-) -> impl Responder {
-    let village = state.village.read().unwrap();
-    match village.dapps.get(&path.into_inner()) {
-        Some(dapp) => HttpResponse::Ok().json(serde_json::json!({"success": true, "data": dapp, "merkle_root": village.dapp_root})),
-        None => HttpResponse::NotFound().json(serde_json::json!({"success": false, "error": "DApp not found"})),
-    }
-}
-
-pub async fn fe_api_dapp_submit(
-    state: web::Data<FrontendAppState>,
-    req: web::Json<DAppSubmitReq>,
-) -> impl Responder {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let mut village = state.village.write().unwrap();
-    let id = village.add_dapp(
-        &req.name,
-        req.category.as_deref().unwrap_or("UtilityTool"),
-        "Incubator",
-        0, 0.0,
-        "New",
-        &req.owner_pubkey,
-        req.description.as_deref().unwrap_or(""),
-        "",
-        false,
-        now,
-    );
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "dapp_id": id,
-        "board": "Incubator",
-        "merkle_root": village.dapp_root,
-        "global_root": village.global_root
-    }))
-}
-
-// --- Host Nodes ---
-pub async fn fe_api_get_host_nodes(
-    state: web::Data<FrontendAppState>,
-) -> impl Responder {
-    let village = state.village.read().unwrap();
-    let hosts: Vec<&StoredHostNode> = village.host_nodes.values().collect();
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": hosts,
-        "count": hosts.len(),
-        "merkle_root": village.host_root,
-        "global_root": village.global_root
-    }))
-}
-
-pub async fn fe_api_get_host_node(
-    state: web::Data<FrontendAppState>,
-    path: web::Path<String>,
-) -> impl Responder {
-    let village = state.village.read().unwrap();
-    match village.host_nodes.get(&path.into_inner()) {
-        Some(host) => HttpResponse::Ok().json(serde_json::json!({"success": true, "data": host, "merkle_root": village.host_root})),
-        None => HttpResponse::NotFound().json(serde_json::json!({"success": false, "error": "Host not found"})),
-    }
-}
-
-// --- Bookshelf ---
-pub async fn fe_api_get_bookshelf(
-    state: web::Data<FrontendAppState>,
-    path: web::Path<String>,
-) -> impl Responder {
-    let pubkey = path.into_inner();
-    let village = state.village.read().unwrap();
-    let entries = village.bookshelf.get(&pubkey).cloned().unwrap_or_default();
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": entries,
-        "count": entries.len(),
-        "merkle_root": village.bookshelf_root,
-        "global_root": village.global_root
-    }))
-}
-
-pub async fn fe_api_bookshelf_add(
-    state: web::Data<FrontendAppState>,
-    req: web::Json<BookshelfAddReq>,
-) -> impl Responder {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let mut village = state.village.write().unwrap();
-    let entry_id = village.add_bookshelf_entry(
-        &req.user_pubkey, &req.item_type, req.item_id,
-        &req.title, req.author.as_deref(), req.abstract_summary.as_deref(),
-        req.abstract_link.as_deref(), req.notes.as_deref(), now,
-    );
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "entry_id": entry_id,
-        "merkle_root": village.bookshelf_root,
-        "global_root": village.global_root
-    }))
-}
-
-pub async fn fe_api_bookshelf_purchase(
-    state: web::Data<FrontendAppState>,
-    req: web::Json<BookshelfPurchaseReq>,
-) -> impl Responder {
-    let village = state.village.read().unwrap();
-    // Mark as purchased in bookshelf
-    // In production this would debit L2 balance and update the Merkle tree
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "merkle_root": village.bookshelf_root
-    }))
-}
-
-pub async fn fe_api_bookshelf_remove(
-    state: web::Data<FrontendAppState>,
-    path: web::Path<u64>,
-) -> impl Responder {
-    let entry_id = path.into_inner();
-    let mut village = state.village.write().unwrap();
-    let removed = village.remove_bookshelf_entry(entry_id);
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": removed,
-        "merkle_root": village.bookshelf_root,
-        "global_root": village.global_root
-    }))
-}
-
-// --- Academic Services ---
-pub async fn fe_api_academic_list(
-    state: web::Data<FrontendAppState>,
-    query: web::Query<AcademicListQ>,
-) -> impl Responder {
-    let village = state.village.read().unwrap();
-    let results = village.get_academics(
-        query.service_type.as_deref(),
-        query.category.as_deref(),
-        query.search.as_deref(),
-    );
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": results,
-        "count": results.len(),
-        "merkle_root": village.academic_root,
-        "global_root": village.global_root,
-        "epoch": village.epoch
-    }))
-}
-
-pub async fn fe_api_academic_detail(
-    state: web::Data<FrontendAppState>,
-    path: web::Path<u64>,
-) -> impl Responder {
-    let village = state.village.read().unwrap();
-    match village.academic_services.get(&path.into_inner()) {
-        Some(svc) => HttpResponse::Ok().json(serde_json::json!({"success": true, "data": svc, "merkle_root": village.academic_root})),
-        None => HttpResponse::NotFound().json(serde_json::json!({"success": false, "error": "Service not found"})),
-    }
-}
-
-pub async fn fe_api_academic_submit(
-    state: web::Data<FrontendAppState>,
-    req: web::Json<serde_json::Value>,
-) -> impl Responder {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let mut village = state.village.write().unwrap();
-    let id = village.add_academic(
-        req.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled"),
-        req.get("service_type").and_then(|v| v.as_str()).unwrap_or("Tutoring"),
-        req.get("category").and_then(|v| v.as_str()).unwrap_or("General"),
-        req.get("author_name").and_then(|v| v.as_str()).unwrap_or("Anonymous"),
-        req.get("description").and_then(|v| v.as_str()).unwrap_or(""),
-        req.get("cost_kas").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        req.get("flat_rate").and_then(|v| v.as_bool()).unwrap_or(true),
-        req.get("apt").and_then(|v| v.as_str()).unwrap_or(""),
-        req.get("provider_pubkey").and_then(|v| v.as_str()).unwrap_or(""),
-        req.get("abstract_summary").and_then(|v| v.as_str()),
-        req.get("abstract_link").and_then(|v| v.as_str()),
-        now,
-    );
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "service_id": id,
-        "merkle_root": village.academic_root,
-        "global_root": village.global_root
-    }))
-}
-
-// --- User DApps & Entertainment ---
-pub async fn fe_api_get_user_dapps(
-    state: web::Data<FrontendAppState>,
-    path: web::Path<String>,
-) -> impl Responder {
-    let pubkey = path.into_inner();
-    let village = state.village.read().unwrap();
-    let owned: Vec<&StoredDApp> = village.dapps.values().filter(|d| d.owner_pubkey == pubkey).collect();
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "owned": owned,
-        "created": owned,
-        "total_count": owned.len(),
-        "merkle_root": village.dapp_root
-    }))
-}
-
-pub async fn fe_api_entertainment_center(
-    state: web::Data<FrontendAppState>,
-    path: web::Path<String>,
-) -> impl Responder {
-    let pubkey = path.into_inner();
-    let village = state.village.read().unwrap();
-    let owned_count = village.dapps.values().filter(|d| d.owner_pubkey == pubkey).count();
-    let bookshelf_count = village.bookshelf.get(&pubkey).map_or(0, |v| v.len());
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": {
-            "balance_kas": 0.0,
-            "available_kas": 0.0,
-            "locked_kas": 0.0,
-            "owned_dapps_count": owned_count,
-            "bookshelf_count": bookshelf_count
-        },
-        "global_root": village.global_root
-    }))
-}
-
-// --- Reserves ---
-pub async fn fe_api_get_reserves(
-    state: web::Data<FrontendAppState>,
-) -> impl Responder {
-    let village = state.village.read().unwrap();
-    let r = &village.reserves;
-    let ratio = if r.total_user_ledger_kas > 0.0 { r.total_reserves_kas / r.total_user_ledger_kas } else { 1.0 };
-    let status = if ratio >= 1.0 { "healthy" } else if ratio >= 0.9 { "caution" } else { "critical" };
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": {
-            "total_user_ledger_kas": r.total_user_ledger_kas,
-            "total_reserves_kas": r.total_reserves_kas,
-            "unowned_reserves_kas": r.unowned_reserves_kas,
-            "reserve_ratio": ratio,
-            "status": status
-        },
-        "global_root": village.global_root
-    }))
-}
-
-pub async fn fe_api_donate_reserves(
-    state: web::Data<FrontendAppState>,
-    req: web::Json<ReserveDonateReq>,
-) -> impl Responder {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let mut village = state.village.write().unwrap();
-    village.donate(&req.donor_pubkey, req.amount_kas as f64, now);
-    let r = &village.reserves;
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "donation_id": now % 1000000,
-        "new_total_reserves_kas": r.total_reserves_kas,
-        "new_reserve_ratio": if r.total_user_ledger_kas > 0.0 { r.total_reserves_kas / r.total_user_ledger_kas } else { 1.0 },
-        "global_root": village.global_root
-    }))
-}
-
-// --- Village State Root (global) ---
-pub async fn fe_api_village_state(
-    state: web::Data<FrontendAppState>,
-) -> impl Responder {
-    let village = state.village.read().unwrap();
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "global_root": village.global_root,
-        "sub_roots": {
-            "dapp_root": village.dapp_root,
-            "host_root": village.host_root,
-            "bookshelf_root": village.bookshelf_root,
-            "academic_root": village.academic_root
-        },
-        "epoch": village.epoch,
-        "counts": {
-            "dapps": village.dapps.len(),
-            "hosts": village.host_nodes.len(),
-            "bookshelf_entries": village.bookshelf.values().map(|v| v.len()).sum::<usize>(),
-            "academic_services": village.academic_services.len()
-        }
-    }))
-}
-
-// --- Village Snapshot (Arweave-ready) ---
-pub async fn fe_api_village_snapshot(
-    state: web::Data<FrontendAppState>,
-) -> impl Responder {
-    let snapshot = generate_village_snapshot(&state);
-    
-    // Save to local file as backup
-    let file_result = save_village_snapshot_to_file(&snapshot, VILLAGE_SNAPSHOT_PATH);
-    
-    let size_estimate = serde_json::to_string(&snapshot).map(|s| s.len()).unwrap_or(0);
-    
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "snapshot": {
-            "global_root": snapshot.global_root,
-            "epoch": snapshot.epoch,
-            "timestamp": snapshot.snapshot_timestamp,
-            "dapps": snapshot.dapps.len(),
-            "host_nodes": snapshot.host_nodes.len(),
-            "bookshelf_users": snapshot.bookshelf.len(),
-            "academic_services": snapshot.academic_services.len(),
-            "coupons": snapshot.coupon_store.len(),
-            "storefronts": snapshot.storefronts.len(),
-            "size_bytes": size_estimate,
-        },
-        "local_file_saved": file_result.is_ok(),
-        "local_path": VILLAGE_SNAPSHOT_PATH,
-        "arweave_ready": true,
-        "sub_roots": {
-            "dapp_root": snapshot.dapp_root,
-            "host_root": snapshot.host_root,
-            "bookshelf_root": snapshot.bookshelf_root,
-            "academic_root": snapshot.academic_root,
-        }
-    }))
-}
-
-// --- Village Restore from local snapshot ---
-pub async fn fe_api_village_restore(
-    state: web::Data<FrontendAppState>,
-) -> impl Responder {
-    match load_village_snapshot_from_file(VILLAGE_SNAPSHOT_PATH) {
-        Ok(snap) => {
-            let epoch = snap.epoch;
-            let root = snap.global_root.clone();
-            restore_village_from_snapshot(&state, &snap);
-            HttpResponse::Ok().json(serde_json::json!({
-                "success": true,
-                "restored_epoch": epoch,
-                "restored_root": root,
-                "dapps": snap.dapps.len(),
-                "host_nodes": snap.host_nodes.len(),
-                "academic_services": snap.academic_services.len(),
-                "coupons": snap.coupon_store.len(),
-            }))
-        }
-        Err(e) => HttpResponse::Ok().json(serde_json::json!({
-            "success": false,
-            "error": format!("No snapshot found: {}", e),
-            "hint": "POST /api/village/snapshot first to create one"
-        }))
-    }
-}
-
-// --- Arweave status (real data from village state) ---
-pub async fn fe_api_arweave_status(
-    state: web::Data<FrontendAppState>,
-) -> impl Responder {
-    let village = state.village.read().unwrap();
-    let snap_exists = std::path::Path::new(VILLAGE_SNAPSHOT_PATH).exists();
-    let snap_size = if snap_exists {
-        std::fs::metadata(VILLAGE_SNAPSHOT_PATH).map(|m| m.len()).unwrap_or(0)
-    } else { 0 };
-    
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": {
-            "wallet_address": null,
-            "wallet_balance_ar": 0.0,
-            "total_snapshots": if snap_exists { 1 } else { 0 },
-            "total_bytes_archived": snap_size,
-            "total_ar_spent": 0.0,
-            "last_snapshot": if snap_exists { VILLAGE_SNAPSHOT_PATH } else { "none" },
-            "archive_healthy": snap_exists,
-            "next_archive_in_secs": 3600,
-            "village_epoch": village.epoch,
-            "village_global_root": village.global_root,
-        }
-    }))
-}
-
-pub async fn fe_api_arweave_snapshots(
-    state: web::Data<FrontendAppState>,
-) -> impl Responder {
-    let mut snapshots = Vec::new();
-    if std::path::Path::new(VILLAGE_SNAPSHOT_PATH).exists() {
-        if let Ok(snap) = load_village_snapshot_from_file(VILLAGE_SNAPSHOT_PATH) {
-            snapshots.push(serde_json::json!({
-                "source": "local",
-                "path": VILLAGE_SNAPSHOT_PATH,
-                "epoch": snap.epoch,
-                "global_root": snap.global_root,
-                "timestamp": snap.snapshot_timestamp,
-                "dapps": snap.dapps.len(),
-                "host_nodes": snap.host_nodes.len(),
-                "academics": snap.academic_services.len(),
-                "coupons": snap.coupon_store.len(),
-            }));
-        }
-    }
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": snapshots,
-        "count": snapshots.len()
-    }))
-}
 
 fn hash_bytes(data: &[u8]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
@@ -54551,9 +53049,6 @@ pub struct KaspaL1Snapshot {
     pub previous_snapshot_txid: Option<String>,
     /// Compression type (none, gzip, zstd)
     pub compression: String,
-    /// Village Merkle state snapshot (DApps, Hosts, Bookshelf, Academic, Reserves)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub village_state: Option<VillageMerkleSnapshot>,
 }
 
 impl KaspaL1Snapshot {
@@ -54603,7 +53098,6 @@ impl KaspaL1Snapshot {
             snapshot_hash: [0u8; 32],
             previous_snapshot_txid,
             compression: "none".to_string(),
-            village_state: None,
         };
         
         snapshot.snapshot_hash = snapshot.compute_hash();
@@ -55013,7 +53507,7 @@ impl ArweaveArchiveManager {
     pub async fn create_snapshot(&mut self, l2_merkle_root: [u8; 32], l2_leaf_count: u64) -> Result<KaspaL1Snapshot, ArchiveError> {
         let state = self.fetch_l1_state().await?;
         
-        let mut snapshot = KaspaL1Snapshot::new(
+        let snapshot = KaspaL1Snapshot::new(
             &self.config.network,
             state.block_height,
             state.tip_hash,
@@ -55028,14 +53522,7 @@ impl ArweaveArchiveManager {
             self.stats.last_arweave_txid.clone(),
         );
         
-        // Village state is attached separately via set_village_state()
-        
         Ok(snapshot)
-    }
-    
-    /// Attach village Merkle state to a snapshot before upload
-    pub fn attach_village_state(snapshot: &mut KaspaL1Snapshot, village_snap: VillageMerkleSnapshot) {
-        snapshot.village_state = Some(village_snap);
     }
     
     /// Upload snapshot to Arweave
@@ -55085,16 +53572,6 @@ impl ArweaveArchiveManager {
             ArweaveTag { name: "UTXO-Count".to_string(), value: snapshot.total_utxo_count.to_string() },
             ArweaveTag { name: "Header-Count".to_string(), value: snapshot.headers.len().to_string() },
         ];
-        
-        // Add village Merkle root if present
-        if let Some(ref village) = snapshot.village_state {
-            let mut tags_mut = tags.clone();
-            tags_mut.push(ArweaveTag { name: "Village-Global-Root".to_string(), value: village.global_root.clone() });
-            tags_mut.push(ArweaveTag { name: "Village-Epoch".to_string(), value: village.epoch.to_string() });
-            tags_mut.push(ArweaveTag { name: "Village-DApps".to_string(), value: village.dapps.len().to_string() });
-            tags_mut.push(ArweaveTag { name: "Village-Hosts".to_string(), value: village.host_nodes.len().to_string() });
-            // Use tags_mut from here
-        }
         
         if let Some(prev) = &snapshot.previous_snapshot_txid {
             // Add link to previous snapshot

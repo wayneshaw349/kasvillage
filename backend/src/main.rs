@@ -1,5 +1,5 @@
 // ============================================================================
-// KASVILLAGE L2 - COMPLETE PRODUCTION IMPLEMENTATION - God willing this works 
+// KASVILLAGE L2-3d draft - COMPLETE PRODUCTION IMPLEMENTATION - God willing this works 
 // ============================================================================
 // VERSION: 2025-02-02-fix-500-endpoints-v3
 // FIXES: 
@@ -24434,71 +24434,74 @@ impl KaspaFluxNode {
     l1_state: L1ConnectionState,
 ) {
     tokio::spawn(async move {
-        // Bring the RpcApi trait into the scope of this thread
         use kaspa_wrpc_client::prelude::RpcApi;
+        
+        println!("[KASPA-MONITOR] 🚀 Starting Bridge in Resolver-First mode.");
+        l1_state.set_status(L1ConnectionStatus::Connecting).await;
 
-        let mut client = match &kaspa_node.wrpc_client {
-            Some(c) => c.clone(),
-            None => return,
-        };
-        
+        // 1. Instantiate the client using the Resolver from the start
+        // Passing 'None' as the URL triggers the Resolver logic
+        let resolver_data = kaspa_node.resolver.clone();
+        let mut client = Arc::new(KaspaWrpcRpcClient::new(
+            WrpcEncoding::Borsh,
+            None, 
+            Some(resolver_data),
+            Some(kaspa_node.network_id),
+            None,
+        ).expect("Failed to initialize wRPC Resolver client"));
+
         let mut retry_delay_secs = 5u64;
-        const MAX_ATTEMPTS_BEFORE_RESOLVER: u64 = 5;
-        
+
         loop {
             let attempt = l1_state.increment_attempts().await;
             
-            if attempt == MAX_ATTEMPTS_BEFORE_RESOLVER + 1 {
-                println!("[KASPA-MONITOR] 🔄 Switching to Official Kaspa Resolver...");
-                
-                let resolver_data: Resolver = kaspa_node.resolver.clone();
-                
-                // Debugging: See what the resolver is finding
-                // Note: network_id is passed directly, not as a reference
-                if let Ok(node_desc) = resolver_data.get_node(WrpcEncoding::Borsh, kaspa_node.network_id).await {
-                    println!("[KASPA-MONITOR] 🔍 Resolver picked node: {}", node_desc.url);
-                }
-
-                match KaspaWrpcRpcClient::new(
-                    WrpcEncoding::Borsh,
-                    None, // No static URL
-                    Some(resolver_data),
-                    Some(kaspa_node.network_id),
-                    None,
-                ) {
-                    Ok(new_client_instance) => {
-                        client = Arc::new(new_client_instance);
-                        l1_state.set_status(L1ConnectionStatus::FallbackApi).await;
-                    }
-                    Err(e) => println!("[KASPA-MONITOR] ❌ Resolver init failed: {}", e),
-                }
-            }
-            
+            // 2. Attempt to start the connection
+            // The Resolver will pick a node here automatically
             match client.start().await {
                 Ok(_) => {
-                    // FIX: Pass 'None' here to satisfy the trait requirement
-                    match client.get_block_dag_info().await {
-                        Ok(info) => {
-                            println!("[KASPA-MONITOR] ✅ Connected! DAA: {}", info.virtual_daa_score);
-                            l1_state.set_connected(info.virtual_daa_score).await;
-                            retry_delay_secs = 5;
-                            
-                            loop {
-                                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                                // FIX: Pass 'None' here as well
-                                if let Err(e) = client.get_block_dag_info().await {
-                                    println!("[KASPA-MONITOR] ⚠ Connection lost: {}", e);
-                                    break; 
+                    // 3. Handshake Grace Period
+                    // We must wait for the WebSocket to reach 'Connected' state
+                    let mut connected = false;
+                    for _ in 0..50 { // 5 seconds max
+                        if client.is_connected() {
+                            connected = true;
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+
+                    if connected {
+                        match client.get_block_dag_info().await {
+                            Ok(info) => {
+                                println!("[KASPA-MONITOR] ✅ Connected via Resolver! DAA: {}", info.virtual_daa_score);
+                                l1_state.set_connected(info.virtual_daa_score).await;
+                                retry_delay_secs = 5; 
+
+                                // 4. Active Health Monitoring
+                                loop {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                                    if !client.is_connected() {
+                                        println!("[KASPA-MONITOR] ⚠ Node disconnected. Resolver will re-route.");
+                                        break; 
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                println!("[KASPA-MONITOR] ⚠ Picked node is busy/syncing: {}", e);
+                                // Fall through to retry, Resolver will pick a different node next time
+                            }
                         }
-                        Err(e) => println!("[KASPA-MONITOR] ⚠ Node Syncing/Busy: {}", e),
+                    } else {
+                        println!("[KASPA-MONITOR] ❌ Handshake timeout on attempt {}.", attempt);
                     }
                 }
-                Err(e) => println!("[KASPA-MONITOR] ⏳ Attempt {} failed: {}", attempt, e),
+                Err(e) => {
+                    println!("[KASPA-MONITOR] ⏳ Connection attempt {} failed: {}", attempt, e);
+                }
             }
-            
-            tokio::time::sleep(std::time::Duration::from_secs(retry_delay_secs)).await;
+
+            // Exponential backoff before the next Resolver cycle
+            tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay_secs)).await;
             retry_delay_secs = (retry_delay_secs * 2).min(60);
         }
     });
@@ -56446,7 +56449,7 @@ impl KaspaWrpcClient {
             block_daa_score: entry.utxo_entry.block_daa_score,
         }).collect())
     }
- pub async fn get_rpc(&self) -> Result<Arc<KaspaWrpcRpcClient>, String> {
+pub async fn get_rpc(&self) -> Result<Arc<KaspaWrpcRpcClient>, String> {
         let mut guard = self.client.write().await;
         
         if let Some(c) = &*guard {
@@ -56455,17 +56458,25 @@ impl KaspaWrpcClient {
             }
         }
 
-        // Now self.resolver.clone() correctly produces a 'Resolver' 
-        // to satisfy the SDK's expected type.
+        // Always use the Resolver to find a node
+        let resolver_data = self.resolver.clone();
+        
         let rpc = Arc::new(KaspaWrpcRpcClient::new(
             WrpcEncoding::Borsh,
-            None, 
-            Some(self.resolver.clone()), // This works now!
-            Some(self.network_id), 
+            None, // <--- No static URL
+            Some(resolver_data),
+            Some(self.network_id),
             None,
-        ).map_err(|e| e.to_string())?);
+        ).map_err(|e| format!("RPC Init Error: {}", e))?);
 
-        rpc.start().await.map_err(|e| e.to_string())?;
+        rpc.start().await.map_err(|e| format!("RPC Start Error: {}", e))?;
+        
+        // Wait briefly for the handshake
+        for _ in 0..30 {
+            if rpc.is_connected() { break; }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+
         *guard = Some(rpc.clone());
         Ok(rpc)
     }

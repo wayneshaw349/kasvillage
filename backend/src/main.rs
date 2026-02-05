@@ -24436,8 +24436,9 @@ pub fn spawn_l1_monitor(
 ) {
     tokio::spawn(async move {
         use kaspa_wrpc_client::prelude::RpcApi;
+        use std::time::Duration;
         
-        println!("[KASPA-MONITOR] 🚀 Starting Bridge in High-Reliability Mode.");
+        println!("[KASPA-MONITOR] 🚀 Starting Bridge in Ultra-Resilient Mode.");
         
         let mut retry_delay_secs = 5u64;
         let mut attempt = 0;
@@ -24446,82 +24447,88 @@ pub fn spawn_l1_monitor(
             attempt += 1;
             l1_state.set_status(L1ConnectionStatus::Connecting).await;
 
-            // 1. Get a URL from the Resolver OR use a hardcoded fallback
-            let resolver = &kaspa_node.resolver;
+            // 1. SELECT TARGET URL
+            // We alternate: Attempt 1 = Resolver, Attempt 2 = Golden Node, Attempt 3 = Resolver...
             let mut target_url = None;
 
-            // Try to get a node from the official resolver
-            if let Ok(node_desc) = resolver.get_node(WrpcEncoding::Borsh, kaspa_node.network_id).await {
-                println!("[KASPA-MONITOR] 🔍 Resolver found: {}", node_desc.url);
-                target_url = Some(node_desc.url);
+            if attempt % 2 != 0 {
+                // Odd attempts: Use the official resolver (Decentralized)
+                if let Ok(node_desc) = kaspa_node.resolver.get_node(WrpcEncoding::Borsh, kaspa_node.network_id).await {
+                    println!("[KASPA-MONITOR] 🔍 Resolver suggested: {}", node_desc.url);
+                    target_url = Some(node_desc.url);
+                }
             } 
             
-            // If resolver fails, use the "Golden List"
             if target_url.is_none() {
-                let fallbacks = [
+                // Even attempts or fallback: Use high-capacity load-balanced nodes
+                let big_nodes = [
                     "wss://wrpc.kaspa.live/wrpc/borsh",
                     "wss://kaspa.aspectron.com/wrpc/borsh",
-                    "wss://rose.kaspa.green/kaspa/mainnet/wrpc/borsh"
                 ];
-                let fallback = fallbacks[attempt % fallbacks.len()];
-                println!("[KASPA-MONITOR] ⚠ Resolver empty. Using Emergency Fallback: {}", fallback);
-                target_url = Some(fallback.to_string());
+                let selected = big_nodes[attempt % big_nodes.len()];
+                println!("[KASPA-MONITOR] ⚡ Using High-Capacity Node: {}", selected);
+                target_url = Some(selected.to_string());
             }
 
-            // 2. Create the client with the specific URL found
+            let url = target_url.unwrap();
+
+            // 2. FRESH CLIENT INITIALIZATION
+            // We use explicit None for the resolver argument when passing a static URL
             let client_result = KaspaWrpcRpcClient::new(
                 WrpcEncoding::Borsh,
-                target_url.as_deref(), 
+                Some(&url), 
                 None, 
                 Some(kaspa_node.network_id),
                 None,
             );
 
-            if let Ok(client) = client_result {
-                let client = Arc::new(client);
+            if let Ok(client_instance) = client_result {
+                let client = Arc::new(client_instance);
                 
-                match client.start().await {
-                    Ok(_) => {
-                        println!("[KASPA-MONITOR] ⏳ Attempt {}: Waiting for handshake...", attempt);
+                // 3. START WITH TIMEOUT
+                // We wrap the start in a timeout to prevent hanging
+                match tokio::time::timeout(Duration::from_secs(10), client.start()).await {
+                    Ok(Ok(_)) => {
+                        println!("[KASPA-MONITOR] ⏳ Socket open, finishing handshake...");
                         
-                        // 3. Handshake Grace Period (Increased to 10 seconds)
+                        // 4. WAIT FOR CONNECTION (Up to 15 seconds for slow proxies)
                         let mut connected = false;
-                        for _ in 0..100 { 
+                        for _ in 0..150 { 
                             if client.is_connected() {
                                 connected = true;
                                 break;
                             }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
 
                         if connected {
                             match client.get_block_dag_info().await {
                                 Ok(info) => {
-                                    println!("[KASPA-MONITOR] ✅ SUCCESS! Connected to node. DAA: {}", info.virtual_daa_score);
+                                    println!("[KASPA-MONITOR] ✅ BRIDGE LIVE! DAA: {}", info.virtual_daa_score);
                                     l1_state.set_connected(info.virtual_daa_score).await;
                                     retry_delay_secs = 5; 
 
-                                    // Active Health Monitoring
                                     loop {
-                                        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                                        tokio::time::sleep(Duration::from_secs(30)).await;
                                         if !client.is_connected() {
-                                            println!("[KASPA-MONITOR] ⚠ Connection lost. Restarting loop.");
+                                            println!("[KASPA-MONITOR] ⚠ Lost connection.");
                                             break; 
                                         }
                                     }
                                 }
-                                Err(e) => println!("[KASPA-MONITOR] ⚠ Node busy/syncing: {}", e),
+                                Err(e) => println!("[KASPA-MONITOR] ⚠ Node busy/rejecting: {}", e),
                             }
                         } else {
-                            println!("[KASPA-MONITOR] ❌ Handshake timed out at {}", target_url.unwrap_or_default());
+                            println!("[KASPA-MONITOR] ❌ Handshake failed (Timeout) at {}", url);
                         }
                     }
-                    Err(e) => println!("[KASPA-MONITOR] ❌ WebSocket start failed: {}", e),
+                    Ok(Err(e)) => println!("[KASPA-MONITOR] ❌ Connection error: {}", e),
+                    Err(_) => println!("[KASPA-MONITOR] ❌ Connect task timed out."),
                 }
             }
 
-            // 4. Cleanup and Wait before next attempt
-            tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay_secs)).await;
+            // 5. WAIT & RETRY
+            tokio::time::sleep(Duration::from_secs(retry_delay_secs)).await;
             retry_delay_secs = (retry_delay_secs * 2).min(60);
         }
     });

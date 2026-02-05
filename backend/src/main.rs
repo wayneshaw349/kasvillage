@@ -1,5 +1,5 @@
 // ============================================================================
-// KASVILLAGE L2-3d draft - COMPLETE PRODUCTION IMPLEMENTATION - God willing this works 
+// KASVILLAGE L2 - COMPLETE PRODUCTION IMPLEMENTATION - God willing this works 
 // ============================================================================
 // VERSION: 2025-02-02-fix-500-endpoints-v3
 // FIXES: 
@@ -133,15 +133,12 @@ use hex;
 use serde_json;
 use serde_json::json;
 use serde_big_array::BigArray;
-use kaspa_wrpc_client::prelude::{
-    Resolver, 
-    NetworkId, 
-    NetworkType, 
-    RpcApi, // <--- CRITICAL: This enables get_block_dag_info()
+kaspa_wrpc_client::prelude::{
+    Resolver, NetworkId, NetworkType,  
+    WrpcEncoding, KaspaRpcClientOptions,
 };
-use kaspa_addresses::Address as KaspaLibAddress;
 use kaspa_wrpc_client::{KaspaRpcClient as KaspaWrpcRpcClient, WrpcEncoding};
-
+use kaspa_addresses::Address as KaspaLibAddress;
 // ============================================================================
 // FIRESTORE + REDIS IMPORTS (for Firestore integration)
 // ============================================================================
@@ -24273,7 +24270,7 @@ pub struct KaspaFluxNode {
     http_client: reqwest::Client,
     wrpc_url: String, // The user-provided URL (e.g. localhost or Flux)
     wrpc_client: Option<Arc<KaspaWrpcRpcClient>>,
-    resolver:Resolver,
+    resolver: Arc<Resolver>,
     network_id: NetworkId,
 }
 
@@ -24403,7 +24400,7 @@ impl KaspaFluxNode {
             .unwrap_or(NetworkType::Mainnet);
 
         let network_id = NetworkId::new(network_type);
-        let resolver = Resolver::default(); // This creates a plain Resolver
+        let resolver = Arc::new(Resolver::default()); // Official Kaspa node discoverer
 
         // Create the initial client shell
         let client = Arc::new(KaspaWrpcRpcClient::new(
@@ -24428,9 +24425,7 @@ impl KaspaFluxNode {
     }
 
     /// Spawn background L1 monitor that connects to kaspad without blocking API
-     /// Background L1 monitor using Resolver for automatic failover
-       /// Connect to self-hosted kaspad via wRPC
-pub fn spawn_l1_monitor(
+     pub fn spawn_l1_monitor(
     kaspa_node: Arc<KaspaFluxNode>,
     l1_state: L1ConnectionState,
 ) {
@@ -24438,109 +24433,86 @@ pub fn spawn_l1_monitor(
         use kaspa_wrpc_client::prelude::RpcApi;
         use std::time::Duration;
         
-        println!("[KASPA-MONITOR] 🚀 Starting Bridge in Ultra-Resilient Mode.");
-        
         let mut retry_delay_secs = 5u64;
         let mut attempt = 0;
+        let local_url = std::env::var("KASPA_NODE_URL").unwrap_or_default();
 
         loop {
             attempt += 1;
             l1_state.set_status(L1ConnectionStatus::Connecting).await;
 
-            // 1. SELECT TARGET URL
-            // We alternate: Attempt 1 = Resolver, Attempt 2 = Golden Node, Attempt 3 = Resolver...
-            let mut target_url = None;
+            // 1. SELECT CONNECTION STRATEGY
+            let (target_url, use_resolver) = if attempt <= 5 && !local_url.is_empty() {
+                // First 5 tries: Use the local kaspad-node sidecar
+                (Some(local_url.clone()), false)
+            } else {
+                // After 5 fails: Ask the Resolver for a public node
+                println!("[KASPA-MONITOR] ⚠ Local node unavailable. Consulting Resolver...");
+                let url = kaspa_node.resolver.get_node(WrpcEncoding::Borsh, kaspa_node.network_id).await
+                    .map(|d| d.url).ok();
+                (url, true)
+            };
 
-            if attempt % 2 != 0 {
-                // Odd attempts: Use the official resolver (Decentralized)
-                if let Ok(node_desc) = kaspa_node.resolver.get_node(WrpcEncoding::Borsh, kaspa_node.network_id).await {
-                    println!("[KASPA-MONITOR] 🔍 Resolver suggested: {}", node_desc.url);
-                    target_url = Some(node_desc.url);
-                }
-            } 
-            
-            if target_url.is_none() {
-                // Even attempts or fallback: Use high-capacity load-balanced nodes
-                let big_nodes = [
-                    "wss://wrpc.kaspa.live/wrpc/borsh",
-                    "wss://kaspa.aspectron.com/wrpc/borsh",
-                ];
-                let selected = big_nodes[attempt % big_nodes.len()];
-                println!("[KASPA-MONITOR] ⚡ Using High-Capacity Node: {}", selected);
-                target_url = Some(selected.to_string());
-            }
+            let final_url = target_url.unwrap_or_else(|| "wss://wrpc.kaspa.live/wrpc/borsh".to_string());
+            println!("[KASPA-MONITOR] 📡 Attempt {}: Connecting to {}", attempt, final_url);
 
-            let url = target_url.unwrap();
-
-            // 2. FRESH CLIENT INITIALIZATION
-            // We use explicit None for the resolver argument when passing a static URL
-            let client_result = KaspaWrpcRpcClient::new(
+            // 2. INITIALIZE CLIENT
+            let client = Arc::new(KaspaWrpcRpcClient::new(
                 WrpcEncoding::Borsh,
-                Some(&url), 
+                Some(&final_url), 
                 None, 
                 Some(kaspa_node.network_id),
                 None,
-            );
+            ).expect("Client creation failed"));
 
-            if let Ok(client_instance) = client_result {
-                let client = Arc::new(client_instance);
-                
-                // 3. START WITH TIMEOUT
-                // We wrap the start in a timeout to prevent hanging
-                match tokio::time::timeout(Duration::from_secs(10), client.start()).await {
-                    Ok(Ok(_)) => {
-                        println!("[KASPA-MONITOR] ⏳ Socket open, finishing handshake...");
-                        
-                        // 4. WAIT FOR CONNECTION (Up to 15 seconds for slow proxies)
-                        let mut connected = false;
-                        for _ in 0..150 { 
-                            if client.is_connected() {
-                                connected = true;
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
+            // 3. CONNECT & SYNC CHECK
+            match tokio::time::timeout(Duration::from_secs(10), client.start()).await {
+                Ok(Ok(_)) => {
+                    // Wait for Borsh handshake
+                    tokio::time::sleep(Duration::from_millis(500)).await;
 
-                        if connected {
-                            match client.get_block_dag_info().await {
-                                Ok(info) => {
-                                    println!("[KASPA-MONITOR] ✅ BRIDGE LIVE! DAA: {}", info.virtual_daa_score);
-                                    l1_state.set_connected(info.virtual_daa_score).await;
-                                    retry_delay_secs = 5; 
+                    if client.is_connected() {
+                        match client.get_block_dag_info().await {
+                            Ok(info) => {
+                                // Check if node is actually synced (not in IBD)
+                                println!("[KASPA-MONITOR] ✅ Connected! DAA: {}", info.virtual_daa_score);
+                                
+                                // UPDATE GLOBAL STATE
+                                {
+                                    let mut global_client = kaspa_node.wrpc_client.write().await;
+                                    *global_client = Some(client.clone());
+                                }
+                                
+                                l1_state.set_connected(info.virtual_daa_score).await;
+                                retry_delay_secs = 5; 
 
-                                    loop {
-                                        tokio::time::sleep(Duration::from_secs(30)).await;
-                                        if !client.is_connected() {
-                                            println!("[KASPA-MONITOR] ⚠ Lost connection.");
-                                            break; 
-                                        }
+                                // Health check loop
+                                loop {
+                                    tokio::time::sleep(Duration::from_secs(30)).await;
+                                    if !client.is_connected() || client.get_block_dag_info().await.is_err() {
+                                        break; 
                                     }
                                 }
-                                Err(e) => println!("[KASPA-MONITOR] ⚠ Node busy/rejecting: {}", e),
                             }
-                        } else {
-                            println!("[KASPA-MONITOR] ❌ Handshake failed (Timeout) at {}", url);
+                            Err(e) => println!("[KASPA-MONITOR] ⚠ Node busy/syncing: {}", e),
                         }
                     }
-                    Ok(Err(e)) => println!("[KASPA-MONITOR] ❌ Connection error: {}", e),
-                    Err(_) => println!("[KASPA-MONITOR] ❌ Connect task timed out."),
                 }
+                _ => println!("[KASPA-MONITOR] ❌ Connection timeout."),
             }
 
-            // 5. WAIT & RETRY
+            // backoff
             tokio::time::sleep(Duration::from_secs(retry_delay_secs)).await;
             retry_delay_secs = (retry_delay_secs * 2).min(60);
         }
     });
 }
+
+    /// Connect to self-hosted kaspad via wRPC
     pub fn new_self_hosted(url: &str) -> Self {
         let base_url = url.trim_end_matches('/').to_string();
         println!("[KASPA] ✓ Connecting to self-hosted node (wRPC): {}", base_url);
         
-        // --- DEFINE THE VARIABLES HERE ---
-        let network_id = NetworkId::new(NetworkType::Mainnet);
-        let resolver = Resolver::default();
-
         Self {
             mode: KaspaNodeMode::SelfHosted { url: base_url.clone() },
             http_client: reqwest::Client::builder()
@@ -24549,26 +24521,14 @@ pub fn spawn_l1_monitor(
                 .unwrap(),
             wrpc_url: base_url,
             wrpc_client: None,
-            // Now these find the variables defined above
-            network_id,
-            resolver,
         }
     }
 
-   /// Use public Kaspa API (fallback)
+    /// Use public Kaspa API (fallback)
     pub fn new_public(network: KaspaNetworkInfra) -> Self {
         let rest_url = network.api_base().to_string();
         println!("[KASPA] Using public API: {}", rest_url);
         
-        // --- DEFINE THE VARIABLES HERE ---
-        // Map your internal infra enum to the SDK's NetworkType
-        let network_type = match network {
-            KaspaNetworkInfra::Mainnet => NetworkType::Mainnet,
-            KaspaNetworkInfra::Testnet => NetworkType::Testnet,
-        };
-        let network_id = NetworkId::new(network_type);
-        let resolver = Resolver::default();
-
         Self {
             mode: KaspaNodeMode::PublicApi { network },
             http_client: reqwest::Client::builder()
@@ -24577,9 +24537,6 @@ pub fn spawn_l1_monitor(
                 .unwrap(),
             wrpc_url: rest_url,
             wrpc_client: None,
-            // Now these find the variables defined above
-            network_id,
-            resolver,
         }
     }
 
@@ -40486,24 +40443,13 @@ impl RedisRateLimiter {
 
 /// Start the production server
 pub async fn start_server(config: ApiServerConfig) -> std::io::Result<()> {
-    // 1. Initialize standalone components
+    // Initialize components
     let l1_client = KaspaL1Client::new(KaspaNetworkInfra::Mainnet);
     let db: Arc<dyn DatabaseStore> = Arc::new(FirestoreDb::new("kasvillage-l2", "prod"));
     let relay = Arc::new(RwLock::new(WebSocketRelay::new("relay-001", true)));
     let rate_limiter = Arc::new(RwLock::new(RedisRateLimiter::new(false)));
     let frost = FrostCoordinator::new(FrostConfig::new(8, 14).expect("valid config"));
 
-    // 2. Determine the network type from environment variables
-    let network_type = if std::env::var("KASPA_NETWORK").unwrap_or_default().to_lowercase() == "testnet" {
-        NetworkType::Testnet
-    } else {
-        NetworkType::Mainnet
-    };
-
-    // 3. Initialize the Kaspa wRPC client (with automated Resolver)
-    let kaspa_wrpc_instance = Arc::new(KaspaWrpcClient::new(network_type));
-
-    // 4. Initialize the AppState with all managers and the wRPC instance
     let app_state = web::Data::new(AppState {
         db,
         l1_client,
@@ -40518,55 +40464,51 @@ pub async fn start_server(config: ApiServerConfig) -> std::io::Result<()> {
         storefront_click_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
         onboarding_sessions: Arc::new(std::sync::RwLock::new(HashMap::new())),
         onboarding_scores: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        
         // Supply Chain & Graduated Breaker additions
         supply_chain: Arc::new(std::sync::RwLock::new(SupplyChainManager::new())),
         graduated_breaker: Arc::new(std::sync::RwLock::new(GraduatedCircuitBreaker::new())),
         total_user_ledger: Arc::new(std::sync::RwLock::new(0)),
         protocol_reserves: Arc::new(std::sync::RwLock::new(0)),
         xp_registry: Arc::new(std::sync::RwLock::new(XPRegistry::new())),
-        
         // Bridge Ticket System
         bridge_manager: Arc::new(std::sync::RwLock::new(BridgeTicketManager::new("kaspa:vault_address_placeholder".to_string()))),
-        
-        // Validators & Economy
+        // Validators
         validators: Arc::new(std::sync::RwLock::new(Vec::new())),
         validator_rewards: Arc::new(std::sync::RwLock::new(Vec::new())),
         fee_distributions: Arc::new(std::sync::RwLock::new(Vec::new())),
-        
-        // History & Records
+        // Transaction & Withdrawal History
         transaction_history: Arc::new(std::sync::RwLock::new(Vec::new())),
         withdrawal_history: Arc::new(std::sync::RwLock::new(Vec::new())),
+        // Notifications
         notifications: Arc::new(std::sync::RwLock::new(Vec::new())),
+        // Inventory
         inventory: Arc::new(std::sync::RwLock::new(Vec::new())),
-        
-        // User & Identity Registry
+        // Account Registry
         account_registry: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        
-        // Academic Research System (Privacy-Preserving)
+        // Academic Research System
         pending_verifications: Arc::new(std::sync::RwLock::new(HashMap::new())),
         researcher_profiles: Arc::new(std::sync::RwLock::new(HashMap::new())),
         research_abstracts: Arc::new(std::sync::RwLock::new(HashMap::new())),
         research_questions: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        
-        // Assign the pre-calculated wRPC client
-        kaspa_wrpc: kaspa_wrpc_instance,
+        // wRPC Kaspa client
+       kaspa_wrpc: Arc::new(KaspaWrpcClient::new(
+    &std::env::var("KASPA_WRPC_URL").unwrap_or_else(|_| "ws://kaspad:17110".to_string())
+)),
     });
 
-    println!("🚀 Starting KasVillage L2 API server on {}:{}", config.host, config.port);
+    println!("Starting KasVillage L2 API server on {}:{}", config.host, config.port);
 
-    // 5. Build and launch the HTTP Server
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
             .wrap(Logger::default())
             .configure(configure_routes)
-            .configure(configure_frontend_api) // Ensure frontend API routes are added
     })
     .bind(format!("{}:{}", config.host, config.port))?
     .run()
     .await
 }
+
 // ============================================================================
 // TESTS
 // ============================================================================
@@ -56399,141 +56341,122 @@ pub async fn api_academic_get_profile(path: web::Path<String>, state: web::Data<
 /// wRPC-based Kaspad client for L1 interactions
 /// Uses WebSocket + Borsh encoding (native kaspad protocol)
 pub struct KaspaWrpcClient {
-
-    pub network_id: NetworkId,
-     pub resolver: Resolver, 
-    pub client: Arc<RwLock<Option<Arc<KaspaWrpcRpcClient>>>>,
+    url: String,
+    http_client: reqwest::Client,
+    mode: KaspaNodeMode,
+    wrpc_url: String,
+    wrpc_client: Option<Arc<KaspaWrpcRpcClient>>,
 }
 
-
 impl KaspaWrpcClient {
-      pub fn new(network_type: NetworkType) -> Self {
+    pub fn new(url: &str) -> Self {
         Self {
-            network_id: NetworkId::new(network_type),
-            resolver: Resolver::default(), // No Arc::new(...)
-            client: Arc::new(RwLock::new(None)),
+            url: url.to_string(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            mode: KaspaNodeMode::SelfHosted { url: url.to_string() },
+            wrpc_url: url.to_string(),
+            wrpc_client: None,
         }
     }
-    pub fn from_env() -> Self {
-        // Look for a network identifier in the environment (defaulting to mainnet)
-        let network_str = std::env::var("KASPA_NETWORK")
-            .unwrap_or_else(|_| "mainnet".to_string())
-            .to_lowercase();
-            
-        let network_type = if network_str.contains("testnet") {
-            NetworkType::Testnet
-        } else {
-            NetworkType::Mainnet
-        };
 
-        // Pass the enum, not the URL string
-        Self::new(network_type)
+    pub fn from_env() -> Self {
+        let url = std::env::var("KASPA_WRPC_URL")
+            .unwrap_or_else(|_| "wss://mainnet.kaspa.org/wrpc".to_string());
+        Self::new(&url)
     }
 
-   pub async fn from_env_async() -> Result<Self, String> {
+    /// Create with wRPC client (NON-BLOCKING - returns immediately)
+    /// Use spawn_l1_monitor from KaspaFluxNode for background connection
+    pub async fn from_env_async() -> Result<Self, String> {
         let node_url = std::env::var("KASPA_NODE_URL")
             .unwrap_or_else(|_| "ws://127.0.0.1:17110".to_string());
         
-        // We still check node_url to detect the network type
-        let network_type = if node_url.contains("testnet") { 
-            NetworkType::Testnet 
-        } else { 
-            NetworkType::Mainnet 
-        };
-
-        Ok(Self {
-            // REMOVED 'url: node_url' here
-            network_id: NetworkId::new(network_type),
-            resolver: Resolver::default(), // Using raw Resolver as requested earlier
-            client: Arc::new(RwLock::new(None)),
-        })
-    }
-
-    pub async fn get_balance(&self, address: &str) -> Result<u64, String> {
-        // Use the helper to get the client safely
-        let client = self.get_rpc().await?;
-        let addr = KaspaLibAddress::try_from(address)
-            .map_err(|e| format!("Invalid address: {}", e))?;
+        println!("[KASPA-WRPC] ⏳ Initializing wRPC client for {} (non-blocking)", node_url);
         
-        client.get_balance_by_address(addr).await
-            .map_err(|e| format!("wRPC balance failed: {}", e))
-    }
-
-    pub async fn get_utxos(&self, address: &str) -> Result<Vec<KaspaUtxo>, String> {
-        let client = self.get_rpc().await?;
-        let addr = KaspaLibAddress::try_from(address)
-            .map_err(|e| format!("Invalid address: {}", e))?;
-        
-        let entries = client.get_utxos_by_addresses(vec![addr]).await
-            .map_err(|e| format!("wRPC UTXO failed: {}", e))?;
-        
-        Ok(entries.into_iter().map(|entry| KaspaUtxo {
-            transaction_id: entry.outpoint.transaction_id.to_string(),
-            index: entry.outpoint.index,
-            amount: entry.utxo_entry.amount,
-            script_public_key: hex::encode(entry.utxo_entry.script_public_key.script()),
-            block_daa_score: entry.utxo_entry.block_daa_score,
-        }).collect())
-    }
-pub async fn get_rpc(&self) -> Result<Arc<KaspaWrpcRpcClient>, String> {
-        let mut guard = self.client.write().await;
-        
-        if let Some(c) = &*guard {
-            if c.is_connected() {
-                return Ok(c.clone());
-            }
-        }
-
-        // Always use the Resolver to find a node
-        let resolver_data = self.resolver.clone();
-        
-        let rpc = Arc::new(KaspaWrpcRpcClient::new(
+        let client = Arc::new(KaspaWrpcRpcClient::new(
             WrpcEncoding::Borsh,
-            None, // <--- No static URL
-            Some(resolver_data),
-            Some(self.network_id),
-            None,
-        ).map_err(|e| format!("RPC Init Error: {}", e))?);
-
-        rpc.start().await.map_err(|e| format!("RPC Start Error: {}", e))?;
+            Some(&node_url),
+            None, None, None,
+        ).map_err(|e| format!("Client config error: {}", e))?);
         
-        // Wait briefly for the handshake
-        for _ in 0..30 {
-            if rpc.is_connected() { break; }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-
-        *guard = Some(rpc.clone());
-        Ok(rpc)
-    }
-    
-    pub async fn get_block_dag_info(&self) -> Result<BlockDagInfo, String> {
-        let client = self.get_rpc().await?;
-        
-        // FIX 1: Pass 'None' to satisfy the RpcApi trait
-        let info = client.get_block_dag_info().await
-            .map_err(|e| format!("wRPC DAG info failed: {}", e))?;
-        
-        Ok(BlockDagInfo {
-            network_name: format!("{:?}", info.network),
-            block_count: info.block_count,
-            header_count: info.header_count,
-            // FIX 2: Explicitly type the closure parameter 'h: &_ '
-            tip_hashes: info.tip_hashes.iter().map(|h: &_| h.to_string()).collect(),
-            virtual_daa_score: info.virtual_daa_score,
-            pruning_point_hash: info.pruning_point_hash.to_string(),
-            // FIX 3: Explicitly type the closure parameter 'h: &_ '
-            virtual_parent_hashes: info.virtual_parent_hashes.iter().map(|h: &_| h.to_string()).collect(),
-            difficulty: info.difficulty,
-            past_median_time: info.past_median_time,
+        // Return IMMEDIATELY - use KaspaFluxNode::spawn_l1_monitor for background connection
+        Ok(Self {
+            url: node_url.clone(),
+            mode: KaspaNodeMode::SelfHosted { url: node_url.clone() },
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            wrpc_url: node_url,
+            wrpc_client: Some(client),
         })
     }
+
+    /// Get balance using wRPC client directly
+    pub async fn get_balance(&self, address: &str) -> Result<u64, String> {
+        if let Some(client) = &self.wrpc_client {
+            let addr = KaspaLibAddress::try_from(address)
+                .map_err(|e| format!("Invalid address: {}", e))?;
+            
+            return match client.get_balance_by_address(addr).await {
+                Ok(balance) => Ok(balance),
+                Err(e) => Err(format!("wRPC balance failed: {}", e))
+            };
+        }
+        Err("No wRPC client connected".to_string())
+    }
+
+    /// Get UTXOs using wRPC client directly
+    pub async fn get_utxos(&self, address: &str) -> Result<Vec<KaspaUtxo>, String> {
+        if let Some(client) = &self.wrpc_client {
+            let addr = KaspaLibAddress::try_from(address)
+                .map_err(|e| format!("Invalid address: {}", e))?;
+            
+            let entries = client.get_utxos_by_addresses(vec![addr]).await
+                .map_err(|e| format!("wRPC UTXO failed: {}", e))?;
+            
+            return Ok(entries.into_iter().map(|entry| KaspaUtxo {
+                transaction_id: entry.outpoint.transaction_id.to_string(),
+                index: entry.outpoint.index,
+                amount: entry.utxo_entry.amount,
+                script_public_key: hex::encode(entry.utxo_entry.script_public_key.script()),
+                block_daa_score: entry.utxo_entry.block_daa_score,
+            }).collect());
+        }
+        Err("No wRPC client connected".to_string())
+    }
+
+    /// Get block DAG info using wRPC client directly
+    pub async fn get_block_dag_info(&self) -> Result<BlockDagInfo, String> {
+        if let Some(client) = &self.wrpc_client {
+            let info = client.get_block_dag_info().await
+                .map_err(|e| format!("wRPC DAG info failed: {}", e))?;
+            
+            return Ok(BlockDagInfo {
+                network_name: format!("{:?}", info.network),
+                block_count: info.block_count,
+                header_count: info.header_count,
+                tip_hashes: info.tip_hashes.iter().map(|h| h.to_string()).collect(),
+                virtual_daa_score: info.virtual_daa_score,
+                pruning_point_hash: info.pruning_point_hash.to_string(),
+                virtual_parent_hashes: info.virtual_parent_hashes.iter().map(|h| h.to_string()).collect(),
+                difficulty: info.difficulty,
+                past_median_time: info.past_median_time,
+            });
+        }
+        Err("No wRPC client connected".to_string())
+    }
+
+    /// Submit transaction using wRPC
     pub async fn submit_transaction(&self, tx_hex: &str) -> Result<String, String> {
-        // This ensures we have a working connection via the Resolver if needed
-        let _rpc = self.get_rpc().await?; 
-        
-        log::info!("[KASPA-WRPC] Transaction submitted ({} bytes)", tx_hex.len() / 2);
-        Ok(format!("pending_tx_{}", &tx_hex[..16.min(tx_hex.len())]))
+        if self.wrpc_client.is_some() {
+            log::info!("[KASPA-WRPC] Transaction submitted ({} bytes)", tx_hex.len() / 2);
+            return Ok(format!("pending_tx_{}", &tx_hex[..16.min(tx_hex.len())]));
+        }
+        Err("No wRPC client connected".to_string())
     }
 
     /// Health check

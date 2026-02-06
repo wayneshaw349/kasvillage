@@ -24443,6 +24443,16 @@ impl KaspaFluxNode {
             use kaspa_wrpc_client::prelude::RpcApi;
             use std::time::Duration;
             
+            // ─────────────────────────────────────────────────────────────────────
+            // HARDCODED ASPECTRON RESOLVER ENDPOINTS (Kaspa Public Node Infrastructure)
+            // ─────────────────────────────────────────────────────────────────────
+            const ASPECTRON_ENDPOINTS: &[&str] = &[
+                "wss://ivy.kaspa.green/kaspa/mainnet/wrpc/borsh",      // Primary
+                "wss://kaspa-resolver.aspectron.org/wrpc",             // Aspectron primary
+                "wss://xelis.io/kaspa/wrpc",                           // Xelis fallback
+                "wss://kaspa.matrx.dev/wrpc",                          // MATRX fallback
+            ];
+            
             let mut retry_delay_secs = 5u64;
             let max_retry_delay = 120u64;
             let local_url = std::env::var("KASPA_NODE_URL").ok();
@@ -24455,7 +24465,7 @@ impl KaspaFluxNode {
                 };
                 l1_state.set_status(L1ConnectionStatus::Connecting).await;
 
-                // ── TIER 1: Local kaspad sidecar ──
+                // ── TIER 1: Local kaspad sidecar (5 attempts max) ──
                 if attempt <= 5 {
                     if let Some(ref url) = local_url {
                         println!("[L1] 📡 Attempt {}: Local node {}", attempt, url);
@@ -24472,17 +24482,19 @@ impl KaspaFluxNode {
                     }
                 }
 
-                // ── TIER 2: Kaspa Resolver (PNN) ──
-                println!("[L1] 📡 Attempt {}: Querying Resolver for public node...", attempt);
-                match Self::try_connect_resolver(&kaspa_node.resolver, kaspa_node.network_id).await {
-                    Ok((client, daa, url)) => {
-                        println!("[L1] ✅ Connected via Resolver: {} (DAA: {})", url, daa);
-                        l1_state.set_connected(daa, client.clone()).await;
-                        retry_delay_secs = 5;
-                        Self::run_keepalive(&l1_state, &client).await;
-                        continue;
+                // ── TIER 2: Hardcoded Aspectron/Public wRPC endpoints ──
+                for (idx, endpoint) in ASPECTRON_ENDPOINTS.iter().enumerate() {
+                    println!("[L1] 📡 Attempt {}: Trying hardcoded endpoint ({}) {}", attempt, idx + 1, endpoint);
+                    match Self::try_connect_wrpc(endpoint, kaspa_node.network_id).await {
+                        Ok((client, daa)) => {
+                            println!("[L1] ✅ Connected via Aspectron: {} (DAA: {})", endpoint, daa);
+                            l1_state.set_connected(daa, client.clone()).await;
+                            retry_delay_secs = 5;
+                            Self::run_keepalive(&l1_state, &client).await;
+                            continue;
+                        }
+                        Err(e) => println!("[L1] ⚠ Endpoint {} failed: {}", endpoint, e),
                     }
-                    Err(e) => println!("[L1] ⚠ Resolver failed: {}", e),
                 }
 
                 // ── TIER 3: REST API fallback ──
@@ -57418,7 +57430,7 @@ mod tests_apartment_cap {
 }
 
 // ============================================================================
-// TESTS: L1 CONNECTION STATE (Non-blocking kaspad monitoring) God willing this works
+// TESTS: L1 CONNECTION STATE (Non-blocking kaspad monitoring)
 // ============================================================================
 #[cfg(test)]
 mod tests_l1_connection_state {

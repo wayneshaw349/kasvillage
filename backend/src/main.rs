@@ -57545,7 +57545,7 @@ mod tests_apartment_cap {
 }
 
 // ============================================================================
-// TESTS: L1 CONNECTION STATE (Non-blocking kaspad monitoring)
+// TESTS: L1 CONNECTION STATE (Non-blocking kaspad monitoring) God Willing
 // ============================================================================
 #[cfg(test)]
 mod tests_l1_connection_state {

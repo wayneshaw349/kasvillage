@@ -19,8 +19,8 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy binary from builder
-COPY --from=builder /build/target/release/kaspa-resolver /app/kaspa-resolver
+# Copy binary from builder (binary name is 'resolver' per Cargo.toml)
+COPY --from=builder /build/target/release/resolver /app/resolver
 
 # Copy default config
 COPY --from=builder /build/Resolver.toml /app/Resolver.toml
@@ -29,4 +29,4 @@ EXPOSE 8888
 
 ENV RESOLVER_ADDRESS=0.0.0.0:8888
 
-CMD ["/app/kaspa-resolver"]
+CMD ["/app/resolver"]

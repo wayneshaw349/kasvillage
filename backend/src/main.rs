@@ -1,5 +1,5 @@
 // ============================================================================
-// KASVILLAGE L2 - COMPLETE PRODUCTION IMPLEMENTATION - God willing this works 
+// KASVILLAGE L2 - COMPLETE PRODUCTION IMPLEMENTATION - God willing this works3 
 // ============================================================================
 // VERSION: 2025-02-02-fix-500-endpoints-v3
 // FIXES: 
@@ -24431,82 +24431,6 @@ impl KaspaFluxNode {
         })
     }
 
-    /// Create with Kaspa Resolver (HTTP endpoint)
-    /// Automatically selects best available kaspad node from resolver pool
-    pub async fn from_resolver(resolver_url: &str) -> Result<Self, String> {
-        let network_type = std::env::var("KASPA_NETWORK")
-            .map(|n| if n.to_lowercase() == "testnet" { NetworkType::Testnet } else { NetworkType::Mainnet })
-            .unwrap_or(NetworkType::Mainnet);
-
-        let network_id = NetworkId::new(network_type);
-        let resolver = Arc::new(Resolver::default());
-
-        // Query resolver for best endpoint
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| format!("HTTP client setup failed: {}", e))?;
-
-        let endpoint_url = format!("{}/endpoint/mainnet/borsh", resolver_url);
-        let resp = http_client
-            .get(&endpoint_url)
-            .send()
-            .await
-            .map_err(|e| format!("Resolver query failed: {}", e))?;
-
-        let data: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Resolver response parse failed: {}", e))?;
-
-        let wrpc_endpoint = data
-            .get("endpoint")
-            .and_then(|e| e.as_str())
-            .ok_or("Resolver did not return endpoint")?
-            .to_string();
-
-        log::info!("Resolved kaspad endpoint: {}", wrpc_endpoint);
-
-        Ok(Self {
-            mode: KaspaNodeMode::SelfHosted { url: wrpc_endpoint.clone() },
-            http_client,
-            wrpc_url: wrpc_endpoint,
-            resolver,
-            network_id,
-            l1_state: L1ConnectionState::new(),
-        })
-    }
-
-    /// Get endpoint from Kaspa Resolver
-    /// Used by spawn_l1_monitor as Tier 2 fallback
-    pub async fn query_resolver(resolver_url: &str) -> Result<String, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("Client error: {}", e))?;
-
-        let endpoint_url = format!("{}/endpoint/mainnet/borsh", resolver_url);
-        let resp = client
-            .get(&endpoint_url)
-            .send()
-            .await
-            .map_err(|e| format!("Resolver request failed: {}", e))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("Resolver returned: {}", resp.status()));
-        }
-
-        let data: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Parse error: {}", e))?;
-
-        data.get("endpoint")
-            .and_then(|e| e.as_str())
-            .ok_or("No endpoint in resolver response".to_string())
-            .map(|s| s.to_string())
-    }
-
     /// Spawn background L1 monitor with 3-tier fallback:
     ///   Tier 1: Local kaspad sidecar (KASPA_NODE_URL)
     ///   Tier 2: Kaspa Resolver (PNN - auto load-balanced public nodes)
@@ -24548,33 +24472,36 @@ impl KaspaFluxNode {
                     }
                 }
 
-                // ── TIER 2: Kaspa Resolver (PNN) ──
-                println!("[L1] 📡 Attempt {}: Querying Resolver for public node...", attempt);
+                // ── TIER 2: HTTP Resolver (kaspa-resolver service) ──
+                let http_resolver_url = std::env::var("RESOLVER_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:8989".to_string());
+                println!("[L1] Querying HTTP Resolver: {}", http_resolver_url);
                 
-                // Try wRPC resolver first
-                if let Ok((client, daa, url)) = Self::try_connect_resolver(&kaspa_node.resolver, kaspa_node.network_id).await {
-                    println!("[L1] ✅ Connected via Resolver: {} (DAA: {})", url, daa);
-                    l1_state.set_connected(daa, client.clone()).await;
-                    retry_delay_secs = 5;
-                    Self::run_keepalive(&l1_state, &client).await;
-                    continue;
+                match Self::try_connect_http_resolver(&kaspa_node.http_client, &http_resolver_url, kaspa_node.network_id).await {
+                    Ok((client, daa, url)) => {
+                        println!("[L1] ✅ Connected via HTTP Resolver: {} (DAA: {})", url, daa);
+                        l1_state.set_connected(daa, client.clone()).await;
+                        retry_delay_secs = 5;
+                        Self::run_keepalive(&l1_state, &client).await;
+                        continue;
+                    }
+                    Err(e) => println!("[L1] ⚠ HTTP Resolver failed: {}", e),
                 }
-                
-                // Try HTTP resolver endpoint as fallback
-                let http_resolver_url = std::env::var("KASPA_RESOLVER_URL")
-                    .unwrap_or_else(|_| "http://127.0.0.1:8888".to_string());
-                
-                if let Ok((client, daa, url)) = Self::try_connect_http_resolver(&http_resolver_url, kaspa_node.network_id).await {
-                    println!("[L1] ✅ Connected via HTTP Resolver: {} (DAA: {})", url, daa);
-                    l1_state.set_connected(daa, client.clone()).await;
-                    retry_delay_secs = 5;
-                    Self::run_keepalive(&l1_state, &client).await;
-                    continue;
-                }
-                
-                println!("[L1] ⚠ Both Resolver methods failed");
 
-                // ── TIER 3: REST API fallback ──
+                // ── TIER 3: DNS Resolver (PNN) ──
+                println!("[L1] 📡 Attempt {}: Querying DNS Resolver for public node...", attempt);
+                match Self::try_connect_resolver(&kaspa_node.resolver, kaspa_node.network_id).await {
+                    Ok((client, daa, url)) => {
+                        println!("[L1] ✅ Connected via DNS Resolver: {} (DAA: {})", url, daa);
+                        l1_state.set_connected(daa, client.clone()).await;
+                        retry_delay_secs = 5;
+                        Self::run_keepalive(&l1_state, &client).await;
+                        continue;
+                    }
+                    Err(e) => println!("[L1] ⚠ DNS Resolver failed: {}", e),
+                }
+
+                // ── TIER 4: REST API fallback ──
                 let rest_endpoints = match kaspa_node.network_id.network_type {
                     NetworkType::Mainnet => REST_API_MAINNET,
                     _ => REST_API_TESTNET,
@@ -24657,42 +24584,44 @@ impl KaspaFluxNode {
         Ok((client, daa, url))
     }
 
-    /// Connect via HTTP Resolver endpoint (Tier 2 fallback)
-    /// Queries resolver REST API for best kaspad endpoint
-    async fn try_connect_http_resolver(resolver_url: &str, network_id: NetworkId) -> Result<(Arc<KaspaWrpcRpcClient>, u64, String), String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("HTTP client: {}", e))?;
-
-        let endpoint_url = format!("{}/endpoint/mainnet/borsh", resolver_url);
-        println!("[L1] Querying HTTP Resolver: {}", resolver_url);
-        
-        let resp = client
-            .get(&endpoint_url)
-            .send()
-            .await
-            .map_err(|e| format!("Resolver HTTP request failed: {}", e))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("Resolver returned: {}", resp.status()));
+    /// Query HTTP resolver service for node URL
+    async fn try_connect_http_resolver(
+        http_client: &reqwest::Client,
+        resolver_url: &str,
+        network_id: NetworkId
+    ) -> Result<(Arc<KaspaWrpcRpcClient>, u64, String), String> {
+        #[derive(serde::Deserialize)]
+        struct ResolverResponse {
+            url: String,
         }
 
-        let data: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Resolver parse error: {}", e))?;
+        let network = match network_id.network_type {
+            NetworkType::Mainnet => "mainnet",
+            NetworkType::Testnet => "testnet",
+            _ => return Err("Unsupported network".into()),
+        };
 
-        let wrpc_endpoint = data
-            .get("endpoint")
-            .and_then(|e| e.as_str())
-            .ok_or("Resolver did not return endpoint")?
-            .to_string();
-
-        println!("[L1] HTTP Resolver returned: {}", wrpc_endpoint);
+        let query_url = format!("{}/v1/kaspa/{}/wrpc/borsh", resolver_url, network);
         
-        let (client, daa) = Self::try_connect_wrpc(&wrpc_endpoint, network_id).await?;
-        Ok((client, daa, wrpc_endpoint))
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            http_client.get(&query_url).send()
+        ).await
+            .map_err(|_| "HTTP resolver timeout".to_string())?
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("HTTP resolver returned: {}", resp.status()));
+        }
+
+        let resolver_resp: ResolverResponse = resp.json().await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        let url = resolver_resp.url;
+        println!("[L1] HTTP Resolver returned: {}", url);
+
+        let (client, daa) = Self::try_connect_wrpc(&url, network_id).await?;
+        Ok((client, daa, url))
     }
 
     /// Keepalive loop — pings every 30s, returns when connection drops
@@ -57545,7 +57474,7 @@ mod tests_apartment_cap {
 }
 
 // ============================================================================
-// TESTS: L1 CONNECTION STATE (Non-blocking kaspad monitoring) God Willing
+// TESTS: L1 CONNECTION STATE (Non-blocking kaspad monitoring)
 // ============================================================================
 #[cfg(test)]
 mod tests_l1_connection_state {

@@ -1,5 +1,5 @@
 // ============================================================================
-// KASVILLAGE L2 - COMPLETE PRODUCTION IMPLEMENTATION - God willing this works5 
+// KASVILLAGE L2 - COMPLETE PRODUCTION IMPLEMENTATION - God willing this works6 
 // ============================================================================
 // VERSION: 2025-02-02-fix-500-endpoints-v3
 // FIXES: 
@@ -124,7 +124,6 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::convert::TryInto;
 use pasta_curves::EqAffine;
-use pasta_curves::pallas::Affine as EpAffine;
 // Use rand 0.8's OsRng - it internally uses rand_core 0.6.4
 // which is compatible with halo2, k256, and other crypto crates
 use rand::rngs::OsRng;
@@ -18388,6 +18387,23 @@ impl KaspadClient {
 
     pub async fn query_root(&self, _epoch: u32) -> Result<Fr, String> {
         Err("Root query not yet implemented".to_string())
+    }
+
+    /// Submit OP_RETURN transaction for inscriptions
+    pub async fn submit_op_return(&self, _address: &str, data: &[u8]) -> Result<String, String> {
+        // In production, this would build and submit an actual OP_RETURN tx
+        // For now, return a mock txid based on data hash
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash: [u8; 32] = hasher.finalize().into();
+        Ok(hex::encode(&hash[..16]))
+    }
+
+    /// Check if transaction is confirmed
+    pub async fn is_tx_confirmed(&self, txid: &str) -> Result<bool, String> {
+        // In production, query kaspad for tx confirmation status
+        // For now, assume confirmed if txid looks valid
+        Ok(txid.len() >= 16)
     }
 }
 
@@ -60662,7 +60678,7 @@ pub async fn api_dkg_round1(
     
     // Convert to internal DkgRound1Package format
     let package = DkgRound1Package {
-        identifier: ParticipantId(req.participant_index),
+        identifier: req.participant_index,
         commitment: vec![commitment],
         proof_of_knowledge: proof,
     };
@@ -60695,13 +60711,13 @@ pub async fn api_dkg_round2(
             if encrypted.len() >= 32 {
                 let mut share = [0u8; 32];
                 share.copy_from_slice(&encrypted[..32]);
-                secret_shares.insert(ParticipantId(s.receiver_index), share);
+                secret_shares.insert(s.receiver_index, share);
             }
         }
     }
     
     let packages = vec![DkgRound2Package {
-        identifier: ParticipantId(req.shares.first().map(|s| s.sender_index).unwrap_or(0)),
+        identifier: req.shares.first().map(|s| s.sender_index).unwrap_or(0),
         secret_shares,
     }];
     

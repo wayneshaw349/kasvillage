@@ -1,0 +1,19 @@
+name = "kasvillage-resharing-cron"
+main = "src/worker.js"
+compatibility_date = "2024-01-01"
+
+[triggers]
+crons = ["0 0 * * *"]  # Every day at 00:00 UTC
+
+[vars]
+BACKEND_URL = "https://134ucrb1rpek78b8ev55521u78.ingress.akash-palmito.org"
+
+# Set secret via CLI: wrangler secret put CRON_AUTH_TOKEN
+# [secrets]
+# CRON_AUTH_TOKEN = "your-secure-token"
+
+# Optional KV namespace for logging resharing ceremonies
+# Create: wrangler kv:namespace create "RESHARING_LOG"
+# [[kv_namespaces]]
+# binding = "RESHARING_LOG"
+# id = "your-kv-namespace-id"

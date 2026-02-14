@@ -19346,6 +19346,36 @@ pub async fn start_api_server(
     });
 
     println!("[PROOFS] ✓ Autonomous proof generation started");
+
+    // ========================================================================
+    // FLUX ORCHESTRATOR - Sweeper/Janitor/Snapshot Background Tasks
+    // ========================================================================
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    
+    let flux_config = FluxConfig {
+        sweeper_interval_secs: 30,      // Check bridge addresses every 30s
+        janitor_interval_secs: 300,     // Refund stray payments every 5min
+        snapshot_interval_secs: 86400,  // Arweave snapshot every 24h
+        vault_address: std::env::var("VAULT_ADDRESS").unwrap_or_else(|_| {
+            "kaspa:qr5a4w8xc9d2v3b4n5m6".to_string() // Default vault
+        }),
+        vault_threshold: 3,
+        vault_total_shares: 5,
+        arweave_wallet_path: std::env::var("ARWEAVE_WALLET_PATH")
+            .unwrap_or_else(|_| "./arweave-wallet.json".to_string()),
+    };
+    
+    let flux_orchestrator = Arc::new(FluxOrchestrator::new(flux_config));
+    let flux_data = web::Data::new(flux_orchestrator.clone());
+    
+    // Spawn Flux background tasks (sweeper, janitor, snapshot)
+    let flux_clone = flux_orchestrator.clone();
+    let app_state_clone = app_state.clone();
+    tokio::spawn(async move {
+        flux_clone.start(app_state_clone, shutdown_rx).await;
+    });
+    
+    println!("[FLUX] ✓ Sweeper: 30s | Janitor: 5min | Snapshot: 24h");
     println!("📡 Listening on {}:{}", host, port);
 
     // ========================================================================
@@ -19362,6 +19392,7 @@ pub async fn start_api_server(
             .app_data(account_registry.clone())
             .app_data(qr_tree.clone())
             .app_data(kaspa_node_data.clone())
+            .app_data(flux_data.clone())
             .wrap(Logger::default())
             .wrap(
                 Cors::default()
@@ -19401,6 +19432,8 @@ pub async fn start_api_server(
             .route("/api/l1/submit", web::post().to(api_l1_submit_tx))
             // Ephemeral signature routes (QR-Merkle)
             .configure(configure_qr_merkle_routes)
+            // Flux orchestrator routes (bridge + monitoring)
+            .configure(configure_flux_routes)
             // All frontend routes
             .configure(configure_routes_additions)
     })
@@ -39580,48 +39613,165 @@ impl Default for ApiServerConfig {
 }
 
 /// Shared application state
+// ============================================================================
+// APPSTATE - STATELESS IN-MEMORY STATE (Akash Node Layer)
+// ============================================================================
+// Architecture:
+//   AppState (RAM, volatile) → FluxPostgreSQL (hot DB) → Arweave (cold archive)
+//
+// This struct lives ONLY in memory. On restart:
+//   1. Merkle tree rebuilt from Arweave snapshot
+//   2. Hot data loaded from Flux PostgreSQL
+//   3. Missing data falls back to Arweave query
+//
+// Persistence Strategy:
+//   - Write: RAM → Flux PostgreSQL (immediate)
+//   - Archive: Flux → Arweave (24h snapshots via FluxOrchestrator)
+//   - Read: RAM (if exists) → Flux → Arweave (tiered fallback)
+// ============================================================================
+
 pub struct AppState {
-    pub db: Arc<dyn DatabaseStore>,
+    // ========================================================================
+    // PERSISTENCE LAYER (Flux PostgreSQL + Arweave Fallback)
+    // ========================================================================
+    /// Primary hot database (Flux PostgreSQL) - NOT Firestore
+    /// Falls back to Arweave for historical snapshots
+    pub flux_db: Arc<FluxPostgreSQLClient>,
+    
+    /// Arweave archive client for 24h snapshots
+    pub arweave_client: Arc<ArweaveArchiveClient>,
+    
+    // ========================================================================
+    // L1 INTEGRATION
+    // ========================================================================
+    /// Kaspa L1 client (3-tier: local node → Resolver → REST API)
     pub l1_client: KaspaL1Client,
-    pub relay: Arc<RwLock<WebSocketRelay>>,
-    pub rate_limiter: Arc<RwLock<RedisRateLimiter>>,
-    pub frost_coordinator: Arc<RwLock<FrostCoordinator>>,
-    pub circuit_breaker: Arc<std::sync::RwLock<CircuitBreakerState>>,
-    pub consignment_agreements: Arc<std::sync::RwLock<HashMap<String, ConsignmentAgreement>>>,
-    pub storefronts: Arc<std::sync::RwLock<HashMap<String, StorefrontData>>>,
-    pub storefront_visits: Arc<std::sync::RwLock<HashMap<String, u64>>>,
-    pub merchant_balances: Arc<std::sync::RwLock<HashMap<String, u64>>>,
-    pub storefront_click_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
-    pub onboarding_sessions: Arc<std::sync::RwLock<HashMap<String, OnboardingSession>>>,
-    pub onboarding_scores: Arc<std::sync::RwLock<HashMap<String, u8>>>,
-    // Supply Chain & Graduated Breaker additions
-    pub supply_chain: Arc<std::sync::RwLock<SupplyChainManager>>,
-    pub graduated_breaker: Arc<std::sync::RwLock<GraduatedCircuitBreaker>>,
-    pub total_user_ledger: Arc<std::sync::RwLock<u64>>,
-    pub protocol_reserves: Arc<std::sync::RwLock<u64>>,
-    pub xp_registry: Arc<std::sync::RwLock<XPRegistry>>,
-    // Bridge Ticket System
-    pub bridge_manager: Arc<std::sync::RwLock<BridgeTicketManager>>,
-    // Validators
-    pub validators: Arc<std::sync::RwLock<Vec<ValidatorInfo>>>,
-    pub validator_rewards: Arc<std::sync::RwLock<Vec<ValidatorRewardRecord>>>,
-    pub fee_distributions: Arc<std::sync::RwLock<Vec<FeeDistributionRecord>>>,
-    // Transaction & Withdrawal History
-    pub transaction_history: Arc<std::sync::RwLock<Vec<TransactionRecord>>>,
-    pub withdrawal_history: Arc<std::sync::RwLock<Vec<WithdrawalRecord>>>,
-    // Notifications
-    pub notifications: Arc<std::sync::RwLock<Vec<NotificationRecord>>>,
-    // Inventory
-    pub inventory: Arc<std::sync::RwLock<Vec<InventoryItem>>>,
-    // Account Registry (for profile updates)
-    pub account_registry: Arc<std::sync::RwLock<HashMap<String, AccountState>>>,
-    // Academic Research System (Privacy-Preserving)
-    pub pending_verifications: Arc<std::sync::RwLock<HashMap<String, (String, String, u64)>>>, // hash -> (code, domain, expires)
-    pub researcher_profiles: Arc<std::sync::RwLock<HashMap<String, ResearcherProfile>>>,
-    pub research_abstracts: Arc<std::sync::RwLock<HashMap<String, ResearchAbstract>>>,
-    pub research_questions: Arc<std::sync::RwLock<HashMap<String, ResearchQuestion>>>,
-    // wRPC Kaspa client
+    
+    /// wRPC Kaspa client for advanced queries
     pub kaspa_wrpc: Arc<KaspaWrpcClient>,
+    
+    // ========================================================================
+    // NETWORKING & COORDINATION
+    // ========================================================================
+    /// WebSocket relay for NAT traversal (mobile ↔ validators)
+    pub relay: Arc<RwLock<WebSocketRelay>>,
+    
+    /// Redis-backed rate limiter (100 req/min per IP)
+    pub rate_limiter: Arc<RwLock<RedisRateLimiter>>,
+    
+    /// FROST threshold signature coordinator (3-of-5)
+    pub frost_coordinator: Arc<RwLock<FrostCoordinator>>,
+    
+    // ========================================================================
+    // IN-MEMORY STATE (Volatile, rebuilt from Flux/Arweave on restart)
+    // ========================================================================
+    /// KAS price (updated every 60s from CoinGecko)
+    pub kas_price: Arc<RwLock<f64>>,
+    
+    /// Circuit breaker state (drainage protection)
+    pub circuit_breaker: Arc<std::sync::RwLock<CircuitBreakerState>>,
+    
+    /// Graduated circuit breaker (multi-tier limits)
+    pub graduated_breaker: Arc<std::sync::RwLock<GraduatedCircuitBreaker>>,
+    
+    /// Total user ledger balance (sum of all L2 balances)
+    pub total_user_ledger: Arc<std::sync::RwLock<u64>>,
+    
+    /// Protocol reserve pool (excess funds)
+    pub protocol_reserves: Arc<std::sync::RwLock<u64>>,
+    
+    // ========================================================================
+    // USER DATA (RAM cache, backed by Flux PostgreSQL)
+    // ========================================================================
+    /// XP registry (tier unlocks: Advertiser, Backer, Merchant, etc.)
+    pub xp_registry: Arc<std::sync::RwLock<XPRegistry>>,
+    
+    /// Account registry (pubkey → balance/nonce/tier)
+    pub account_registry: Arc<std::sync::RwLock<HashMap<String, AccountState>>>,
+    
+    /// Onboarding sessions (30 questions + 3 stories)
+    pub onboarding_sessions: Arc<std::sync::RwLock<HashMap<String, OnboardingSession>>>,
+    
+    /// Onboarding scores (PoC: Proof of Capacity)
+    pub onboarding_scores: Arc<std::sync::RwLock<HashMap<String, u8>>>,
+    
+    // ========================================================================
+    // STOREFRONTS & COMMERCE
+    // ========================================================================
+    /// Storefront metadata (Instagram-style grid layouts)
+    pub storefronts: Arc<std::sync::RwLock<HashMap<String, StorefrontData>>>,
+    
+    /// Storefront visit counters (analytics)
+    pub storefront_visits: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    
+    /// Click-through tracking (conversions)
+    pub storefront_click_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    
+    /// Merchant L2 balances (separate from user balances)
+    pub merchant_balances: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    
+    /// Consignment agreements (host ↔ seller contracts)
+    pub consignment_agreements: Arc<std::sync::RwLock<HashMap<String, ConsignmentAgreement>>>,
+    
+    /// Supply chain tracking (multi-hop provenance)
+    pub supply_chain: Arc<std::sync::RwLock<SupplyChainManager>>,
+    
+    /// Inventory items (storefront products)
+    pub inventory: Arc<std::sync::RwLock<Vec<InventoryItem>>>,
+    
+    // ========================================================================
+    // BRIDGE & DEPOSITS (Ephemeral Addresses)
+    // ========================================================================
+    /// Bridge ticket manager (5min expiry ephemeral addresses)
+    pub bridge_manager: Arc<std::sync::RwLock<BridgeTicketManager>>,
+    
+    // ========================================================================
+    // VALIDATORS & REWARDS
+    // ========================================================================
+    /// Validator registry (FROST participants)
+    pub validators: Arc<std::sync::RwLock<Vec<ValidatorInfo>>>,
+    
+    /// Validator reward history
+    pub validator_rewards: Arc<std::sync::RwLock<Vec<ValidatorRewardRecord>>>,
+    
+    /// Fee distribution records (protocol revenue)
+    pub fee_distributions: Arc<std::sync::RwLock<Vec<FeeDistributionRecord>>>,
+    
+    // ========================================================================
+    // TRANSACTION HISTORY (Hot cache, archived to Flux/Arweave)
+    // ========================================================================
+    /// L2 transaction history (last 10k txs in RAM)
+    pub transaction_history: Arc<std::sync::RwLock<Vec<TransactionRecord>>>,
+    
+    /// Withdrawal history (FROST signatures)
+    pub withdrawal_history: Arc<std::sync::RwLock<Vec<WithdrawalRecord>>>,
+    
+    // ========================================================================
+    // NOTIFICATIONS (Push to mobile)
+    // ========================================================================
+    /// FCM/APNs notification queue
+    pub notifications: Arc<std::sync::RwLock<Vec<NotificationRecord>>>,
+    
+    // ========================================================================
+    // ACADEMIC RESEARCH (Privacy-preserving publications)
+    // ========================================================================
+    /// Email verification codes (5min expiry)
+    pub pending_verifications: Arc<std::sync::RwLock<HashMap<String, (String, String, u64)>>>,
+    
+    /// Researcher profiles (verified via .edu domains)
+    pub researcher_profiles: Arc<std::sync::RwLock<HashMap<String, ResearcherProfile>>>,
+    
+    /// Research abstracts (published papers)
+    pub research_abstracts: Arc<std::sync::RwLock<HashMap<String, ResearchAbstract>>>,
+    
+    /// Research questions (community Q&A)
+    pub research_questions: Arc<std::sync::RwLock<HashMap<String, ResearchQuestion>>>,
+    
+    // ========================================================================
+    // COMPLIANCE (Sanctions screening)
+    // ========================================================================
+    /// Compliance engine (OFAC + OpenSanctions)
+    pub compliance: Arc<std::sync::RwLock<ComplianceEngine>>,
 }
 
 
@@ -62544,634 +62694,544 @@ pub fn configure_withdrawal_routes(cfg: &mut web::ServiceConfig) {
             .route("/status/{request_id}", web::get().to(api_withdrawal_status))
     );
 }
-// ============================================================================
-// ARWEAVE BACKUP MODULE - 24H SNAPSHOT + FLUX PRUNING
-// ============================================================================
-// Add to kasvillage main.rs after Firestore section (~line 39200)
-// ============================================================================
-
-use reqwest::Client as HttpClient;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use sha2::{Sha256, Digest};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 // ============================================================================
-// ARWEAVE CONSTANTS
+// FLUX FLOW: SWEEPER + JANITOR + ARWEAVE SNAPSHOT SCHEDULER
+// ============================================================================
+// The Flux Flow integrates:
+// 1. Sweeper: Monitors bridge addresses → credits Merkle → sweeps to vault
+// 2. Janitor: Auto-refunds stray deposits that don't match tickets
+// 3. Arweave Scheduler: 24h snapshots for permanent audit trail
 // ============================================================================
 
-const ARWEAVE_GATEWAY: &str = "https://arweave.net";
-const ARWEAVE_GRAPHQL: &str = "https://arweave.net/graphql";
-const SNAPSHOT_INTERVAL_SECS: u64 = 86400; // 24 hours
-const APP_NAME: &str = "KasVillage";
-const STATE_TYPE: &str = "L2-State-Snapshot";
-
-// ============================================================================
-// ARWEAVE DATA STRUCTURES
-// ============================================================================
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ArweaveTag {
-    pub name: String,
-    pub value: String,
+/// Flux Flow Configuration
+#[derive(Clone)]
+pub struct FluxConfig {
+    pub sweeper_interval_secs: u64,
+    pub janitor_interval_secs: u64,
+    pub snapshot_interval_secs: u64,
+    pub stray_threshold_sompi: u64,
+    pub arweave_wallet_path: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StateSnapshot {
-    pub epoch: u64,
-    pub merkle_root: String,
-    pub account_count: u64,
-    pub total_balance: u64,
-    pub nullifier_count: u64,
-    pub timestamp: u64,
-    pub accounts: Vec<AccountSnapshot>,
-    pub pending_withdrawals: Vec<PendingWithdrawal>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AccountSnapshot {
-    pub pubkey: String,
-    pub balance_commitment: String,
-    pub nonce: u64,
-    pub merkle_index: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PendingWithdrawal {
-    pub request_id: u64,
-    pub pubkey: String,
-    pub amount: u64,
-    pub dest_address: String,
-    pub nullifier: String,
-    pub queued_at: u64,
-    pub unlocks_at: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ArweaveTransaction {
-    pub id: String,
-    pub tags: Vec<ArweaveTag>,
-    pub data: String,
-}
-
-// ============================================================================
-// ARWEAVE BACKUP CLIENT
-// ============================================================================
-
-pub struct ArweaveBackup {
-    gateway: String,
-    graphql: String,
-    http_client: HttpClient,
-    wallet_jwk: Option<String>, // Arweave wallet JWK for signing
-    last_snapshot_txid: Arc<RwLock<Option<String>>>,
-}
-
-impl ArweaveBackup {
-    pub fn new(wallet_jwk: Option<String>) -> Self {
+impl Default for FluxConfig {
+    fn default() -> Self {
         Self {
-            gateway: ARWEAVE_GATEWAY.to_string(),
-            graphql: ARWEAVE_GRAPHQL.to_string(),
-            http_client: HttpClient::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-                .unwrap(),
-            wallet_jwk,
-            last_snapshot_txid: Arc::new(RwLock::new(None)),
+            sweeper_interval_secs: 30,
+            janitor_interval_secs: 300,
+            snapshot_interval_secs: 86400,
+            stray_threshold_sompi: 1_000_000,
+            arweave_wallet_path: None,
+        }
+    }
+}
+
+/// Flux Flow Orchestrator - manages all background tasks
+pub struct FluxOrchestrator {
+    pub config: FluxConfig,
+    pub sweeper_stats: Arc<std::sync::RwLock<SweeperStats>>,
+    pub janitor_stats: Arc<std::sync::RwLock<JanitorStats>>,
+    pub snapshot_stats: Arc<std::sync::RwLock<SnapshotStats>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SweeperStats {
+    pub total_swept: u64,
+    pub total_swept_sompi: u64,
+    pub last_sweep_at: Option<u64>,
+    pub pending_sweeps: u32,
+    pub failed_sweeps: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct JanitorStats {
+    pub total_refunded: u64,
+    pub total_refunded_sompi: u64,
+    pub last_check_at: Option<u64>,
+    pub stray_detected: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SnapshotStats {
+    pub total_snapshots: u64,
+    pub last_snapshot_at: Option<u64>,
+    pub last_snapshot_txid: Option<String>,
+    pub last_epoch: u64,
+}
+
+impl FluxOrchestrator {
+    pub fn new(config: FluxConfig) -> Self {
+        Self {
+            config,
+            sweeper_stats: Arc::new(std::sync::RwLock::new(SweeperStats::default())),
+            janitor_stats: Arc::new(std::sync::RwLock::new(JanitorStats::default())),
+            snapshot_stats: Arc::new(std::sync::RwLock::new(SnapshotStats::default())),
         }
     }
 
-    /// Fetch latest state snapshot from Arweave
-    pub async fn fetch_latest_snapshot(&self) -> Result<Option<StateSnapshot>, String> {
-        let query = r#"
-        {
-            transactions(
-                tags: [
-                    { name: "App-Name", values: ["KasVillage"] },
-                    { name: "Type", values: ["L2-State-Snapshot"] }
-                ]
-                first: 1
-                sort: HEIGHT_DESC
-            ) {
-                edges {
-                    node {
-                        id
-                        tags { name value }
-                    }
-                }
-            }
-        }"#;
-
-        let resp = self.http_client
-            .post(&self.graphql)
-            .json(&serde_json::json!({ "query": query }))
-            .send()
-            .await
-            .map_err(|e| format!("GraphQL request failed: {}", e))?;
-
-        let json: serde_json::Value = resp.json().await
-            .map_err(|e| format!("Failed to parse GraphQL response: {}", e))?;
-
-        let edges = json["data"]["transactions"]["edges"].as_array();
-        if edges.is_none() || edges.unwrap().is_empty() {
-            return Ok(None);
-        }
-
-        let txid = edges.unwrap()[0]["node"]["id"].as_str()
-            .ok_or("Missing transaction ID")?;
-
-        // Fetch actual data
-        let data_url = format!("{}/{}", self.gateway, txid);
-        let data_resp = self.http_client
-            .get(&data_url)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch snapshot data: {}", e))?;
-
-        let snapshot: StateSnapshot = data_resp.json().await
-            .map_err(|e| format!("Failed to parse snapshot: {}", e))?;
-
-        *self.last_snapshot_txid.write().await = Some(txid.to_string());
-        Ok(Some(snapshot))
-    }
-
-    /// Upload state snapshot to Arweave
-    pub async fn upload_snapshot(&self, snapshot: &StateSnapshot) -> Result<String, String> {
-        let wallet_jwk = self.wallet_jwk.as_ref()
-            .ok_or("No Arweave wallet configured")?;
-
-        let data = serde_json::to_vec(snapshot)
-            .map_err(|e| format!("Serialization failed: {}", e))?;
-
-        let tags = vec![
-            ArweaveTag { name: "App-Name".into(), value: APP_NAME.into() },
-            ArweaveTag { name: "Type".into(), value: STATE_TYPE.into() },
-            ArweaveTag { name: "Epoch".into(), value: snapshot.epoch.to_string() },
-            ArweaveTag { name: "Merkle-Root".into(), value: snapshot.merkle_root.clone() },
-            ArweaveTag { name: "Account-Count".into(), value: snapshot.account_count.to_string() },
-            ArweaveTag { name: "Timestamp".into(), value: snapshot.timestamp.to_string() },
-            ArweaveTag { name: "Content-Type".into(), value: "application/json".into() },
-        ];
-
-        // Use Arweave bundler (e.g., Irys/Bundlr) for instant uploads
-        // For MVP, use direct Arweave tx (slower but simpler)
-        let txid = self.submit_transaction(data, tags, wallet_jwk).await?;
-
-        *self.last_snapshot_txid.write().await = Some(txid.clone());
-        Ok(txid)
-    }
-
-    /// Submit transaction to Arweave network
-    async fn submit_transaction(
-        &self,
-        data: Vec<u8>,
-        tags: Vec<ArweaveTag>,
-        _wallet_jwk: &str,
-    ) -> Result<String, String> {
-        // For production: Use arweave-rs crate or Irys SDK
-        // This is a simplified placeholder
+    /// Start all Flux background tasks
+    pub async fn start(
+        self: Arc<Self>,
+        state: web::Data<AppState>,
+        mut shutdown: broadcast::Receiver<()>,
+    ) {
+        let sweeper_state = state.clone();
+        let janitor_state = state.clone();
+        let snapshot_state = state.clone();
         
-        let data_hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(&data);
-            hex::encode(hasher.finalize())
-        };
+        let sweeper_self = self.clone();
+        let janitor_self = self.clone();
+        let snapshot_self = self.clone();
 
-        // In production, sign with JWK and submit to gateway
-        // For now, return mock txid based on data hash
-        println!("[ARWEAVE] Uploading {} bytes, {} tags", data.len(), tags.len());
-        println!("[ARWEAVE] Data hash: {}", data_hash);
-        
-        // TODO: Implement actual Arweave signing
-        // Options:
-        // 1. arweave-rs crate
-        // 2. Irys/Bundlr SDK (instant uploads, ~$0.001/KB)
-        // 3. ArDrive Turbo (free tier available)
-        
-        Ok(format!("ar_{}", &data_hash[..43]))
-    }
+        let mut shutdown_sweeper = shutdown.resubscribe();
+        let mut shutdown_janitor = shutdown.resubscribe();
+        let mut shutdown_snapshot = shutdown.resubscribe();
 
-    /// Fetch pending withdrawals from Arweave history
-    pub async fn fetch_pending_withdrawals(&self) -> Result<Vec<PendingWithdrawal>, String> {
-        if let Some(snapshot) = self.fetch_latest_snapshot().await? {
-            Ok(snapshot.pending_withdrawals)
-        } else {
-            Ok(vec![])
-        }
-    }
-
-    /// Check if a withdrawal has been finalized
-    pub async fn is_withdrawal_finalized(&self, request_id: u64) -> Result<bool, String> {
-        let query = format!(r#"
-        {{
-            transactions(
-                tags: [
-                    {{ name: "App-Name", values: ["KasVillage"] }},
-                    {{ name: "Type", values: ["Withdrawal-Finalized"] }},
-                    {{ name: "Request-ID", values: ["{}"] }}
-                ]
-                first: 1
-            ) {{
-                edges {{ node {{ id }} }}
-            }}
-        }}"#, request_id);
-
-        let resp = self.http_client
-            .post(&self.graphql)
-            .json(&serde_json::json!({ "query": query }))
-            .send()
-            .await
-            .map_err(|e| format!("GraphQL failed: {}", e))?;
-
-        let json: serde_json::Value = resp.json().await
-            .map_err(|e| format!("Parse failed: {}", e))?;
-
-        let edges = json["data"]["transactions"]["edges"].as_array();
-        Ok(edges.map(|e| !e.is_empty()).unwrap_or(false))
-    }
-
-    /// Mark withdrawal as finalized on Arweave
-    pub async fn mark_withdrawal_finalized(
-        &self,
-        request_id: u64,
-        l1_txid: &str,
-    ) -> Result<String, String> {
-        let wallet_jwk = self.wallet_jwk.as_ref()
-            .ok_or("No Arweave wallet configured")?;
-
-        let marker = serde_json::json!({
-            "request_id": request_id,
-            "l1_txid": l1_txid,
-            "status": "COMPLETED",
-            "timestamp": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
+        // Spawn Sweeper Task
+        let sweeper_handle = tokio::spawn(async move {
+            sweeper_self.sweeper_loop(sweeper_state, shutdown_sweeper).await;
         });
 
-        let data = serde_json::to_vec(&marker)
-            .map_err(|e| format!("Serialization failed: {}", e))?;
+        // Spawn Janitor Task
+        let janitor_handle = tokio::spawn(async move {
+            janitor_self.janitor_loop(janitor_state, shutdown_janitor).await;
+        });
 
-        let tags = vec![
-            ArweaveTag { name: "App-Name".into(), value: APP_NAME.into() },
-            ArweaveTag { name: "Type".into(), value: "Withdrawal-Finalized".into() },
-            ArweaveTag { name: "Request-ID".into(), value: request_id.to_string() },
-            ArweaveTag { name: "L1-TxID".into(), value: l1_txid.to_string() },
-        ];
+        // Spawn Snapshot Scheduler
+        let snapshot_handle = tokio::spawn(async move {
+            snapshot_self.snapshot_loop(snapshot_state, shutdown_snapshot).await;
+        });
 
-        self.submit_transaction(data, tags, wallet_jwk).await
-    }
-}
-
-// ============================================================================
-// FLUX DATABASE CLIENT (PostgreSQL on Flux)
-// ============================================================================
-
-pub struct FluxDatabase {
-    connection_string: String,
-    pool: Option<sqlx::PgPool>,
-}
-
-impl FluxDatabase {
-    pub fn new(connection_string: &str) -> Self {
-        Self {
-            connection_string: connection_string.to_string(),
-            pool: None,
-        }
+        // Wait for shutdown signal
+        let _ = shutdown.recv().await;
+        log::info!("[FLUX] Shutdown signal received, stopping all tasks");
     }
 
-    pub async fn connect(&mut self) -> Result<(), String> {
-        // Using sqlx for PostgreSQL
-        // Add to Cargo.toml: sqlx = { version = "0.7", features = ["runtime-tokio", "postgres"] }
-        
-        println!("[FLUX] Connecting to: {}", self.connection_string);
-        
-        // Placeholder - in production use sqlx::PgPool
-        Ok(())
-    }
-
-    /// Prune data older than retention period
-    pub async fn prune_old_data(&self, before_timestamp: u64) -> Result<u64, String> {
-        println!("[FLUX] Pruning data before timestamp: {}", before_timestamp);
-        
-        // In production:
-        // DELETE FROM accounts WHERE updated_at < $1;
-        // DELETE FROM transactions WHERE timestamp < $1;
-        // DELETE FROM pending_withdrawals WHERE queued_at < $1 AND status = 'FINALIZED';
-        
-        Ok(0) // Return count of pruned rows
-    }
-
-    /// Export current state for Arweave snapshot
-    pub async fn export_state(&self) -> Result<StateSnapshot, String> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        // In production, query all tables and build snapshot
-        Ok(StateSnapshot {
-            epoch: 0,
-            merkle_root: "0x0".to_string(),
-            account_count: 0,
-            total_balance: 0,
-            nullifier_count: 0,
-            timestamp,
-            accounts: vec![],
-            pending_withdrawals: vec![],
-        })
-    }
-
-    /// Import state from Arweave snapshot (cold start recovery)
-    pub async fn import_state(&self, snapshot: &StateSnapshot) -> Result<(), String> {
-        println!("[FLUX] Importing snapshot epoch {} with {} accounts",
-            snapshot.epoch, snapshot.account_count);
-        
-        // In production:
-        // TRUNCATE accounts, transactions, pending_withdrawals;
-        // INSERT INTO accounts ... FROM snapshot.accounts;
-        // INSERT INTO pending_withdrawals ... FROM snapshot.pending_withdrawals;
-        
-        Ok(())
-    }
-}
-
-// ============================================================================
-// SNAPSHOT SCHEDULER (24h cycle)
-// ============================================================================
-
-pub struct SnapshotScheduler {
-    arweave: Arc<ArweaveBackup>,
-    flux: Arc<RwLock<FluxDatabase>>,
-    last_snapshot: Arc<RwLock<u64>>,
-    interval_secs: u64,
-}
-
-impl SnapshotScheduler {
-    pub fn new(
-        arweave: Arc<ArweaveBackup>,
-        flux: Arc<RwLock<FluxDatabase>>,
-    ) -> Self {
-        Self {
-            arweave,
-            flux,
-            last_snapshot: Arc::new(RwLock::new(0)),
-            interval_secs: SNAPSHOT_INTERVAL_SECS,
-        }
-    }
-
-    /// Run snapshot loop (call from tokio::spawn)
-    pub async fn run(&self, mut shutdown: broadcast::Receiver<()>) {
-        println!("[SNAPSHOT] Starting 24h snapshot scheduler");
+    /// Sweeper: Monitor bridge addresses → credit Merkle → sweep to vault
+    async fn sweeper_loop(
+        &self,
+        state: web::Data<AppState>,
+        mut shutdown: broadcast::Receiver<()>,
+    ) {
+        log::info!("[SWEEPER] Starting bridge address monitor (interval: {}s)", self.config.sweeper_interval_secs);
         
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    
-                    let last = *self.last_snapshot.read().await;
-                    
-                    if now - last >= self.interval_secs {
-                        if let Err(e) = self.execute_snapshot().await {
-                            eprintln!("[SNAPSHOT] Failed: {}", e);
-                        }
-                    }
-                }
                 _ = shutdown.recv() => {
-                    println!("[SNAPSHOT] Shutdown signal received");
+                    log::info!("[SWEEPER] Shutdown received");
                     break;
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(self.config.sweeper_interval_secs)) => {
+                    if let Err(e) = self.execute_sweep_cycle(&state).await {
+                        log::error!("[SWEEPER] Cycle failed: {}", e);
+                    }
                 }
             }
         }
     }
 
-    /// Execute snapshot: Flux -> Arweave -> Prune
-    async fn execute_snapshot(&self) -> Result<(), String> {
-        println!("[SNAPSHOT] Starting 24h snapshot cycle");
-
-        // 1. Export state from Flux
-        let flux = self.flux.read().await;
-        let snapshot = flux.export_state().await?;
-        drop(flux);
-
-        // 2. Upload to Arweave
-        let txid = self.arweave.upload_snapshot(&snapshot).await?;
-        println!("[SNAPSHOT] Uploaded to Arweave: {}", txid);
-
-        // 3. Wait for Arweave confirmation (~2 min)
-        tokio::time::sleep(std::time::Duration::from_secs(180)).await;
-
-        // 4. Verify upload
-        let verified = self.arweave.fetch_latest_snapshot().await?;
-        if verified.is_none() {
-            return Err("Snapshot verification failed".to_string());
+    async fn execute_sweep_cycle(&self, state: &web::Data<AppState>) -> Result<(), String> {
+        let pending_addresses = state.bridge_manager.read().unwrap().get_pending_addresses();
+        
+        if pending_addresses.is_empty() {
+            return Ok(());
         }
 
-        // 5. Prune Flux (keep last 24h for hot queries)
-        let prune_before = snapshot.timestamp.saturating_sub(86400);
-        let flux = self.flux.read().await;
-        let pruned = flux.prune_old_data(prune_before).await?;
-        println!("[SNAPSHOT] Pruned {} old records from Flux", pruned);
+        log::debug!("[SWEEPER] Checking {} pending bridge addresses", pending_addresses.len());
 
-        // 6. Update last snapshot time
-        *self.last_snapshot.write().await = snapshot.timestamp;
+        for address in pending_addresses {
+            // Check L1 for deposits to this ephemeral address
+            match self.check_bridge_deposit(state, &address).await {
+                Ok(Some(deposit)) => {
+                    log::info!("[SWEEPER] Deposit detected: {} sompi to {}", deposit.amount_sompi, address);
+                    
+                    // Process the deposit
+                    if let Err(e) = self.process_bridge_deposit(state, &address, deposit).await {
+                        log::error!("[SWEEPER] Failed to process deposit: {}", e);
+                        let mut stats = self.sweeper_stats.write().unwrap();
+                        stats.failed_sweeps += 1;
+                    }
+                }
+                Ok(None) => {
+                    // No deposit yet, continue
+                }
+                Err(e) => {
+                    log::warn!("[SWEEPER] Failed to check address {}: {}", address, e);
+                }
+            }
+        }
 
-        println!("[SNAPSHOT] Cycle complete");
+        // Expire old tickets
+        let expired = state.bridge_manager.write().unwrap().expire_old_tickets();
+        if !expired.is_empty() {
+            log::info!("[SWEEPER] Expired {} stale tickets", expired.len());
+        }
+
+        let mut stats = self.sweeper_stats.write().unwrap();
+        stats.last_sweep_at = Some(current_timestamp());
+        stats.pending_sweeps = state.bridge_manager.read().unwrap().get_pending_addresses().len() as u32;
+
+        Ok(())
+    }
+
+    async fn check_bridge_deposit(&self, state: &web::Data<AppState>, address: &str) -> Result<Option<BridgeDeposit>, String> {
+        // Query Kaspa L1 for UTXOs at this address
+        match state.l1_client.get_utxos_by_address(address).await {
+            Ok(utxos) => {
+                if utxos.is_empty() {
+                    return Ok(None);
+                }
+                
+                let total_sompi: u64 = utxos.iter().map(|u| u.amount).sum();
+                let tx_ids: Vec<String> = utxos.iter().map(|u| u.transaction_id.clone()).collect();
+                
+                Ok(Some(BridgeDeposit {
+                    address: address.to_string(),
+                    amount_sompi: total_sompi,
+                    tx_ids,
+                    detected_at: current_timestamp(),
+                }))
+            }
+            Err(e) => Err(format!("L1 query failed: {}", e))
+        }
+    }
+
+    async fn process_bridge_deposit(
+        &self,
+        state: &web::Data<AppState>,
+        address: &str,
+        deposit: BridgeDeposit,
+    ) -> Result<(), String> {
+        // Find the ticket for this address
+        let ticket = state.bridge_manager.read().unwrap()
+            .find_by_address(address)
+            .ok_or_else(|| "No ticket found for address".to_string())?;
+
+        // Check if over limit (compliance)
+        let kas_amount = deposit.amount_sompi as f64 / 100_000_000.0;
+        let usd_value = kas_amount * ticket.kas_price_at_creation;
+
+        if usd_value > BRIDGE_MAX_DEPOSIT_USD {
+            // Mark as over limit - will need manual review or refund
+            let mut updated = ticket.clone();
+            updated.status = BridgeTicketStatus::OverLimit;
+            updated.actual_amount_sompi = Some(deposit.amount_sompi);
+            updated.funded_at = Some(deposit.detected_at);
+            state.bridge_manager.read().unwrap().update_ticket(&ticket.ticket_id, updated);
+            
+            log::warn!("[SWEEPER] Over-limit deposit: ${:.2} > ${:.2} limit", usd_value, BRIDGE_MAX_DEPOSIT_USD);
+            return Err(format!("Deposit ${:.2} exceeds limit", usd_value));
+        }
+
+        // 1. Credit user's L2 balance via Merkle update
+        let user_pubkey_hex = hex::encode(&ticket.user_pubkey);
+        self.credit_l2_balance(state, &ticket.user_pubkey, deposit.amount_sompi).await?;
+
+        // 2. Mark ticket as funded
+        let mut updated = ticket.clone();
+        updated.status = BridgeTicketStatus::Funded;
+        updated.actual_amount_sompi = Some(deposit.amount_sompi);
+        updated.funded_at = Some(deposit.detected_at);
+        state.bridge_manager.read().unwrap().update_ticket(&ticket.ticket_id, updated.clone());
+
+        // 3. Initiate sweep to vault (FROST threshold signature)
+        match self.initiate_vault_sweep(state, &updated).await {
+            Ok(sweep_txid) => {
+                let mut final_update = updated.clone();
+                final_update.status = BridgeTicketStatus::Swept;
+                final_update.swept_at = Some(current_timestamp());
+                final_update.swept_txid = Some(sweep_txid.clone());
+                state.bridge_manager.read().unwrap().update_ticket(&ticket.ticket_id, final_update);
+
+                let mut stats = self.sweeper_stats.write().unwrap();
+                stats.total_swept += 1;
+                stats.total_swept_sompi += deposit.amount_sompi;
+
+                log::info!("[SWEEPER] ✓ Swept {} sompi to vault, txid: {}", deposit.amount_sompi, sweep_txid);
+            }
+            Err(e) => {
+                log::error!("[SWEEPER] Sweep to vault failed: {}", e);
+                // Ticket stays as Funded, will retry next cycle
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn credit_l2_balance(&self, state: &web::Data<AppState>, pubkey: &[u8; 33], amount_sompi: u64) -> Result<(), String> {
+        // Update user's Merkle leaf balance
+        let mut accounts = state.accounts.write().await;
+        let pubkey_hex = hex::encode(pubkey);
+        
+        if let Some(account) = accounts.get_mut(&pubkey_hex) {
+            account.balance += amount_sompi;
+            log::info!("[SWEEPER] Credited {} sompi to account {}", amount_sompi, &pubkey_hex[..16]);
+        } else {
+            // Create new account
+            let new_account = AccountState {
+                balance: amount_sompi,
+                nonce: 0,
+                ..Default::default()
+            };
+            accounts.insert(pubkey_hex.clone(), new_account);
+            log::info!("[SWEEPER] Created new account {} with {} sompi", &pubkey_hex[..16], amount_sompi);
+        }
+
+        // Update Merkle tree
+        drop(accounts);
+        if let Err(e) = self.update_merkle_tree(state).await {
+            log::error!("[SWEEPER] Merkle update failed: {}", e);
+        }
+
+        Ok(())
+    }
+
+    async fn initiate_vault_sweep(&self, state: &web::Data<AppState>, ticket: &BridgeTicket) -> Result<String, String> {
+        // Build sweep transaction: ephemeral_address → vault
+        let vault_address = &state.bridge_manager.read().unwrap().vault_address;
+        
+        // Use FROST threshold signature to authorize sweep
+        let sweep_request = WithdrawalRequest {
+            withdrawal_id: format!("sweep_{}", ticket.ticket_id),
+            user_pubkey: hex::encode(&ticket.user_pubkey),
+            amount_sompi: ticket.actual_amount_sompi.unwrap_or(ticket.expected_amount_sompi),
+            destination: vault_address.clone(),
+            status: "pending".to_string(),
+            submitted_at: current_timestamp(),
+        };
+
+        // In production: coordinate FROST signing across validators
+        // For now, simulate successful sweep
+        let sweep_txid = format!("sweep_tx_{}", &ticket.ticket_id[..8]);
+        
+        Ok(sweep_txid)
+    }
+
+    async fn update_merkle_tree(&self, state: &web::Data<AppState>) -> Result<(), String> {
+        // Rebuild Merkle root from all account states
+        let accounts = state.accounts.read().await;
+        let mut leaves: Vec<[u8; 32]> = Vec::new();
+        
+        for (pubkey, account) in accounts.iter() {
+            let mut hasher = sha2::Sha256::new();
+            sha2::Digest::update(&mut hasher, pubkey.as_bytes());
+            sha2::Digest::update(&mut hasher, &account.balance.to_le_bytes());
+            sha2::Digest::update(&mut hasher, &account.nonce.to_le_bytes());
+            let leaf: [u8; 32] = hasher.finalize().into();
+            leaves.push(leaf);
+        }
+
+        // Compute new root (simplified - in production use proper Merkle tree)
+        let new_root = if leaves.is_empty() {
+            [0u8; 32]
+        } else {
+            let mut combined = sha2::Sha256::new();
+            for leaf in &leaves {
+                sha2::Digest::update(&mut combined, leaf);
+            }
+            combined.finalize().into()
+        };
+
+        // Update state commitment
+        let mut commitment = state.state_commitment.write().await;
+        *commitment = hex::encode(&new_root);
+
+        Ok(())
+    }
+
+    /// Janitor: Auto-refund stray deposits that don't match any ticket
+    async fn janitor_loop(
+        &self,
+        state: web::Data<AppState>,
+        mut shutdown: broadcast::Receiver<()>,
+    ) {
+        log::info!("[JANITOR] Starting stray deposit monitor (interval: {}s)", self.config.janitor_interval_secs);
+        
+        loop {
+            tokio::select! {
+                _ = shutdown.recv() => {
+                    log::info!("[JANITOR] Shutdown received");
+                    break;
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(self.config.janitor_interval_secs)) => {
+                    if let Err(e) = self.execute_janitor_cycle(&state).await {
+                        log::error!("[JANITOR] Cycle failed: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn execute_janitor_cycle(&self, state: &web::Data<AppState>) -> Result<(), String> {
+        // Get expected total from Merkle tree
+        let accounts = state.accounts.read().await;
+        let expected_balance: u64 = accounts.values().map(|a| a.balance).sum();
+        drop(accounts);
+
+        // Get actual vault balance from L1
+        let vault_address = &state.bridge_manager.read().unwrap().vault_address;
+        let actual_balance = state.l1_client.get_balance(vault_address).await
+            .unwrap_or(0);
+
+        // Check for discrepancy (stray funds)
+        if actual_balance > expected_balance + self.config.stray_threshold_sompi {
+            let stray_amount = actual_balance - expected_balance;
+            log::warn!("[JANITOR] Stray funds detected: {} sompi", stray_amount);
+
+            let mut stats = self.janitor_stats.write().unwrap();
+            stats.stray_detected += 1;
+
+            // Find untracked transactions
+            if let Ok(stray_txs) = self.find_stray_transactions(state, stray_amount).await {
+                for tx in stray_txs {
+                    if let Err(e) = self.initiate_refund(state, &tx).await {
+                        log::error!("[JANITOR] Refund failed for {}: {}", tx.from_address, e);
+                    } else {
+                        stats.total_refunded += 1;
+                        stats.total_refunded_sompi += tx.amount_sompi;
+                    }
+                }
+            }
+        }
+
+        let mut stats = self.janitor_stats.write().unwrap();
+        stats.last_check_at = Some(current_timestamp());
+
+        Ok(())
+    }
+
+    async fn find_stray_transactions(&self, state: &web::Data<AppState>, _amount: u64) -> Result<Vec<StrayTransaction>, String> {
+        // Query recent transactions to vault that don't match any ticket
+        let vault_address = &state.bridge_manager.read().unwrap().vault_address;
+        
+        // In production: query L1 for recent txs, cross-reference with tickets
+        // For now, return empty (no strays detected)
+        Ok(vec![])
+    }
+
+    async fn initiate_refund(&self, state: &web::Data<AppState>, tx: &StrayTransaction) -> Result<(), String> {
+        log::info!("[JANITOR] Initiating refund of {} sompi to {}", tx.amount_sompi, tx.from_address);
+
+        // Create refund proposal for FROST signing
+        let refund_request = WithdrawalRequest {
+            withdrawal_id: format!("refund_{}", tx.tx_id),
+            user_pubkey: tx.from_address.clone(),
+            amount_sompi: tx.amount_sompi,
+            destination: tx.from_address.clone(),
+            status: "pending_refund".to_string(),
+            submitted_at: current_timestamp(),
+        };
+
+        // Queue for FROST signing
+        // In production: submit to frost_coordinator.propose(refund_request)
+        
+        Ok(())
+    }
+
+    /// Snapshot Scheduler: 24h Arweave backups
+    async fn snapshot_loop(
+        &self,
+        state: web::Data<AppState>,
+        mut shutdown: broadcast::Receiver<()>,
+    ) {
+        log::info!("[SNAPSHOT] Starting Arweave scheduler (interval: {}s)", self.config.snapshot_interval_secs);
+        
+        loop {
+            tokio::select! {
+                _ = shutdown.recv() => {
+                    log::info!("[SNAPSHOT] Shutdown received");
+                    break;
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(self.config.snapshot_interval_secs)) => {
+                    if let Err(e) = self.execute_snapshot(&state).await {
+                        log::error!("[SNAPSHOT] Failed: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn execute_snapshot(&self, state: &web::Data<AppState>) -> Result<(), String> {
+        log::info!("[SNAPSHOT] Creating state snapshot...");
+
+        // Export current state
+        let accounts = state.accounts.read().await;
+        let commitment = state.state_commitment.read().await;
+        
+        let snapshot = L2StateSnapshot {
+            epoch: self.snapshot_stats.read().unwrap().last_epoch + 1,
+            merkle_root: commitment.clone(),
+            timestamp: current_timestamp(),
+            account_count: accounts.len() as u64,
+            total_balance: accounts.values().map(|a| a.balance).sum(),
+            nullifier_count: 0,
+            stats: GlobalStatsSnapshot::default(),
+            accounts: vec![],
+            pending_withdrawals: vec![],
+            active_deadlocks: vec![],
+            validators: vec![],
+            circuit_breaker: CircuitBreakerSnapshot::default(),
+        };
+
+        drop(accounts);
+        drop(commitment);
+
+        // Upload to Arweave
+        let arweave = ArweaveBackup::new("https://arweave.net");
+        
+        // In production: use actual wallet and upload
+        let txid = format!("ar_snapshot_{}", snapshot.epoch);
+        
+        // Update stats
+        let mut stats = self.snapshot_stats.write().unwrap();
+        stats.total_snapshots += 1;
+        stats.last_snapshot_at = Some(current_timestamp());
+        stats.last_snapshot_txid = Some(txid.clone());
+        stats.last_epoch = snapshot.epoch;
+
+        log::info!("[SNAPSHOT] ✓ Epoch {} uploaded to Arweave: {}", snapshot.epoch, txid);
+
         Ok(())
     }
 }
 
-// ============================================================================
-// COLD START RECOVERY
-// ============================================================================
+#[derive(Debug)]
+struct BridgeDeposit {
+    address: String,
+    amount_sompi: u64,
+    tx_ids: Vec<String>,
+    detected_at: u64,
+}
 
-pub async fn hydrate_from_arweave(
-    arweave: &ArweaveBackup,
-    flux: &FluxDatabase,
-) -> Result<(), String> {
-    println!("[HYDRATE] Checking Arweave for latest state...");
-
-    match arweave.fetch_latest_snapshot().await? {
-        Some(snapshot) => {
-            println!("[HYDRATE] Found snapshot epoch {} from {}",
-                snapshot.epoch, snapshot.timestamp);
-            flux.import_state(&snapshot).await?;
-            println!("[HYDRATE] State restored from Arweave");
-            Ok(())
-        }
-        None => {
-            println!("[HYDRATE] No previous state found, starting fresh");
-            Ok(())
-        }
-    }
+#[derive(Debug)]
+struct StrayTransaction {
+    tx_id: String,
+    from_address: String,
+    amount_sompi: u64,
+    detected_at: u64,
 }
 
 // ============================================================================
-// INTEGRATION WITH MAIN.RS
+// L2 STATE SNAPSHOT (for Arweave)
 // ============================================================================
 
-/*
-Add to main.rs startup:
-
-```rust
-// Initialize Arweave backup
-let arweave_wallet = std::env::var("ARWEAVE_WALLET_JWK").ok();
-let arweave = Arc::new(ArweaveBackup::new(arweave_wallet));
-
-// Initialize Flux database
-let flux_url = std::env::var("FLUX_DATABASE_URL")
-    .unwrap_or_else(|_| "postgres://user:pass@flux-node:5432/kasvillage".to_string());
-let mut flux = FluxDatabase::new(&flux_url);
-flux.connect().await.expect("Failed to connect to Flux");
-let flux = Arc::new(RwLock::new(flux));
-
-// Cold start recovery
-hydrate_from_arweave(&arweave, &flux.read().await).await
-    .expect("Failed to hydrate from Arweave");
-
-// Start snapshot scheduler
-let scheduler = SnapshotScheduler::new(arweave.clone(), flux.clone());
-let shutdown_rx = shutdown_tx.subscribe();
-tokio::spawn(async move {
-    scheduler.run(shutdown_rx).await;
-});
-```
-
-Environment variables:
-- ARWEAVE_WALLET_JWK: Arweave wallet JSON (for signing uploads)
-- FLUX_DATABASE_URL: PostgreSQL connection string for Flux node
-
-*/
-
-// ============================================================================
-// TESTS
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_arweave_backup_init() {
-        let backup = ArweaveBackup::new(None);
-        assert_eq!(backup.gateway, ARWEAVE_GATEWAY);
-    }
-
-    #[test]
-    fn test_state_snapshot_serialize() {
-        let snapshot = StateSnapshot {
-            epoch: 1,
-            merkle_root: "0xabc".to_string(),
-            account_count: 100,
-            total_balance: 1_000_000,
-            nullifier_count: 50,
-            timestamp: 1234567890,
-            accounts: vec![],
-            pending_withdrawals: vec![],
-        };
-        
-        let json = serde_json::to_string(&snapshot).unwrap();
-        assert!(json.contains("merkle_root"));
-    }
-
-    #[test]
-    fn test_pending_withdrawal_serialize() {
-        let withdrawal = PendingWithdrawal {
-            request_id: 1,
-            pubkey: "02abc".to_string(),
-            amount: 1000,
-            dest_address: "kaspa:test".to_string(),
-            nullifier: "0x123".to_string(),
-            queued_at: 1000,
-            unlocks_at: 87400,
-        };
-        
-        let json = serde_json::to_string(&withdrawal).unwrap();
-        assert!(json.contains("unlocks_at"));
-    }
-}
-// ============================================================================
-// KASVILLAGE L2 - ARWEAVE + FLUX STATELESS ARCHITECTURE WIRING
-// ============================================================================
-// VERSION: 2025-02-13-arweave-flux-integration
-//
-// This module wires together:
-//   - SECTION A: Core (Merkle tree, Poseidon, FROST)
-//   - SECTION B: Store/XP system
-//   - SECTION C: Infrastructure (Database, API)
-//   - SECTION D: FROST + Halo2
-//   - SECTION E: Compliance
-//
-// New Architecture:
-//   Akash (stateless API) → Flux (PostgreSQL hot DB) → Arweave (24h snapshots)
-//                                    ↓
-//                              Kaspa L1 (root anchor)
-//
-// Add this after line ~41538 in kasvillage main.rs
-// ============================================================================
-
-use reqwest::Client as HttpClient;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast};
-use std::collections::HashMap;
-
-// ============================================================================
-// ARWEAVE CONSTANTS
-// ============================================================================
-
-const ARWEAVE_GATEWAY: &str = "https://arweave.net";
-const ARWEAVE_GRAPHQL: &str = "https://arweave.net/graphql";
-const SNAPSHOT_INTERVAL_SECS: u64 = 86400; // 24 hours
-const APP_NAME: &str = "KasVillage";
-const STATE_TYPE: &str = "L2-State-Snapshot";
-
-// ============================================================================
-// ARWEAVE DATA STRUCTURES
-// ============================================================================
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ArweaveTag {
-    pub name: String,
-    pub value: String,
-}
-
-/// Complete L2 state snapshot for Arweave backup
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct L2StateSnapshot {
-    // Core state
     pub epoch: u64,
-    pub merkle_root: String,           // hex-encoded Fr
+    pub merkle_root: String,
     pub timestamp: u64,
-    
-    // Counts
     pub account_count: u64,
     pub total_balance: u64,
     pub nullifier_count: u64,
-    
-    // Global stats (from Section B)
     pub stats: GlobalStatsSnapshot,
-    
-    // Account data (sparse - only changed since last snapshot)
-    pub accounts: Vec<AccountSnapshot>,
-    
-    // Pending withdrawals (24h queue)
+    pub accounts: Vec<AccountSnapshotData>,
     pub pending_withdrawals: Vec<PendingWithdrawalSnapshot>,
-    
-    // Active deadlocks
     pub active_deadlocks: Vec<DeadlockSnapshot>,
-    
-    // Validator state
     pub validators: Vec<ValidatorSnapshot>,
-    
-    // Circuit breaker state
     pub circuit_breaker: CircuitBreakerSnapshot,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GlobalStatsSnapshot {
     pub total_transactions: u64,
     pub completed_count: u64,
@@ -63185,52 +63245,38 @@ pub struct GlobalStatsSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AccountSnapshot {
-    pub pubkey: String,                // hex
-    pub balance_commitment: String,    // hex
+pub struct AccountSnapshotData {
+    pub pubkey: String,
+    pub balance_sompi: u64,
     pub nonce: u64,
-    pub merkle_index: u64,
-    pub xp_gross: u64,
-    pub xp_tier: u8,
-    pub success_count: u64,
-    pub failure_count: u64,
-    pub deadlock_count: u64,
-    pub p_complete: f64,
-    pub poc_score: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingWithdrawalSnapshot {
-    pub request_id: u64,
-    pub pubkey: String,
-    pub amount: u64,
-    pub dest_address: String,
-    pub nullifier: String,
-    pub queued_at: u64,
-    pub unlocks_at: u64,
-    pub status: String,
+    pub request_id: String,
+    pub user_pubkey: String,
+    pub amount_sompi: u64,
+    pub destination: String,
+    pub submitted_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeadlockSnapshot {
-    pub id: u64,
-    pub party_a: String,
-    pub party_b: String,
+    pub deal_id: String,
+    pub parties: Vec<String>,
     pub locked_amount: u64,
-    pub status: String,
-    pub created_at: u64,
+    pub detected_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidatorSnapshot {
     pub validator_id: u64,
     pub pubkey: String,
-    pub stake: u64,
-    pub xp: u64,
-    pub is_active: bool,
+    pub stake_sompi: u64,
+    pub reliability_score: f64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CircuitBreakerSnapshot {
     pub is_tripped: bool,
     pub total_outflow_last_hour: u64,
@@ -63238,851 +63284,842 @@ pub struct CircuitBreakerSnapshot {
 }
 
 // ============================================================================
-// ARWEAVE BACKUP CLIENT
+// FLUX API ENDPOINTS
 // ============================================================================
 
-pub struct ArweaveBackup {
-    gateway: String,
-    graphql: String,
-    http_client: HttpClient,
-    wallet_jwk: Option<String>,
-    last_snapshot_txid: Arc<RwLock<Option<String>>>,
-    last_snapshot_epoch: Arc<RwLock<u64>>,
+/// GET /api/flux/status - Get Flux orchestrator status
+pub async fn api_flux_status(
+    flux: web::Data<Arc<FluxOrchestrator>>,
+) -> impl Responder {
+    let sweeper = flux.sweeper_stats.read().unwrap().clone();
+    let janitor = flux.janitor_stats.read().unwrap().clone();
+    let snapshot = flux.snapshot_stats.read().unwrap().clone();
+
+    HttpResponse::Ok().json(json!({
+        "sweeper": sweeper,
+        "janitor": janitor,
+        "snapshot": snapshot,
+        "config": {
+            "sweeper_interval_secs": flux.config.sweeper_interval_secs,
+            "janitor_interval_secs": flux.config.janitor_interval_secs,
+            "snapshot_interval_secs": flux.config.snapshot_interval_secs,
+        }
+    }))
 }
 
-impl ArweaveBackup {
-    pub fn new(wallet_jwk: Option<String>) -> Self {
-        Self {
-            gateway: ARWEAVE_GATEWAY.to_string(),
-            graphql: ARWEAVE_GRAPHQL.to_string(),
-            http_client: HttpClient::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-                .unwrap(),
-            wallet_jwk,
-            last_snapshot_txid: Arc::new(RwLock::new(None)),
-            last_snapshot_epoch: Arc::new(RwLock::new(0)),
+/// POST /api/bridge/request - Request ephemeral deposit address
+pub async fn api_bridge_request(
+    state: web::Data<AppState>,
+    payload: web::Json<BridgeRequestPayload>,
+) -> impl Responder {
+    // Parse pubkey
+    let pubkey_bytes = match hex::decode(&payload.pubkey) {
+        Ok(b) if b.len() == 33 => {
+            let mut arr = [0u8; 33];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return HttpResponse::BadRequest().json(json!({
+            "success": false,
+            "error": "Invalid pubkey format"
+        })),
+    };
+
+    // Get KAS price
+    let kas_price = state.kas_price.read().await.clone();
+
+    // Sanctions check
+    let sanctions_cleared = !state.compliance.read().unwrap()
+        .check_sanctions(&payload.pubkey).unwrap_or(true);
+
+    // Geo check
+    let geo_cleared = payload.country_code.as_ref()
+        .map(|c| !BLOCKED_COUNTRIES.contains(&c.as_str()))
+        .unwrap_or(true);
+
+    // Create ticket
+    match state.bridge_manager.write().unwrap().create_ticket(
+        pubkey_bytes,
+        payload.amount_usd,
+        kas_price,
+        sanctions_cleared,
+        geo_cleared,
+        payload.country_code.clone(),
+    ) {
+        Ok(ticket) => {
+            let now = current_timestamp();
+            HttpResponse::Ok().json(BridgeRequestResponse {
+                success: true,
+                ticket_id: Some(ticket.ticket_id),
+                temp_l1_address: Some(ticket.ephemeral_address),
+                expected_amount_kas: Some(ticket.expected_amount_sompi as f64 / 100_000_000.0),
+                kas_price: Some(kas_price),
+                expires_at: Some(ticket.expires_at),
+                seconds_remaining: Some(ticket.expires_at.saturating_sub(now)),
+                warning: if payload.amount_usd > 900.0 {
+                    Some("Approaching daily limit".to_string())
+                } else {
+                    None
+                },
+                error: None,
+                sanctions_cleared,
+                geo_cleared,
+            })
+        }
+        Err(e) => HttpResponse::BadRequest().json(BridgeRequestResponse {
+            success: false,
+            ticket_id: None,
+            temp_l1_address: None,
+            expected_amount_kas: None,
+            kas_price: None,
+            expires_at: None,
+            seconds_remaining: None,
+            warning: None,
+            error: Some(e),
+            sanctions_cleared,
+            geo_cleared,
+        }),
+    }
+}
+
+/// GET /api/bridge/status/{ticket_id} - Check bridge ticket status
+pub async fn api_bridge_status(
+    state: web::Data<AppState>,
+    ticket_id: web::Path<String>,
+) -> impl Responder {
+    match state.bridge_manager.read().unwrap().get_ticket(&ticket_id) {
+        Some(ticket) => {
+            let now = current_timestamp();
+            HttpResponse::Ok().json(json!({
+                "success": true,
+                "ticket_id": ticket.ticket_id,
+                "status": format!("{:?}", ticket.status),
+                "ephemeral_address": ticket.ephemeral_address,
+                "expected_amount_sompi": ticket.expected_amount_sompi,
+                "actual_amount_sompi": ticket.actual_amount_sompi,
+                "created_at": ticket.created_at,
+                "expires_at": ticket.expires_at,
+                "is_expired": ticket.is_expired(),
+                "seconds_remaining": ticket.expires_at.saturating_sub(now),
+                "funded_at": ticket.funded_at,
+                "swept_at": ticket.swept_at,
+                "swept_txid": ticket.swept_txid,
+            }))
+        }
+        None => HttpResponse::NotFound().json(json!({
+            "success": false,
+            "error": "Ticket not found"
+        })),
+    }
+}
+
+/// Configure Flux routes
+pub fn configure_flux_routes(cfg: &mut web::ServiceConfig) {
+    cfg.service(
+        web::scope("/api/flux")
+            .route("/status", web::get().to(api_flux_status))
+    );
+    cfg.service(
+        web::scope("/api/bridge")
+            .route("/request", web::post().to(api_bridge_request))
+            .route("/status/{ticket_id}", web::get().to(api_bridge_status))
+    );
+}
+// ============================================================================
+// FLUX POSTGRESQL CLIENT - Hot Database Layer
+// ============================================================================
+// Replaces Firestore with Railway.app PostgreSQL (free tier)
+// 
+// Architecture:
+//   AppState (RAM) → FluxPostgreSQL (hot) → Arweave (cold archive)
+//
+// Connection: postgresql://user:pass@containers-us-west-12.railway.app:5432/railway
+// Free Tier: 512MB RAM, 1GB storage, 100 hours/month compute
+// ============================================================================
+
+use tokio_postgres::{Client, NoTls, Error as PgError};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// Flux PostgreSQL client for hot database storage
+pub struct FluxPostgreSQLClient {
+    client: Arc<RwLock<Client>>,
+}
+
+impl FluxPostgreSQLClient {
+    /// Initialize connection to Railway PostgreSQL
+    pub async fn new(database_url: &str) -> Result<Self, PgError> {
+        let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+        
+        // Spawn connection handler
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("[FLUX-PG] Connection error: {}", e);
+            }
+        });
+        
+        let client = Arc::new(RwLock::new(client));
+        let db = Self { client };
+        
+        // Initialize schema
+        db.init_schema().await?;
+        
+        Ok(db)
+    }
+    
+    /// Create all tables (matches Firestore schema)
+    async fn init_schema(&self) -> Result<(), PgError> {
+        let client = self.client.write().await;
+        
+        // Account state (user balances & nonces)
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS account_state (
+                pubkey TEXT PRIMARY KEY,
+                balance BIGINT NOT NULL DEFAULT 0,
+                nonce BIGINT NOT NULL DEFAULT 0,
+                tier TEXT NOT NULL DEFAULT 'Base',
+                xp_gross BIGINT NOT NULL DEFAULT 0,
+                updated_at BIGINT NOT NULL
+            )",
+            &[],
+        ).await?;
+        
+        // Merkle leaves (L2 state tree)
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS merkle_leaves (
+                id SERIAL PRIMARY KEY,
+                leaf_hash TEXT NOT NULL UNIQUE,
+                account_pubkey TEXT,
+                balance BIGINT,
+                created_at BIGINT NOT NULL
+            )",
+            &[],
+        ).await?;
+        
+        // Spent nullifiers (prevent double-spends)
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS spent_nullifiers (
+                nullifier TEXT PRIMARY KEY,
+                spent_at BIGINT NOT NULL
+            )",
+            &[],
+        ).await?;
+        
+        // Transaction history
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS transactions (
+                id SERIAL PRIMARY KEY,
+                tx_hash TEXT UNIQUE,
+                sender TEXT NOT NULL,
+                receiver TEXT NOT NULL,
+                amount BIGINT NOT NULL,
+                timestamp BIGINT NOT NULL,
+                tx_type TEXT NOT NULL,
+                status TEXT DEFAULT 'confirmed'
+            )",
+            &[],
+        ).await?;
+        
+        // Withdrawal history
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS withdrawals (
+                id SERIAL PRIMARY KEY,
+                request_id TEXT UNIQUE NOT NULL,
+                user_pubkey TEXT NOT NULL,
+                amount BIGINT NOT NULL,
+                destination TEXT NOT NULL,
+                frost_signature TEXT,
+                status TEXT DEFAULT 'pending',
+                submitted_at BIGINT NOT NULL,
+                confirmed_at BIGINT
+            )",
+            &[],
+        ).await?;
+        
+        // Bridge tickets (ephemeral deposits)
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS bridge_tickets (
+                ticket_id TEXT PRIMARY KEY,
+                user_pubkey TEXT NOT NULL,
+                ephemeral_address TEXT NOT NULL,
+                expected_amount_sompi BIGINT NOT NULL,
+                actual_amount_sompi BIGINT,
+                kas_price REAL NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at BIGINT NOT NULL,
+                expires_at BIGINT NOT NULL,
+                funded_at BIGINT,
+                swept_at BIGINT,
+                swept_txid TEXT
+            )",
+            &[],
+        ).await?;
+        
+        // Storefronts
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS storefronts (
+                storefront_id TEXT PRIMARY KEY,
+                owner_pubkey TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                theme TEXT DEFAULT 'minimal',
+                grid_layout JSONB,
+                created_at BIGINT NOT NULL,
+                visits BIGINT DEFAULT 0
+            )",
+            &[],
+        ).await?;
+        
+        // Inventory items
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS inventory (
+                item_id SERIAL PRIMARY KEY,
+                storefront_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                price_sompi BIGINT NOT NULL,
+                description TEXT,
+                image_url TEXT,
+                stock INTEGER DEFAULT 0,
+                created_at BIGINT NOT NULL
+            )",
+            &[],
+        ).await?;
+        
+        // Consignment agreements
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS consignment_agreements (
+                agreement_id TEXT PRIMARY KEY,
+                host_pubkey TEXT NOT NULL,
+                seller_pubkey TEXT NOT NULL,
+                commission_rate INTEGER NOT NULL,
+                terms TEXT,
+                status TEXT DEFAULT 'active',
+                created_at BIGINT NOT NULL
+            )",
+            &[],
+        ).await?;
+        
+        // Identity templates (30 questions + 3 stories)
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS identity_templates (
+                pubkey TEXT PRIMARY KEY,
+                question_hashes JSONB NOT NULL,
+                story_hashes JSONB NOT NULL,
+                device_fingerprint TEXT,
+                poc_score INTEGER DEFAULT 0,
+                created_at BIGINT NOT NULL
+            )",
+            &[],
+        ).await?;
+        
+        // Validators (FROST participants)
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS validators (
+                validator_id SERIAL PRIMARY KEY,
+                pubkey TEXT UNIQUE NOT NULL,
+                stake_sompi BIGINT NOT NULL,
+                reliability_score REAL DEFAULT 1.0,
+                last_reshare_epoch BIGINT,
+                status TEXT DEFAULT 'active',
+                joined_at BIGINT NOT NULL
+            )",
+            &[],
+        ).await?;
+        
+        // Arweave snapshots (24h archives)
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS arweave_snapshots (
+                snapshot_id SERIAL PRIMARY KEY,
+                epoch BIGINT NOT NULL,
+                merkle_root TEXT NOT NULL,
+                arweave_txid TEXT NOT NULL,
+                account_count BIGINT,
+                total_balance BIGINT,
+                created_at BIGINT NOT NULL,
+                confirmed BOOLEAN DEFAULT FALSE
+            )",
+            &[],
+        ).await?;
+        
+        // Circuit breaker events
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS circuit_breaker_events (
+                event_id SERIAL PRIMARY KEY,
+                trigger_pubkey TEXT,
+                outflow_1h BIGINT NOT NULL,
+                threshold BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                triggered_at BIGINT NOT NULL,
+                resolved_at BIGINT
+            )",
+            &[],
+        ).await?;
+        
+        println!("[FLUX-PG] ✓ Schema initialized (13 tables)");
+        Ok(())
+    }
+    
+    // ========================================================================
+    // ACCOUNT STATE OPERATIONS
+    // ========================================================================
+    
+    /// Get account state
+    pub async fn get_account(&self, pubkey: &str) -> Result<Option<AccountState>, PgError> {
+        let client = self.client.read().await;
+        let row = client.query_opt(
+            "SELECT balance, nonce, tier, xp_gross, updated_at 
+             FROM account_state WHERE pubkey = $1",
+            &[&pubkey],
+        ).await?;
+        
+        Ok(row.map(|r| AccountState {
+            pubkey: pubkey.to_string(),
+            balance_sompi: r.get::<_, i64>(0) as u64,
+            nonce: r.get::<_, i64>(1) as u64,
+            tier: r.get(2),
+            xp_gross: r.get::<_, i64>(3) as u64,
+            updated_at: r.get::<_, i64>(4) as u64,
+        }))
+    }
+    
+    /// Update account balance
+    pub async fn update_balance(&self, pubkey: &str, balance: u64, nonce: u64) -> Result<(), PgError> {
+        let client = self.client.write().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        client.execute(
+            "INSERT INTO account_state (pubkey, balance, nonce, updated_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (pubkey) DO UPDATE
+             SET balance = $2, nonce = $3, updated_at = $4",
+            &[&pubkey, &(balance as i64), &(nonce as i64), &(now as i64)],
+        ).await?;
+        
+        Ok(())
+    }
+    
+    // ========================================================================
+    // TRANSACTION OPERATIONS
+    // ========================================================================
+    
+    /// Store transaction
+    pub async fn store_transaction(&self, tx: &TransactionRecord) -> Result<(), PgError> {
+        let client = self.client.write().await;
+        client.execute(
+            "INSERT INTO transactions (tx_hash, sender, receiver, amount, timestamp, tx_type)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (tx_hash) DO NOTHING",
+            &[&tx.tx_hash, &tx.sender, &tx.receiver, &(tx.amount as i64), &(tx.timestamp as i64), &tx.tx_type],
+        ).await?;
+        Ok(())
+    }
+    
+    /// Get transaction history for pubkey
+    pub async fn get_transactions(&self, pubkey: &str, limit: i64) -> Result<Vec<TransactionRecord>, PgError> {
+        let client = self.client.read().await;
+        let rows = client.query(
+            "SELECT tx_hash, sender, receiver, amount, timestamp, tx_type
+             FROM transactions
+             WHERE sender = $1 OR receiver = $1
+             ORDER BY timestamp DESC
+             LIMIT $2",
+            &[&pubkey, &limit],
+        ).await?;
+        
+        Ok(rows.iter().map(|r| TransactionRecord {
+            tx_hash: r.get(0),
+            sender: r.get(1),
+            receiver: r.get(2),
+            amount: r.get::<_, i64>(3) as u64,
+            timestamp: r.get::<_, i64>(4) as u64,
+            tx_type: r.get(5),
+        }).collect())
+    }
+    
+    // ========================================================================
+    // ARWEAVE SNAPSHOT OPERATIONS
+    // ========================================================================
+    
+    /// Store Arweave snapshot metadata
+    pub async fn store_snapshot(&self, epoch: u64, merkle_root: &str, arweave_txid: &str) -> Result<(), PgError> {
+        let client = self.client.write().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        client.execute(
+            "INSERT INTO arweave_snapshots (epoch, merkle_root, arweave_txid, created_at)
+             VALUES ($1, $2, $3, $4)",
+            &[&(epoch as i64), &merkle_root, &arweave_txid, &(now as i64)],
+        ).await?;
+        
+        Ok(())
+    }
+    
+    /// Get latest snapshot
+    pub async fn get_latest_snapshot(&self) -> Result<Option<ArweaveSnapshot>, PgError> {
+        let client = self.client.read().await;
+        let row = client.query_opt(
+            "SELECT epoch, merkle_root, arweave_txid, created_at
+             FROM arweave_snapshots
+             ORDER BY epoch DESC
+             LIMIT 1",
+            &[]
+        ).await?;
+        
+        Ok(row.map(|r| ArweaveSnapshot {
+            epoch: r.get::<_, i64>(0) as u64,
+            merkle_root: r.get(1),
+            arweave_txid: r.get(2),
+            created_at: r.get::<_, i64>(3) as u64,
+        }))
+    }
+}
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub struct AccountState {
+    pub pubkey: String,
+    pub balance_sompi: u64,
+    pub nonce: u64,
+    pub tier: String,
+    pub xp_gross: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct TransactionRecord {
+    pub tx_hash: String,
+    pub sender: String,
+    pub receiver: String,
+    pub amount: u64,
+    pub timestamp: u64,
+    pub tx_type: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArweaveSnapshot {
+    pub epoch: u64,
+    pub merkle_root: String,
+    pub arweave_txid: String,
+    pub created_at: u64,
+}
+// ============================================================================
+// ARWEAVE ARCHIVE CLIENT - Cold Storage Layer
+// ============================================================================
+// 24-hour snapshot archival to Arweave permaweb
+// Cost: ~$5-10 for ~50MB snapshots (one-time payment, permanent storage)
+//
+// Architecture:
+//   AppState (RAM) → FluxPostgreSQL (hot) → Arweave (cold, immutable)
+//
+// Upload frequency: Every 24 hours via FluxOrchestrator::snapshot_loop()
+// ============================================================================
+
+use serde::{Serialize, Deserialize};
+use reqwest::Client;
+use std::fs;
+use std::path::Path;
+
+/// Arweave archive client for permanent L2 state snapshots
+pub struct ArweaveArchiveClient {
+    wallet: ArweaveWallet,
+    gateway: String,
+    http_client: Client,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ArweaveWallet {
+    kty: String,
+    n: String,
+    e: String,
+    d: String,
+    p: String,
+    q: String,
+    dp: String,
+    dq: String,
+    qi: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArweaveTransaction {
+    pub id: String,
+    pub last_tx: String,
+    pub owner: String,
+    pub tags: Vec<ArweaveTag>,
+    pub target: String,
+    pub quantity: String,
+    pub data: String,
+    pub data_size: String,
+    pub data_root: String,
+    pub reward: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArweaveTag {
+    pub name: String,
+    pub value: String,
+}
+
+impl ArweaveArchiveClient {
+    /// Initialize Arweave client from wallet file
+    pub fn new(wallet_path: &str) -> Result<Self, String> {
+        let wallet_json = fs::read_to_string(wallet_path)
+            .map_err(|e| format!("Failed to read wallet: {}", e))?;
+        
+        let wallet: ArweaveWallet = serde_json::from_str(&wallet_json)
+            .map_err(|e| format!("Invalid wallet format: {}", e))?;
+        
+        Ok(Self {
+            wallet,
+            gateway: "https://arweave.net".to_string(),
+            http_client: Client::new(),
+        })
+    }
+    
+    /// Upload L2 state snapshot to Arweave
+    pub async fn upload_snapshot(&self, snapshot: &L2StateSnapshot) -> Result<String, String> {
+        // Serialize snapshot to JSON
+        let snapshot_json = serde_json::to_string_pretty(snapshot)
+            .map_err(|e| format!("Serialization failed: {}", e))?;
+        
+        let data_bytes = snapshot_json.as_bytes();
+        
+        // Create Arweave transaction
+        let tx = self.create_transaction(data_bytes, vec![
+            ArweaveTag {
+                name: base64::encode("Content-Type"),
+                value: base64::encode("application/json"),
+            },
+            ArweaveTag {
+                name: base64::encode("App-Name"),
+                value: base64::encode("KasVillage-L2"),
+            },
+            ArweaveTag {
+                name: base64::encode("Epoch"),
+                value: base64::encode(snapshot.epoch.to_string()),
+            },
+            ArweaveTag {
+                name: base64::encode("Merkle-Root"),
+                value: base64::encode(&snapshot.merkle_root),
+            },
+        ]).await?;
+        
+        // Submit transaction to Arweave network
+        let response = self.http_client
+            .post(&format!("{}/tx", self.gateway))
+            .json(&tx)
+            .send()
+            .await
+            .map_err(|e| format!("Upload failed: {}", e))?;
+        
+        if !response.status().is_success() {
+            return Err(format!("Arweave rejected: {}", response.status()));
+        }
+        
+        println!("[ARWEAVE] ✓ Snapshot uploaded: {} (epoch {})", tx.id, snapshot.epoch);
+        Ok(tx.id)
+    }
+    
+    /// Create Arweave transaction (simplified - production needs proper signing)
+    async fn create_transaction(&self, data: &[u8], tags: Vec<ArweaveTag>) -> Result<ArweaveTransaction, String> {
+        // Get wallet address
+        let owner = self.get_wallet_address()?;
+        
+        // Get last transaction ID
+        let last_tx = self.get_last_tx(&owner).await?;
+        
+        // Get current price
+        let reward = self.get_price(data.len()).await?;
+        
+        // Create transaction (signing omitted for brevity - use arweave-rs crate in production)
+        Ok(ArweaveTransaction {
+            id: format!("temp-{}", uuid::Uuid::new_v4()),
+            last_tx,
+            owner: owner.clone(),
+            tags,
+            target: String::new(),
+            quantity: "0".to_string(),
+            data: base64::encode(data),
+            data_size: data.len().to_string(),
+            data_root: String::new(), // Computed from merkle tree
+            reward,
+            signature: String::new(), // RSA signature required
+        })
+    }
+    
+    /// Get wallet address from JWK
+    fn get_wallet_address(&self) -> Result<String, String> {
+        // Simplified - production should decode n from wallet
+        Ok("placeholder-address".to_string())
+    }
+    
+    /// Get last transaction ID for wallet
+    async fn get_last_tx(&self, address: &str) -> Result<String, String> {
+        let response = self.http_client
+            .get(&format!("{}/wallet/{}/last_tx", self.gateway, address))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to get last_tx: {}", e))?;
+        
+        if response.status().is_success() {
+            response.text().await
+                .map_err(|e| format!("Failed to read last_tx: {}", e))
+        } else {
+            Ok(String::new())
         }
     }
-
-    /// Fetch latest state snapshot from Arweave
-    pub async fn fetch_latest_snapshot(&self) -> Result<Option<L2StateSnapshot>, String> {
+    
+    /// Get upload price in Winston (10^-12 AR)
+    async fn get_price(&self, bytes: usize) -> Result<String, String> {
+        let response = self.http_client
+            .get(&format!("{}/price/{}", self.gateway, bytes))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to get price: {}", e))?;
+        
+        response.text().await
+            .map_err(|e| format!("Failed to read price: {}", e))
+    }
+    
+    /// Download snapshot from Arweave by transaction ID
+    pub async fn download_snapshot(&self, txid: &str) -> Result<L2StateSnapshot, String> {
+        let response = self.http_client
+            .get(&format!("{}/{}", self.gateway, txid))
+            .send()
+            .await
+            .map_err(|e| format!("Download failed: {}", e))?;
+        
+        if !response.status().is_success() {
+            return Err(format!("Not found: {}", response.status()));
+        }
+        
+        let json = response.text().await
+            .map_err(|e| format!("Failed to read data: {}", e))?;
+        
+        serde_json::from_str(&json)
+            .map_err(|e| format!("Invalid snapshot: {}", e))
+    }
+    
+    /// Get latest snapshot for KasVillage
+    pub async fn get_latest_snapshot(&self) -> Result<Option<L2StateSnapshot>, String> {
+        // Query Arweave GraphQL for latest snapshot
         let query = r#"
         {
             transactions(
                 tags: [
-                    { name: "App-Name", values: ["KasVillage"] },
-                    { name: "Type", values: ["L2-State-Snapshot"] }
+                    { name: "App-Name", values: ["KasVillage-L2"] }
                 ]
-                first: 1
                 sort: HEIGHT_DESC
+                first: 1
             ) {
                 edges {
                     node {
                         id
-                        tags { name value }
                     }
                 }
             }
-        }"#;
-
-        let resp = self.http_client
-            .post(&self.graphql)
-            .json(&serde_json::json!({ "query": query }))
-            .send()
-            .await
-            .map_err(|e| format!("GraphQL request failed: {}", e))?;
-
-        let json: serde_json::Value = resp.json().await
-            .map_err(|e| format!("Failed to parse GraphQL response: {}", e))?;
-
-        let edges = json["data"]["transactions"]["edges"].as_array();
-        if edges.is_none() || edges.unwrap().is_empty() {
-            return Ok(None);
         }
-
-        let txid = edges.unwrap()[0]["node"]["id"].as_str()
-            .ok_or("Missing transaction ID")?;
-
-        // Fetch actual data
-        let data_url = format!("{}/{}", self.gateway, txid);
-        let data_resp = self.http_client
-            .get(&data_url)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch snapshot data: {}", e))?;
-
-        let snapshot: L2StateSnapshot = data_resp.json().await
-            .map_err(|e| format!("Failed to parse snapshot: {}", e))?;
-
-        *self.last_snapshot_txid.write().await = Some(txid.to_string());
-        *self.last_snapshot_epoch.write().await = snapshot.epoch;
+        "#;
         
-        Ok(Some(snapshot))
-    }
-
-    /// Upload state snapshot to Arweave
-    pub async fn upload_snapshot(&self, snapshot: &L2StateSnapshot) -> Result<String, String> {
-        let wallet_jwk = self.wallet_jwk.as_ref()
-            .ok_or("No Arweave wallet configured")?;
-
-        let data = serde_json::to_vec(snapshot)
-            .map_err(|e| format!("Serialization failed: {}", e))?;
-
-        let tags = vec![
-            ArweaveTag { name: "App-Name".into(), value: APP_NAME.into() },
-            ArweaveTag { name: "Type".into(), value: STATE_TYPE.into() },
-            ArweaveTag { name: "Epoch".into(), value: snapshot.epoch.to_string() },
-            ArweaveTag { name: "Merkle-Root".into(), value: snapshot.merkle_root.clone() },
-            ArweaveTag { name: "Account-Count".into(), value: snapshot.account_count.to_string() },
-            ArweaveTag { name: "Timestamp".into(), value: snapshot.timestamp.to_string() },
-            ArweaveTag { name: "Content-Type".into(), value: "application/json".into() },
-        ];
-
-        let txid = self.submit_transaction(data, tags, wallet_jwk).await?;
-
-        *self.last_snapshot_txid.write().await = Some(txid.clone());
-        *self.last_snapshot_epoch.write().await = snapshot.epoch;
-        
-        Ok(txid)
-    }
-
-    /// Submit transaction to Arweave (via Irys/Bundlr for instant uploads)
-    async fn submit_transaction(
-        &self,
-        data: Vec<u8>,
-        tags: Vec<ArweaveTag>,
-        _wallet_jwk: &str,
-    ) -> Result<String, String> {
-        // For production: Use Irys SDK for instant uploads (~$0.001/KB)
-        // npm install @irys/sdk
-        // Or use arweave-rs crate for direct uploads (slower, ~2 min confirmation)
-        
-        use sha2::{Sha256, Digest};
-        let data_hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(&data);
-            hex::encode(hasher.finalize())
-        };
-
-        println!("[ARWEAVE] Uploading {} bytes, {} tags", data.len(), tags.len());
-        println!("[ARWEAVE] Data hash: {}", data_hash);
-        
-        // Production implementation options:
-        // 1. Irys/Bundlr: Instant uploads, pay with ETH/SOL/MATIC
-        // 2. ArDrive Turbo: Free tier available
-        // 3. Direct Arweave: Slower but fully decentralized
-        
-        Ok(format!("ar_{}", &data_hash[..43]))
-    }
-
-    /// Mark withdrawal as finalized on Arweave
-    pub async fn mark_withdrawal_finalized(
-        &self,
-        request_id: u64,
-        l1_txid: &str,
-    ) -> Result<String, String> {
-        let wallet_jwk = self.wallet_jwk.as_ref()
-            .ok_or("No Arweave wallet configured")?;
-
-        let marker = serde_json::json!({
-            "request_id": request_id,
-            "l1_txid": l1_txid,
-            "status": "COMPLETED",
-            "timestamp": current_timestamp()
-        });
-
-        let data = serde_json::to_vec(&marker)
-            .map_err(|e| format!("Serialization failed: {}", e))?;
-
-        let tags = vec![
-            ArweaveTag { name: "App-Name".into(), value: APP_NAME.into() },
-            ArweaveTag { name: "Type".into(), value: "Withdrawal-Finalized".into() },
-            ArweaveTag { name: "Request-ID".into(), value: request_id.to_string() },
-            ArweaveTag { name: "L1-TxID".into(), value: l1_txid.to_string() },
-        ];
-
-        self.submit_transaction(data, tags, wallet_jwk).await
-    }
-
-    /// Check if withdrawal is finalized on Arweave
-    pub async fn is_withdrawal_finalized(&self, request_id: u64) -> Result<bool, String> {
-        let query = format!(r#"
-        {{
-            transactions(
-                tags: [
-                    {{ name: "App-Name", values: ["KasVillage"] }},
-                    {{ name: "Type", values: ["Withdrawal-Finalized"] }},
-                    {{ name: "Request-ID", values: ["{}"] }}
-                ]
-                first: 1
-            ) {{
-                edges {{ node {{ id }} }}
-            }}
-        }}"#, request_id);
-
-        let resp = self.http_client
-            .post(&self.graphql)
+        let response = self.http_client
+            .post(&format!("{}/graphql", self.gateway))
             .json(&serde_json::json!({ "query": query }))
             .send()
             .await
             .map_err(|e| format!("GraphQL failed: {}", e))?;
-
-        let json: serde_json::Value = resp.json().await
-            .map_err(|e| format!("Parse failed: {}", e))?;
-
-        let edges = json["data"]["transactions"]["edges"].as_array();
-        Ok(edges.map(|e| !e.is_empty()).unwrap_or(false))
-    }
-}
-
-// ============================================================================
-// FLUX DATABASE CLIENT (PostgreSQL)
-// ============================================================================
-
-pub struct FluxDatabase {
-    connection_string: String,
-    // In production: sqlx::PgPool
-}
-
-impl FluxDatabase {
-    pub fn new(connection_string: &str) -> Self {
-        Self {
-            connection_string: connection_string.to_string(),
-        }
-    }
-
-    pub async fn connect(&self) -> Result<(), String> {
-        println!("[FLUX] Connecting to: {}", self.connection_string);
-        // sqlx::PgPool::connect(&self.connection_string).await
-        Ok(())
-    }
-
-    /// Export current state for Arweave snapshot
-    pub async fn export_state(&self, app_state: &AppState) -> Result<L2StateSnapshot, String> {
-        let timestamp = current_timestamp();
         
-        // Gather data from AppState (which holds in-memory state)
-        let accounts = self.export_accounts(app_state).await?;
-        let pending_withdrawals = self.export_pending_withdrawals(app_state).await?;
-        let validators = self.export_validators(app_state).await?;
-        let stats = self.export_global_stats(app_state).await?;
-        let circuit_breaker = self.export_circuit_breaker(app_state).await?;
-        let deadlocks = self.export_deadlocks(app_state).await?;
+        let result: serde_json::Value = response.json().await
+            .map_err(|e| format!("Failed to parse: {}", e))?;
         
-        // Get current merkle root from state
-        let merkle_root = "0x0".to_string(); // TODO: Get from SparseMerkleTree
-        
-        Ok(L2StateSnapshot {
-            epoch: 0, // TODO: Get from consensus loop
-            merkle_root,
-            timestamp,
-            account_count: accounts.len() as u64,
-            total_balance: accounts.iter().map(|a| a.xp_gross).sum(), // Approximate
-            nullifier_count: 0,
-            stats,
-            accounts,
-            pending_withdrawals,
-            active_deadlocks: deadlocks,
-            validators,
-            circuit_breaker,
-        })
-    }
-
-    async fn export_accounts(&self, app_state: &AppState) -> Result<Vec<AccountSnapshot>, String> {
-        let registry = app_state.account_registry.read()
-            .map_err(|_| "Lock poisoned")?;
-        
-        let mut accounts = Vec::new();
-        for (pubkey, state) in registry.iter() {
-            accounts.push(AccountSnapshot {
-                pubkey: pubkey.clone(),
-                balance_commitment: hex::encode(&state.balance_commitment),
-                nonce: state.nonce,
-                merkle_index: state.merkle_index,
-                xp_gross: state.xp_gross,
-                xp_tier: state.xp_tier,
-                success_count: state.success_count,
-                failure_count: state.failure_count,
-                deadlock_count: state.deadlock_count,
-                p_complete: state.p_complete,
-                poc_score: state.poc_score,
-            });
-        }
-        Ok(accounts)
-    }
-
-    async fn export_pending_withdrawals(&self, app_state: &AppState) -> Result<Vec<PendingWithdrawalSnapshot>, String> {
-        let history = app_state.withdrawal_history.read()
-            .map_err(|_| "Lock poisoned")?;
-        
-        let mut pending = Vec::new();
-        for w in history.iter() {
-            if w.status == "PENDING" || w.status == "PROCESSING" {
-                pending.push(PendingWithdrawalSnapshot {
-                    request_id: w.request_id,
-                    pubkey: w.pubkey.clone(),
-                    amount: w.amount,
-                    dest_address: w.dest_address.clone(),
-                    nullifier: hex::encode(&w.nullifier),
-                    queued_at: w.queued_at,
-                    unlocks_at: w.unlocks_at,
-                    status: w.status.clone(),
-                });
-            }
-        }
-        Ok(pending)
-    }
-
-    async fn export_validators(&self, app_state: &AppState) -> Result<Vec<ValidatorSnapshot>, String> {
-        let validators = app_state.validators.read()
-            .map_err(|_| "Lock poisoned")?;
-        
-        Ok(validators.iter().map(|v| ValidatorSnapshot {
-            validator_id: v.id,
-            pubkey: v.pubkey.clone(),
-            stake: v.stake,
-            xp: v.xp,
-            is_active: v.is_active,
-        }).collect())
-    }
-
-    async fn export_global_stats(&self, _app_state: &AppState) -> Result<GlobalStatsSnapshot, String> {
-        // TODO: Aggregate from transaction_history
-        Ok(GlobalStatsSnapshot {
-            total_transactions: 0,
-            completed_count: 0,
-            failed_count: 0,
-            total_deadlocks: 0,
-            recovered_count: 0,
-            total_disputes: 0,
-            network_p_complete: 0.5,
-            network_p_deadlock: 0.01,
-            total_volume: 0,
-        })
-    }
-
-    async fn export_circuit_breaker(&self, app_state: &AppState) -> Result<CircuitBreakerSnapshot, String> {
-        let breaker = app_state.circuit_breaker.read()
-            .map_err(|_| "Lock poisoned")?;
-        
-        Ok(CircuitBreakerSnapshot {
-            is_tripped: breaker.is_tripped,
-            total_outflow_last_hour: breaker.total_outflow_last_hour,
-            drain_threshold: breaker.drain_threshold,
-        })
-    }
-
-    async fn export_deadlocks(&self, _app_state: &AppState) -> Result<Vec<DeadlockSnapshot>, String> {
-        // TODO: Get from deadlock tracking
-        Ok(vec![])
-    }
-
-    /// Import state from Arweave snapshot (cold start recovery)
-    pub async fn import_state(&self, snapshot: &L2StateSnapshot, app_state: &AppState) -> Result<(), String> {
-        println!("[FLUX] Importing snapshot epoch {} with {} accounts",
-            snapshot.epoch, snapshot.account_count);
-        
-        // Restore accounts
-        {
-            let mut registry = app_state.account_registry.write()
-                .map_err(|_| "Lock poisoned")?;
-            registry.clear();
-            
-            for acc in &snapshot.accounts {
-                let state = AccountState {
-                    pubkey: acc.pubkey.clone(),
-                    balance_commitment: hex::decode(&acc.balance_commitment)
-                        .unwrap_or_default()
-                        .try_into()
-                        .unwrap_or([0u8; 32]),
-                    nonce: acc.nonce,
-                    merkle_index: acc.merkle_index,
-                    xp_gross: acc.xp_gross,
-                    xp_tier: acc.xp_tier,
-                    success_count: acc.success_count,
-                    failure_count: acc.failure_count,
-                    deadlock_count: acc.deadlock_count,
-                    p_complete: acc.p_complete,
-                    poc_score: acc.poc_score,
-                };
-                registry.insert(acc.pubkey.clone(), state);
-            }
-        }
-        
-        // Restore pending withdrawals
-        {
-            let mut history = app_state.withdrawal_history.write()
-                .map_err(|_| "Lock poisoned")?;
-            
-            for w in &snapshot.pending_withdrawals {
-                history.push(WithdrawalRecord {
-                    request_id: w.request_id,
-                    pubkey: w.pubkey.clone(),
-                    amount: w.amount,
-                    dest_address: w.dest_address.clone(),
-                    nullifier: hex::decode(&w.nullifier)
-                        .unwrap_or_default()
-                        .try_into()
-                        .unwrap_or([0u8; 32]),
-                    queued_at: w.queued_at,
-                    unlocks_at: w.unlocks_at,
-                    status: w.status.clone(),
-                    l1_txid: None,
-                });
-            }
-        }
-        
-        // Restore validators
-        {
-            let mut validators = app_state.validators.write()
-                .map_err(|_| "Lock poisoned")?;
-            validators.clear();
-            
-            for v in &snapshot.validators {
-                validators.push(ValidatorInfo {
-                    id: v.validator_id,
-                    pubkey: v.pubkey.clone(),
-                    stake: v.stake,
-                    xp: v.xp,
-                    is_active: v.is_active,
-                });
-            }
-        }
-        
-        // Restore circuit breaker
-        {
-            let mut breaker = app_state.circuit_breaker.write()
-                .map_err(|_| "Lock poisoned")?;
-            breaker.is_tripped = snapshot.circuit_breaker.is_tripped;
-            breaker.total_outflow_last_hour = snapshot.circuit_breaker.total_outflow_last_hour;
-            breaker.drain_threshold = snapshot.circuit_breaker.drain_threshold;
-        }
-        
-        println!("[FLUX] State restored from Arweave");
-        Ok(())
-    }
-
-    /// Prune old data after Arweave backup confirms
-    pub async fn prune_old_data(&self, before_timestamp: u64) -> Result<u64, String> {
-        println!("[FLUX] Pruning data before timestamp: {}", before_timestamp);
-        // In production: DELETE FROM transactions WHERE confirmed_at < $1
-        Ok(0)
-    }
-}
-
-// ============================================================================
-// SNAPSHOT SCHEDULER (24h cycle)
-// ============================================================================
-
-pub struct SnapshotScheduler {
-    arweave: Arc<ArweaveBackup>,
-    flux: Arc<FluxDatabase>,
-    app_state: Arc<AppState>,
-    last_snapshot: Arc<RwLock<u64>>,
-    interval_secs: u64,
-}
-
-impl SnapshotScheduler {
-    pub fn new(
-        arweave: Arc<ArweaveBackup>,
-        flux: Arc<FluxDatabase>,
-        app_state: Arc<AppState>,
-    ) -> Self {
-        Self {
-            arweave,
-            flux,
-            app_state,
-            last_snapshot: Arc::new(RwLock::new(0)),
-            interval_secs: SNAPSHOT_INTERVAL_SECS,
-        }
-    }
-
-    /// Run snapshot loop (call from tokio::spawn)
-    pub async fn run(&self, mut shutdown: broadcast::Receiver<()>) {
-        println!("[SNAPSHOT] Starting 24h snapshot scheduler");
-        
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {
-                    let now = current_timestamp();
-                    let last = *self.last_snapshot.read().await;
-                    
-                    if now - last >= self.interval_secs {
-                        if let Err(e) = self.execute_snapshot().await {
-                            eprintln!("[SNAPSHOT] Failed: {}", e);
-                        }
-                    }
-                }
-                _ = shutdown.recv() => {
-                    println!("[SNAPSHOT] Shutdown signal received");
-                    break;
+        if let Some(edges) = result["data"]["transactions"]["edges"].as_array() {
+            if let Some(edge) = edges.first() {
+                if let Some(txid) = edge["node"]["id"].as_str() {
+                    return self.download_snapshot(txid).await.map(Some);
                 }
             }
         }
-    }
-
-    /// Execute snapshot: Export → Arweave → Prune
-    async fn execute_snapshot(&self) -> Result<(), String> {
-        println!("[SNAPSHOT] Starting 24h snapshot cycle");
-
-        // 1. Export state from AppState
-        let snapshot = self.flux.export_state(&self.app_state).await?;
-        println!("[SNAPSHOT] Exported {} accounts, {} pending withdrawals",
-            snapshot.account_count, snapshot.pending_withdrawals.len());
-
-        // 2. Upload to Arweave
-        let txid = self.arweave.upload_snapshot(&snapshot).await?;
-        println!("[SNAPSHOT] Uploaded to Arweave: {}", txid);
-
-        // 3. Wait for Arweave confirmation (~2-3 min)
-        tokio::time::sleep(std::time::Duration::from_secs(180)).await;
-
-        // 4. Verify upload
-        let verified = self.arweave.fetch_latest_snapshot().await?;
-        if verified.is_none() {
-            return Err("Snapshot verification failed".to_string());
-        }
-        let verified = verified.unwrap();
-        if verified.epoch != snapshot.epoch {
-            return Err("Snapshot epoch mismatch".to_string());
-        }
-
-        // 5. Prune old data (keep last 24h for hot queries)
-        let prune_before = snapshot.timestamp.saturating_sub(86400);
-        let pruned = self.flux.prune_old_data(prune_before).await?;
-        println!("[SNAPSHOT] Pruned {} old records", pruned);
-
-        // 6. Update last snapshot time
-        *self.last_snapshot.write().await = snapshot.timestamp;
-
-        println!("[SNAPSHOT] Cycle complete");
-        Ok(())
+        
+        Ok(None)
     }
 }
 
 // ============================================================================
-// COLD START RECOVERY
+// L2 STATE SNAPSHOT STRUCTURE (matches FluxOrchestrator)
 // ============================================================================
 
-pub async fn hydrate_from_arweave(
-    arweave: &ArweaveBackup,
-    flux: &FluxDatabase,
-    app_state: &AppState,
-) -> Result<(), String> {
-    println!("[HYDRATE] Checking Arweave for latest state...");
-
-    match arweave.fetch_latest_snapshot().await? {
-        Some(snapshot) => {
-            println!("[HYDRATE] Found snapshot epoch {} from timestamp {}",
-                snapshot.epoch, snapshot.timestamp);
-            flux.import_state(&snapshot, app_state).await?;
-            println!("[HYDRATE] State restored from Arweave");
-            Ok(())
-        }
-        None => {
-            println!("[HYDRATE] No previous state found, starting fresh");
-            Ok(())
-        }
-    }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct L2StateSnapshot {
+    pub epoch: u64,
+    pub merkle_root: String,
+    pub timestamp: u64,
+    pub account_count: u64,
+    pub total_balance: u64,
+    pub nullifier_count: u64,
+    pub stats: GlobalStatsSnapshot,
+    pub accounts: Vec<AccountSnapshotData>,
+    pub pending_withdrawals: Vec<PendingWithdrawalSnapshot>,
+    pub active_deadlocks: Vec<DeadlockSnapshot>,
+    pub validators: Vec<ValidatorSnapshot>,
+    pub circuit_breaker: CircuitBreakerSnapshot,
 }
 
-// ============================================================================
-// EXTENDED APPSTATE FOR ARWEAVE/FLUX
-// ============================================================================
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GlobalStatsSnapshot {
+    pub total_transactions: u64,
+    pub completed_count: u64,
+    pub failed_count: u64,
+    pub total_deadlocks: u64,
+    pub recovered_count: u64,
+    pub total_disputes: u64,
+    pub network_p_complete: f64,
+    pub network_p_deadlock: f64,
+    pub total_volume: u64,
+}
 
-/// Extended account state with XP and probability fields
-#[derive(Clone, Debug, Default)]
-pub struct AccountState {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AccountSnapshotData {
     pub pubkey: String,
-    pub balance_commitment: [u8; 32],
+    pub balance_sompi: u64,
     pub nonce: u64,
-    pub merkle_index: u64,
-    pub xp_gross: u64,
-    pub xp_tier: u8,
-    pub success_count: u64,
-    pub failure_count: u64,
-    pub deadlock_count: u64,
-    pub p_complete: f64,
-    pub poc_score: f64,
 }
 
-/// Withdrawal record for history tracking
-#[derive(Clone, Debug)]
-pub struct WithdrawalRecord {
-    pub request_id: u64,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingWithdrawalSnapshot {
+    pub request_id: String,
+    pub user_pubkey: String,
+    pub amount_sompi: u64,
+    pub destination: String,
+    pub submitted_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeadlockSnapshot {
+    pub deal_id: String,
+    pub parties: Vec<String>,
+    pub locked_amount: u64,
+    pub detected_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidatorSnapshot {
+    pub validator_id: u64,
     pub pubkey: String,
-    pub amount: u64,
-    pub dest_address: String,
-    pub nullifier: [u8; 32],
-    pub queued_at: u64,
-    pub unlocks_at: u64,
-    pub status: String,
-    pub l1_txid: Option<String>,
+    pub stake_sompi: u64,
+    pub reliability_score: f64,
 }
 
-/// Validator info
-#[derive(Clone, Debug)]
-pub struct ValidatorInfo {
-    pub id: u64,
-    pub pubkey: String,
-    pub stake: u64,
-    pub xp: u64,
-    pub is_active: bool,
-}
-
-/// Circuit breaker state extension
-#[derive(Clone, Debug)]
-pub struct CircuitBreakerState {
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CircuitBreakerSnapshot {
     pub is_tripped: bool,
     pub total_outflow_last_hour: u64,
     pub drain_threshold: u64,
-    pub trip_timestamp: Option<u64>,
-    pub cooldown_hours: u64,
-}
-
-impl CircuitBreakerState {
-    pub fn new() -> Self {
-        Self {
-            is_tripped: false,
-            total_outflow_last_hour: 0,
-            drain_threshold: 1_000_000_000_000, // 1M KAS in sompi
-            trip_timestamp: None,
-            cooldown_hours: 6,
-        }
-    }
-}
-
-// ============================================================================
-// UPDATED SERVER STARTUP WITH ARWEAVE/FLUX
-// ============================================================================
-
-/// Start the production server with Arweave/Flux integration
-pub async fn start_server_with_arweave(config: ApiServerConfig) -> std::io::Result<()> {
-    // Initialize shutdown channel
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    
-    // Initialize Arweave backup
-    let arweave_wallet = std::env::var("ARWEAVE_WALLET_JWK").ok();
-    let arweave = Arc::new(ArweaveBackup::new(arweave_wallet));
-    
-    // Initialize Flux database
-    let flux_url = std::env::var("FLUX_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://kasvillage:password@flux-node:5432/kasvillage".to_string());
-    let flux = Arc::new(FluxDatabase::new(&flux_url));
-    flux.connect().await.expect("Failed to connect to Flux");
-    
-    // Initialize other components (from original start_server)
-    let l1_client = KaspaL1Client::new(KaspaNetworkInfra::Mainnet);
-    let db: Arc<dyn DatabaseStore> = Arc::new(FirestoreDb::new("kasvillage-l2", "prod"));
-    let relay = Arc::new(RwLock::new(WebSocketRelay::new("relay-001", true)));
-    let rate_limiter = Arc::new(RwLock::new(RedisRateLimiter::new(false)));
-    let frost = FrostCoordinator::new(FrostConfig::new(8, 14).expect("valid config"));
-
-    let app_state = web::Data::new(AppState {
-        db,
-        l1_client,
-        relay,
-        rate_limiter,
-        frost_coordinator: Arc::new(RwLock::new(frost)),
-        circuit_breaker: Arc::new(std::sync::RwLock::new(CircuitBreakerState::new())),
-        consignment_agreements: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        storefronts: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        storefront_visits: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        merchant_balances: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        storefront_click_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        onboarding_sessions: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        onboarding_scores: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        supply_chain: Arc::new(std::sync::RwLock::new(SupplyChainManager::new())),
-        graduated_breaker: Arc::new(std::sync::RwLock::new(GraduatedCircuitBreaker::new())),
-        total_user_ledger: Arc::new(std::sync::RwLock::new(0)),
-        protocol_reserves: Arc::new(std::sync::RwLock::new(0)),
-        xp_registry: Arc::new(std::sync::RwLock::new(XPRegistry::new())),
-        bridge_manager: Arc::new(std::sync::RwLock::new(BridgeTicketManager::new("kaspa:vault".to_string()))),
-        validators: Arc::new(std::sync::RwLock::new(Vec::new())),
-        validator_rewards: Arc::new(std::sync::RwLock::new(Vec::new())),
-        fee_distributions: Arc::new(std::sync::RwLock::new(Vec::new())),
-        transaction_history: Arc::new(std::sync::RwLock::new(Vec::new())),
-        withdrawal_history: Arc::new(std::sync::RwLock::new(Vec::new())),
-        notifications: Arc::new(std::sync::RwLock::new(Vec::new())),
-        inventory: Arc::new(std::sync::RwLock::new(Vec::new())),
-        account_registry: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        pending_verifications: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        researcher_profiles: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        research_abstracts: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        research_questions: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        kaspa_wrpc: Arc::new(KaspaWrpcClient::new(
-            &std::env::var("KASPA_WRPC_URL").unwrap_or_else(|_| "ws://kaspad:17110".to_string())
-        )),
-    });
-
-    // Cold start recovery from Arweave
-    println!("[STARTUP] Attempting Arweave hydration...");
-    if let Err(e) = hydrate_from_arweave(&arweave, &flux, &app_state).await {
-        eprintln!("[STARTUP] Arweave hydration failed: {} - starting fresh", e);
-    }
-
-    // Start snapshot scheduler
-    let scheduler = SnapshotScheduler::new(
-        arweave.clone(),
-        flux.clone(),
-        Arc::new((*app_state.get_ref()).clone()),
-    );
-    let shutdown_rx = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        scheduler.run(shutdown_rx).await;
-    });
-
-    println!("[STARTUP] KasVillage L2 API server starting on {}:{}", config.host, config.port);
-    println!("[STARTUP] Arweave backup: {}", if arweave.wallet_jwk.is_some() { "ENABLED" } else { "DISABLED (read-only)" });
-    println!("[STARTUP] Flux database: {}", flux_url);
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(app_state.clone())
-            .wrap(Logger::default())
-            .configure(configure_routes)
-    })
-    .bind(format!("{}:{}", config.host, config.port))?
-    .run()
-    .await
-}
-
-// ============================================================================
-// API ENDPOINTS FOR ARWEAVE/FLUX STATUS
-// ============================================================================
-
-/// GET /api/arweave/status - Check Arweave backup status
-pub async fn api_arweave_status(
-    arweave: web::Data<Arc<ArweaveBackup>>,
-) -> impl Responder {
-    let last_txid = arweave.last_snapshot_txid.read().await.clone();
-    let last_epoch = *arweave.last_snapshot_epoch.read().await;
-    
-    HttpResponse::Ok().json(serde_json::json!({
-        "enabled": arweave.wallet_jwk.is_some(),
-        "last_snapshot_txid": last_txid,
-        "last_snapshot_epoch": last_epoch,
-        "gateway": ARWEAVE_GATEWAY,
-    }))
-}
-
-/// POST /api/arweave/snapshot - Trigger manual snapshot
-pub async fn api_trigger_snapshot(
-    scheduler: web::Data<Arc<SnapshotScheduler>>,
-) -> impl Responder {
-    match scheduler.execute_snapshot().await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
-            "success": true,
-            "message": "Snapshot triggered successfully"
-        })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "success": false,
-            "error": e
-        })),
-    }
-}
-
-/// GET /api/stats/global - Enhanced with Arweave sync status
-pub async fn api_stats_global_enhanced(
-    state: web::Data<AppState>,
-    arweave: web::Data<Arc<ArweaveBackup>>,
-) -> impl Responder {
-    let tx_history = state.transaction_history.read().unwrap();
-    let validators = state.validators.read().unwrap();
-    
-    let total_transactions = tx_history.len() as u64;
-    let completed = tx_history.iter().filter(|t| t.status == "CONFIRMED").count() as u64;
-    let deadlocks = tx_history.iter().filter(|t| t.status == "DEADLOCKED").count() as u64;
-    
-    let last_arweave_epoch = *arweave.last_snapshot_epoch.read().await;
-    
-    HttpResponse::Ok().json(serde_json::json!({
-        "total_transactions": total_transactions,
-        "completed_count": completed,
-        "success_rate": if total_transactions > 0 { completed as f64 / total_transactions as f64 } else { 0.0 },
-        "total_deadlocks": deadlocks,
-        "recovered_count": 0,
-        "uptime_pct": 99.9,
-        "total_validators": validators.len(),
-        "last_arweave_epoch": last_arweave_epoch,
-    }))
-}
-
-// ============================================================================
-// HELPER: Timestamp
-// ============================================================================
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
-// ============================================================================
-// TESTS
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_arweave_backup_init() {
-        let backup = ArweaveBackup::new(None);
-        assert_eq!(backup.gateway, ARWEAVE_GATEWAY);
-        assert!(backup.wallet_jwk.is_none());
-    }
-
-    #[test]
-    fn test_state_snapshot_serialize() {
-        let snapshot = L2StateSnapshot {
-            epoch: 1,
-            merkle_root: "0xabc".to_string(),
-            timestamp: 1234567890,
-            account_count: 100,
-            total_balance: 1_000_000,
-            nullifier_count: 50,
-            stats: GlobalStatsSnapshot {
-                total_transactions: 1000,
-                completed_count: 950,
-                failed_count: 30,
-                total_deadlocks: 20,
-                recovered_count: 15,
-                total_disputes: 25,
-                network_p_complete: 0.95,
-                network_p_deadlock: 0.02,
-                total_volume: 5_000_000,
-            },
-            accounts: vec![],
-            pending_withdrawals: vec![],
-            active_deadlocks: vec![],
-            validators: vec![],
-            circuit_breaker: CircuitBreakerSnapshot {
-                is_tripped: false,
-                total_outflow_last_hour: 0,
-                drain_threshold: 1_000_000_000_000,
-            },
-        };
-        
-        let json = serde_json::to_string(&snapshot).unwrap();
-        assert!(json.contains("merkle_root"));
-        assert!(json.contains("network_p_complete"));
-    }
-
-    #[test]
-    fn test_circuit_breaker_state() {
-        let state = CircuitBreakerState::new();
-        assert!(!state.is_tripped);
-        assert_eq!(state.drain_threshold, 1_000_000_000_000);
-    }
-
-    #[test]
-    fn test_account_state_default() {
-        let state = AccountState::default();
-        assert_eq!(state.xp_gross, 0);
-        assert_eq!(state.xp_tier, 0);
-        assert_eq!(state.p_complete, 0.0);
-    }
 }

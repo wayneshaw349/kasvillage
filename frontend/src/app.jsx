@@ -4796,6 +4796,10 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost, openStorefront }) => {
   const [logoShape, setLogoShape] = useState(apt.logoShape || "round");
   const [brandName, setBrandName] = useState(apt.name || "");
 
+  // --- MONETIZATION STATE ---
+  const [creatorContentFee, setCreatorContentFee] = useState(apt.creatorFeeKas || 0); // Fee to view creator content
+  const [channelSubscriptionFee, setChannelSubscriptionFee] = useState(apt.subscriptionFeeKas || 0); // Monthly sub
+
   // --- NEW ROBUST FONT STATE ---
   const [headerFontSize, setHeaderFontSize] = useState(apt.headerFontSize || 32);
   const [bodyFontSize, setBodyFontSize] = useState(apt.bodyFontSize || 14);
@@ -5016,6 +5020,10 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost, openStorefront }) => {
       letterSpacing,
       fontFamily: selectedFont.fontFamily,
   
+      // MONETIZATION - Creator Fees (NO storefront visit fee)
+      creatorFeeKas: creatorContentFee,          // Fee per content view
+      subscriptionFeeKas: channelSubscriptionFee, // Monthly subscription
+  
       // External Payments (gated at 5000 XP)
       paymentLinks, 
   
@@ -5217,13 +5225,13 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost, openStorefront }) => {
         <Badge tier={apt.owner_tier} />
       </div>
       
-      <div className="flex mb-6 p-1 bg-amber-200 rounded-xl">
-        {/* ADD "brand" TO THIS ARRAY BELOW */}
-        {["background", "brand", "layout", "fonts", "items", "coupons", "payments", "dapps", "preview", "visit"].map(view => (
+      <div className="flex mb-6 p-1 bg-amber-200 rounded-xl overflow-x-auto">
+        {/* Tab navigation - monetize added for fees */}
+        {["background", "brand", "layout", "fonts", "monetize", "items", "coupons", "payments", "dapps", "preview"].map(view => (
           <button key={view} onClick={() => setActiveView(view)} 
-            className={cn("flex-1 py-2 text-xs font-bold rounded-lg capitalize", 
+            className={cn("flex-1 py-2 text-xs font-bold rounded-lg capitalize whitespace-nowrap px-2", 
               activeView === view ? "bg-white shadow text-red-800" : "text-amber-800")}>
-            {view === "visit" ? "📍 Visit" : view}
+            {view === "monetize" ? "💰 Fees" : view}
           </button>
         ))}
       </div>
@@ -5548,6 +5556,95 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost, openStorefront }) => {
                   </div>
                 </div>
               </div>
+            </div>
+          </div>
+        )}
+        
+        {/* MONETIZATION TAB - Creator Content Fees */}
+        {activeView === "monetize" && (
+          <div className="space-y-6">
+            <h3 className="font-black text-amber-900 flex items-center gap-2">
+              <Coins className="text-amber-600" size={20}/> 
+              Creator Monetization
+            </h3>
+            
+            {/* Creator Content Fee */}
+            <div className="p-5 bg-gradient-to-br from-purple-50 to-pink-50 rounded-2xl border-2 border-purple-200">
+              <h4 className="font-bold text-purple-900 mb-3 flex items-center gap-2">
+                <PlayCircle size={18} /> Creator Content Fee
+              </h4>
+              <p className="text-xs text-purple-700 mb-4">
+                Charge for exclusive content (YouTube videos, TikTok, Instagram posts). Viewers pay to unlock.
+              </p>
+              <div className="flex items-center gap-3">
+                <input 
+                  type="number" 
+                  className="flex-1 p-3 bg-white rounded-xl border border-purple-200 font-bold text-lg"
+                  placeholder="0 = Free"
+                  value={creatorContentFee || ''}
+                  onChange={e => setCreatorContentFee(Number(e.target.value) || 0)}
+                  min="0"
+                  step="0.1"
+                />
+                <span className="text-purple-800 font-bold text-lg">KASPA</span>
+              </div>
+              <div className="mt-3 p-3 bg-white/50 rounded-xl">
+                {creatorContentFee > 0 ? (
+                  <p className="text-sm text-green-700 flex items-center gap-2">
+                    <CheckCircle size={16} />
+                    Fans pay <strong>{creatorContentFee} KAS</strong> per content view. You receive 100%.
+                  </p>
+                ) : (
+                  <p className="text-sm text-stone-600">Free content - no paywall on your posts/videos.</p>
+                )}
+              </div>
+            </div>
+            
+            {/* Channel Subscription (Influencer) */}
+            <div className="p-5 bg-gradient-to-br from-blue-50 to-cyan-50 rounded-2xl border-2 border-blue-200">
+              <h4 className="font-bold text-blue-900 mb-3 flex items-center gap-2">
+                <Users size={18} /> Channel Subscription (Monthly)
+              </h4>
+              <p className="text-xs text-blue-700 mb-4">
+                Fans subscribe monthly to access all your exclusive content. Like Patreon, but in crypto.
+              </p>
+              <div className="flex items-center gap-3">
+                <input 
+                  type="number" 
+                  className="flex-1 p-3 bg-white rounded-xl border border-blue-200 font-bold text-lg"
+                  placeholder="0 = No subscription"
+                  value={channelSubscriptionFee || ''}
+                  onChange={e => setChannelSubscriptionFee(Number(e.target.value) || 0)}
+                  min="0"
+                  step="1"
+                />
+                <span className="text-blue-800 font-bold text-lg">KASPA/mo</span>
+              </div>
+              <div className="mt-3 p-3 bg-white/50 rounded-xl">
+                {channelSubscriptionFee > 0 ? (
+                  <p className="text-sm text-green-700 flex items-center gap-2">
+                    <CheckCircle size={16} />
+                    Subscribers pay <strong>{channelSubscriptionFee} KAS/month</strong>. You receive 100%.
+                  </p>
+                ) : (
+                  <p className="text-sm text-stone-600">No subscription - fans access content per-view or free.</p>
+                )}
+              </div>
+            </div>
+            
+            {/* Supported Platforms */}
+            <div className="p-4 bg-stone-100 rounded-xl">
+              <h4 className="font-bold text-stone-700 mb-3 text-sm">Supported Platforms for Creator Content</h4>
+              <div className="flex flex-wrap gap-2">
+                {ALLOWED_SOCIAL_PLATFORMS.map(p => (
+                  <span key={p.id} className="px-3 py-1 bg-white rounded-full text-xs font-bold flex items-center gap-1 border border-stone-200">
+                    {p.icon} {p.name}
+                  </span>
+                ))}
+              </div>
+              <p className="text-[10px] text-stone-500 mt-3">
+                ⚠️ Twitter/X blocked due to adult content policies. Only whitelisted platforms supported.
+              </p>
             </div>
           </div>
         )}
@@ -9208,11 +9305,16 @@ const QualityGateModal = ({ onClose, onPublish }) => {
     name: "",
     gameUrl: "https://dapp-mock-link.com",
     category: "GameRPG",
+    gameType: "utility",              // physics, board, card, puzzle, rpg, utility
     description: "",
     codeHash: "",
     stakeAmount: 100, 
     lockDuration: 12, 
     auditors: [],
+    // MONETIZATION OPTIONS
+    visitFeeKas: 0,                   // Entry fee to play/use (0 = free)
+    salePrice: null,                  // Sale price if selling DApp (null = not for sale)
+    saleCurrency: 'kas',              // kas or usd
     checks: {
         endpointActive: false,
         hasMainMenu: false,
@@ -9385,6 +9487,81 @@ const QualityGateModal = ({ onClose, onPublish }) => {
                                 <span className="text-sm font-medium text-stone-700">L2 Save/Sync Logic is implemented</span>
                             </label>
                         </div>
+                    </div>
+
+                    {/* MONETIZATION OPTIONS */}
+                    <div className="bg-gradient-to-br from-amber-50 to-orange-50 p-5 rounded-2xl border-2 border-amber-200">
+                      <h3 className="font-black text-amber-900 flex items-center gap-2 mb-4">
+                        <Coins className="text-amber-600" size={20}/> 
+                        Monetization Options
+                      </h3>
+                      
+                      {/* Game Type */}
+                      <div className="mb-4">
+                        <label className="text-xs font-bold text-amber-700 uppercase">Game Type (for template validation)</label>
+                        <select 
+                          className="w-full p-3 bg-white rounded-xl border border-amber-200 mt-1"
+                          value={manifest.gameType}
+                          onChange={e => setManifest({...manifest, gameType: e.target.value})}
+                        >
+                          <option value="physics">Physics (bouncing, gravity, collision)</option>
+                          <option value="board">Board Game (chess, checkers, go)</option>
+                          <option value="card">Card Game (deck, hand, draw)</option>
+                          <option value="puzzle">Puzzle (grid, solve, validate)</option>
+                          <option value="rpg">RPG (player, inventory, action)</option>
+                          <option value="utility">Utility App (non-game tool)</option>
+                        </select>
+                      </div>
+                      
+                      {/* Visit Fee */}
+                      <div className="mb-4">
+                        <label className="text-xs font-bold text-amber-700 uppercase">Entry Fee (per visit/play session)</label>
+                        <div className="flex items-center gap-2 mt-1">
+                          <input 
+                            type="number" 
+                            className="flex-1 p-3 bg-white rounded-xl border border-amber-200 font-bold"
+                            placeholder="0 = Free"
+                            value={manifest.visitFeeKas || ''}
+                            onChange={e => setManifest({...manifest, visitFeeKas: Number(e.target.value) || 0})}
+                            min="0"
+                            step="0.1"
+                          />
+                          <span className="text-amber-800 font-bold">KASPA</span>
+                        </div>
+                        <p className="text-[10px] text-amber-600 mt-1">
+                          {manifest.visitFeeKas > 0 
+                            ? `Users pay ${manifest.visitFeeKas} KAS to play. You receive 100% instantly.` 
+                            : "Free to play - no entry fee required."}
+                        </p>
+                      </div>
+                      
+                      {/* Sale Price */}
+                      <div>
+                        <label className="text-xs font-bold text-amber-700 uppercase">Sell This DApp? (optional)</label>
+                        <div className="flex items-center gap-2 mt-1">
+                          <input 
+                            type="number" 
+                            className="flex-1 p-3 bg-white rounded-xl border border-amber-200 font-bold"
+                            placeholder="Leave empty if not for sale"
+                            value={manifest.salePrice || ''}
+                            onChange={e => setManifest({...manifest, salePrice: e.target.value ? Number(e.target.value) : null})}
+                            min="0"
+                          />
+                          <select 
+                            className="p-3 bg-white rounded-xl border border-amber-200 font-bold"
+                            value={manifest.saleCurrency}
+                            onChange={e => setManifest({...manifest, saleCurrency: e.target.value})}
+                          >
+                            <option value="kas">KASPA</option>
+                            <option value="usd">USD (PayPal)</option>
+                          </select>
+                        </div>
+                        <p className="text-[10px] text-amber-600 mt-1">
+                          {manifest.salePrice 
+                            ? `Listed for sale at ${manifest.salePrice} ${manifest.saleCurrency.toUpperCase()}` 
+                            : "Not for sale - you keep ownership."}
+                        </p>
+                      </div>
                     </div>
 
                     <button 

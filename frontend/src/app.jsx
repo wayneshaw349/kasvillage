@@ -8601,8 +8601,8 @@ const validateDAppCode = (code, gameType) => {
   
   // Check required core functions
   DAPP_REQUIRED_FUNCTIONS.forEach(fn => {
-    if (!codeLower.includes(`function ${fn}`) && !codeLower.includes(`${fn}(`)) {
-      errors.push(\`MISSING REQUIRED: \${fn}() function\`);
+    if (!codeLower.includes('function ' + fn) && !codeLower.includes(fn + '(')) {
+      errors.push('MISSING REQUIRED: ' + fn + '() function');
     }
   });
   
@@ -8610,14 +8610,14 @@ const validateDAppCode = (code, gameType) => {
   const typeReqs = DAPP_TYPE_REQUIREMENTS[gameType] || [];
   typeReqs.forEach(pattern => {
     if (!codeLower.includes(pattern.toLowerCase())) {
-      errors.push(\`MISSING FOR \${gameType.toUpperCase()}: \${pattern}\`);
+      errors.push('MISSING FOR ' + gameType.toUpperCase() + ': ' + pattern);
     }
   });
   
   // Check blocked patterns
   DAPP_BLOCKED_PATTERNS.forEach(blocked => {
     if (codeLower.includes(blocked.toLowerCase())) {
-      errors.push(\`BLOCKED PATTERN: \${blocked} (security violation)\`);
+      errors.push('BLOCKED PATTERN: ' + blocked + ' (security violation)');
     }
   });
   
@@ -8632,7 +8632,7 @@ const validateDAppCode = (code, gameType) => {
   return errors;
 };
 
-const DAPP_TEMPLATE_CODE = \`// ═══════════════════════════════════════════════════════════════════════════
+const DAPP_TEMPLATE_CODE = `// ═══════════════════════════════════════════════════════════════════════════
 // KASVILLAGE L2 - GAME TEMPLATE (Select your type below)
 // ═══════════════════════════════════════════════════════════════════════════
 // Types: physics | board | card | puzzle | rpg | utility
@@ -8777,7 +8777,7 @@ document.addEventListener('DOMContentLoaded', init);
 // BOARDS & XP REQUIREMENTS:
 // Incubator:  500+ XP  | Main: 1000+ XP  | Elite: 5000+ XP
 // ═══════════════════════════════════════════════════════════════════════════
-\`;
+`;
 
 // ============================================================================
 // VISIT FEE SYSTEM - DApps/Games can set optional entry fee in KASPA

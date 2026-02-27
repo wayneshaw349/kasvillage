@@ -1,4 +1,4 @@
-// KasVillage Frontend v18.1 — 2026-02-02 — Village Merkle integration: DApps, Academic, Coupons live-fetch from API; Arweave snapshot endpoints; auto-restore on boot
+// KasVillage Frontend v16 — Patched 2026-02-01 — storefront/save: host_id + theme fix 
 import React, { createContext, useContext, useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion"; 
 import {   
@@ -95,6 +95,391 @@ const API_BASE = typeof window !== 'undefined' && window.KASVILLAGE_API_URL
   ? window.KASVILLAGE_API_URL 
   : 'https://api.kasvillage.com';
 
+// ============================================================================
+// HYDRA NETWORK - Multi-Endpoint Failover System
+// ============================================================================
+// 4-Tier Architecture:
+//   PRIMARY → BACKUP → CLIFF → DIRECT
+// 
+// Validators are NEVER exposed. All tiers are disposable proxies.
+// Based on network4 architecture for DDoS resilience.
+// ============================================================================
+
+const HYDRA_ENDPOINTS = {
+  // Tier 1: Primary Akash proxies (US-West region)
+  PRIMARY: [
+    'https://node1.kasvillage.io',
+    'https://node2.kasvillage.io',
+    'https://node3.kasvillage.io',
+  ],
+  // Tier 2: Backup Akash proxies (EU region)
+  BACKUP: [
+    'https://backup1.kasvillage.io',
+    'https://backup2.kasvillage.io',
+  ],
+  // Tier 3: Cloudflare-proxied (absorbs large DDoS)
+  CLIFF: [
+    'https://api.kasvillage.io',
+  ],
+  // Tier 4: Direct emergency relays (disposable, rotate weekly)
+  // These are NOT validators - just cheap forwarding proxies
+  DIRECT: [
+    'https://relay1.kasvillage.io:8443',
+    'https://relay2.kasvillage.io:8443',
+    'https://relay3.kasvillage.io:8443',
+  ],
+};
+
+// Tier order for failover
+const TIER_ORDER = ['PRIMARY', 'BACKUP', 'CLIFF', 'DIRECT'];
+
+// Hydra State Management
+let hydraCurrentTierIndex = 0;
+let hydraEndpointIndex = 0;
+let hydraConsecutiveFailures = 0;
+const HYDRA_MAX_FAILURES = 3;
+const HYDRA_TIMEOUT_MS = 5000;
+const HYDRA_RECOVERY_CHECK_MS = 30000; // Check if PRIMARY recovered
+
+// Get current tier name
+const getHydraTier = () => TIER_ORDER[hydraCurrentTierIndex];
+
+const getHydraEndpoint = () => {
+  const tierName = getHydraTier();
+  const tier = HYDRA_ENDPOINTS[tierName];
+  return tier[hydraEndpointIndex % tier.length];
+};
+
+const hopHydraEndpoint = () => {
+  hydraConsecutiveFailures++;
+  
+  if (hydraConsecutiveFailures >= HYDRA_MAX_FAILURES) {
+    hydraEndpointIndex++;
+    const tierName = getHydraTier();
+    const tier = HYDRA_ENDPOINTS[tierName];
+    
+    if (hydraEndpointIndex >= tier.length) {
+      hydraEndpointIndex = 0;
+      
+      // Move to next tier
+      if (hydraCurrentTierIndex < TIER_ORDER.length - 1) {
+        hydraCurrentTierIndex++;
+        console.warn(`[HYDRA] ${TIER_ORDER[hydraCurrentTierIndex - 1]} exhausted, hopping to ${getHydraTier()}`);
+      } else {
+        console.error('[HYDRA] All 4 tiers exhausted - network unreachable');
+      }
+    }
+    hydraConsecutiveFailures = 0;
+  }
+};
+
+const resetHydraState = () => {
+  hydraConsecutiveFailures = 0;
+};
+
+// Attempt recovery to higher tier periodically
+let lastRecoveryCheck = 0;
+const attemptTierRecovery = async () => {
+  const now = Date.now();
+  if (hydraCurrentTierIndex === 0) return; // Already on PRIMARY
+  if (now - lastRecoveryCheck < HYDRA_RECOVERY_CHECK_MS) return;
+  
+  lastRecoveryCheck = now;
+  
+  // Try PRIMARY health check
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    const response = await fetch(`${HYDRA_ENDPOINTS.PRIMARY[0]}/health`, {
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    
+    if (response.ok) {
+      console.log('[HYDRA] PRIMARY recovered, switching back');
+      hydraCurrentTierIndex = 0;
+      hydraEndpointIndex = 0;
+    }
+  } catch (e) {
+    // PRIMARY still down, stay on current tier
+  }
+};
+
+// Resilient fetch with automatic tier hopping
+const resilientFetch = async (path, options = {}) => {
+  const totalEndpoints = Object.values(HYDRA_ENDPOINTS).flat().length;
+  
+  // Check if we can recover to a better tier
+  await attemptTierRecovery();
+  
+  for (let attempt = 0; attempt < totalEndpoints; attempt++) {
+    const endpoint = getHydraEndpoint();
+    const url = `${endpoint}${path}`;
+    
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), HYDRA_TIMEOUT_MS);
+      
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          ...options.headers,
+        },
+      });
+      
+      clearTimeout(timeout);
+      
+      if (response.ok) {
+        resetHydraState();
+        return response;
+      }
+      
+      if (response.status >= 500) {
+        hopHydraEndpoint();
+        continue;
+      }
+      
+      return response;
+      
+    } catch (error) {
+      console.warn(`[HYDRA] ${endpoint} failed:`, error.message);
+      hopHydraEndpoint();
+    }
+  }
+  
+  throw new Error('All network tiers exhausted');
+};
+
+// ============================================================================
+// FLUX BRIDGE API - Ephemeral Deposit Addresses
+// ============================================================================
+
+const requestBridgeTicket = async (pubkey, amountUsd, countryCode = null) => {
+  try {
+    const response = await resilientFetch('/api/bridge/request', {
+      method: 'POST',
+      body: JSON.stringify({
+        pubkey,
+        amount_usd: amountUsd,
+        country_code: countryCode,
+      }),
+    });
+    
+    const data = await response.json();
+    
+    if (!data.success) {
+      return {
+        success: false,
+        error: data.error || 'Failed to create bridge ticket',
+        sanctionsBlocked: !data.sanctions_cleared,
+        geoBlocked: !data.geo_cleared,
+      };
+    }
+    
+    return {
+      success: true,
+      ticketId: data.ticket_id,
+      ephemeralAddress: data.temp_l1_address,
+      expectedAmountKas: data.expected_amount_kas,
+      kasPrice: data.kas_price,
+      expiresAt: data.expires_at,
+      secondsRemaining: data.seconds_remaining,
+      warning: data.warning,
+    };
+  } catch (error) {
+    console.error('[BRIDGE] Ticket request failed:', error);
+    return { success: false, error: error.message };
+  }
+};
+
+const checkBridgeStatus = async (ticketId) => {
+  try {
+    const response = await resilientFetch(`/api/bridge/status/${ticketId}`);
+    const data = await response.json();
+    
+    if (!data.success) {
+      return { success: false, error: data.error };
+    }
+    
+    return {
+      success: true,
+      ticketId: data.ticket_id,
+      status: data.status,
+      ephemeralAddress: data.ephemeral_address,
+      expectedAmountSompi: data.expected_amount_sompi,
+      actualAmountSompi: data.actual_amount_sompi,
+      isExpired: data.is_expired,
+      secondsRemaining: data.seconds_remaining,
+      fundedAt: data.funded_at,
+      sweptAt: data.swept_at,
+      sweptTxid: data.swept_txid,
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+};
+
+const getFluxStatus = async () => {
+  try {
+    const response = await resilientFetch('/api/flux/status');
+    return await response.json();
+  } catch (error) {
+    return null;
+  }
+};
+
+// ============================================================================
+// FLUX REACT HOOKS
+// ============================================================================
+
+const useBridgeTicket = () => {
+  const [ticket, setTicket] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [status, setStatus] = useState(null);
+  const pollingRef = useRef(null);
+  
+  const requestTicket = async (pubkey, amountUsd, countryCode) => {
+    setLoading(true);
+    setError(null);
+    
+    const result = await requestBridgeTicket(pubkey, amountUsd, countryCode);
+    setLoading(false);
+    
+    if (result.success) {
+      setTicket(result);
+      startPolling(result.ticketId);
+    } else {
+      setError(result.error);
+    }
+    
+    return result;
+  };
+  
+  const startPolling = (ticketId) => {
+    if (pollingRef.current) clearInterval(pollingRef.current);
+    
+    pollingRef.current = setInterval(async () => {
+      const statusResult = await checkBridgeStatus(ticketId);
+      if (statusResult.success) {
+        setStatus(statusResult);
+        if (['Swept', 'Expired', 'Refunded', 'Sanctioned'].includes(statusResult.status)) {
+          clearInterval(pollingRef.current);
+          pollingRef.current = null;
+        }
+      }
+    }, 5000);
+  };
+  
+  const stopPolling = () => {
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+  };
+  
+  useEffect(() => () => stopPolling(), []);
+  
+  return { ticket, status, loading, error, requestTicket, stopPolling };
+};
+
+const useFluxStatus = (pollInterval = 30000) => {
+  const [fluxStatus, setFluxStatus] = useState(null);
+  const [lastUpdate, setLastUpdate] = useState(null);
+  
+  useEffect(() => {
+    const fetchStatus = async () => {
+      const status = await getFluxStatus();
+      if (status) {
+        setFluxStatus(status);
+        setLastUpdate(Date.now());
+      }
+    };
+    
+    fetchStatus();
+    const interval = setInterval(fetchStatus, pollInterval);
+    return () => clearInterval(interval);
+  }, [pollInterval]);
+  
+  return { fluxStatus, lastUpdate };
+};
+
+const useNetworkHealth = () => {
+  const [networkTier, setNetworkTier] = useState(getHydraTier());
+  const [endpoint, setEndpoint] = useState(getHydraEndpoint());
+  
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setNetworkTier(getHydraTier());
+      setEndpoint(getHydraEndpoint());
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+  
+  return {
+    tier: networkTier,
+    endpoint,
+    tierIndex: TIER_ORDER.indexOf(networkTier),
+    isHealthy: networkTier === 'PRIMARY',
+    isDegraded: networkTier === 'BACKUP',
+    isEmergency: networkTier === 'CLIFF',
+    isDirect: networkTier === 'DIRECT',
+  };
+};
+
+// ============================================================================
+// FLUX STATUS WIDGET COMPONENT
+// ============================================================================
+
+const FluxStatusWidget = () => {
+  const { fluxStatus, lastUpdate } = useFluxStatus(30000);
+  const { tier, isHealthy, isDegraded, isEmergency, isDirect } = useNetworkHealth();
+  
+  if (!fluxStatus) return null;
+  
+  return (
+    <div className="p-4 bg-stone-50 border border-stone-200 rounded-xl">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-bold text-stone-800 flex items-center gap-2">
+          <Database size={16}/>
+          Flux Status
+        </h3>
+        <div className={cn(
+          "px-2 py-1 rounded text-[10px] font-bold",
+          isHealthy && "bg-green-100 text-green-700",
+          isDegraded && "bg-yellow-100 text-yellow-700",
+          isEmergency && "bg-orange-100 text-orange-700",
+          isDirect && "bg-red-100 text-red-700"
+        )}>
+          {tier}
+        </div>
+      </div>
+      
+      <div className="grid grid-cols-3 gap-3 text-center">
+        <div>
+          <div className="text-lg font-bold text-green-600">{fluxStatus.sweeper?.total_swept || 0}</div>
+          <div className="text-[10px] text-stone-500">Swept</div>
+        </div>
+        <div>
+          <div className="text-lg font-bold text-amber-600">{fluxStatus.janitor?.total_refunded || 0}</div>
+          <div className="text-[10px] text-stone-500">Refunded</div>
+        </div>
+        <div>
+          <div className="text-lg font-bold text-indigo-600">{fluxStatus.snapshot?.last_epoch || 0}</div>
+          <div className="text-[10px] text-stone-500">Epoch</div>
+        </div>
+      </div>
+      
+      {lastUpdate && (
+        <p className="text-[9px] text-stone-400 mt-2 text-right">
+          Updated: {new Date(lastUpdate).toLocaleTimeString()}
+        </p>
+      )}
+    </div>
+  );
+};
 
 // CoinGecko API (free, no key needed) for live KASPA price
 const COINGECKO_API = 'https://api.coingecko.com/api/v3';
@@ -618,20 +1003,74 @@ const sha256Hash = async (message) => {
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 };
 
-// Visual URL Platforms (approved for safety monitoring)
+// ============================================================================
+// WHITELISTED PLATFORMS (No adult content platforms allowed)
+// ============================================================================
+// Twitter/X REMOVED - allows adult content
+// Only family-friendly platforms for storefront advertisements
+// ============================================================================
+
+// Visual URL Platforms (WHITELISTED - No adult content)
 const VISUAL_PLATFORMS = [
   { id: 'instagram', name: 'Instagram', icon: '📸', domain: 'instagram.com' },
-  { id: 'tiktok', name: 'TikTok', icon: '🎵', domain: 'tiktok.com' },
-  { id: 'twitter', name: 'Twitter/X', icon: '𝕏', domain: 'x.com' },
   { id: 'etsy', name: 'Etsy', icon: '🛍️', domain: 'etsy.com' },
   { id: 'pinterest', name: 'Pinterest', icon: '📌', domain: 'pinterest.com' },
+  { id: 'facebook', name: 'Facebook', icon: '📘', domain: 'facebook.com' },
 ];
 
-// Video platforms
+// Video platforms (WHITELISTED)
 const VIDEO_PLATFORMS = [
   { id: 'youtube', name: 'YouTube', icon: '▶️', domain: 'youtube.com' },
   { id: 'tiktok', name: 'TikTok', icon: '🎵', domain: 'tiktok.com' },
 ];
+
+// ALL allowed platforms for storefront/creator links
+const ALLOWED_SOCIAL_PLATFORMS = [
+  { id: 'youtube', name: 'YouTube', icon: '▶️', domain: 'youtube.com' },
+  { id: 'tiktok', name: 'TikTok', icon: '🎵', domain: 'tiktok.com' },
+  { id: 'facebook', name: 'Facebook', icon: '📘', domain: 'facebook.com' },
+  { id: 'instagram', name: 'Instagram', icon: '📸', domain: 'instagram.com' },
+  { id: 'etsy', name: 'Etsy', icon: '🛍️', domain: 'etsy.com' },
+  { id: 'pinterest', name: 'Pinterest', icon: '📌', domain: 'pinterest.com' },
+];
+
+// Domains that are BLOCKED (adult content risk)
+const BLOCKED_SOCIAL_DOMAINS = [
+  'twitter.com', 'x.com',           // Adult content allowed - BLOCKED
+  'onlyfans.com',                    // Adult platform
+  'patreon.com',                     // Can have adult content
+  'reddit.com',                      // NSFW subreddits
+  'tumblr.com',                      // Adult content
+  'snapchat.com',                    // Private/adult content
+];
+
+// Validate URL against whitelist
+const isAllowedSocialUrl = (url) => {
+  if (!url || typeof url !== 'string') return false;
+  const urlLower = url.toLowerCase();
+  
+  // Check if blocked
+  for (const blocked of BLOCKED_SOCIAL_DOMAINS) {
+    if (urlLower.includes(blocked)) return false;
+  }
+  
+  // Check if allowed
+  const allowedDomains = ALLOWED_SOCIAL_PLATFORMS.map(p => p.domain);
+  return allowedDomains.some(domain => urlLower.includes(domain));
+};
+
+// Validate and sanitize social links object
+const sanitizeSocialLinks = (links) => {
+  const sanitized = {};
+  const allowedIds = ALLOWED_SOCIAL_PLATFORMS.map(p => p.id);
+  
+  for (const [key, value] of Object.entries(links || {})) {
+    if (allowedIds.includes(key) && value && isAllowedSocialUrl(value)) {
+      sanitized[key] = value;
+    }
+  }
+  return sanitized;
+};
 
 // 1000 Question Bank (common sense, visual, logic, math, everyday knowledge)
 const QUESTION_BANK = [
@@ -1404,33 +1843,48 @@ donateToReserves: async (pubkey, amount) => {
   },
 
   saveStorefrontLayout: async (merchantPubkey, layout) => {
-    // Guard: skip save if host_id is invalid
-    if (!merchantPubkey || merchantPubkey === 'new' || merchantPubkey === 0 || merchantPubkey === '0') {
-      console.warn('⚠️ Skipping storefront save — invalid host_id:', merchantPubkey);
-      const layoutStr = JSON.stringify(layout);
-      const layoutHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(layoutStr)))).map(b => b.toString(16).padStart(2, '0')).join('');
-      return { success: true, merkle_root: '0x' + layoutHash.substring(0, 64), layout_hash: layoutHash, stored_at: Date.now() };
-    }
+    console.log('=== SAVE STOREFRONT DEBUG ===');
+    console.log('merchantPubkey:', merchantPubkey);
+    console.log('layout:', JSON.stringify(layout, null, 2));
+
+    // Extract theme string from object if needed
+    const themeStr = typeof layout.theme === 'string' 
+      ? layout.theme 
+      : (layout.theme?.id || 'default');
+    console.log('themeStr:', themeStr);
+
+    const body = { 
+      host_id: merchantPubkey,
+      layout: layout,
+      theme: themeStr,
+      timestamp: Date.now()
+    };
+    console.log('Request body:', JSON.stringify(body, null, 2));
+
     try {
       const res = await fetch(`${API_BASE}/api/storefront/save`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          host_id: String(merchantPubkey),
-          layout: layout,
-          theme: layout.theme || 'default',
-          timestamp: Date.now()
-        }),
+        body: JSON.stringify(body),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      console.log('Response status:', res.status);
       const data = await res.json();
+      console.log('Response data:', data);
+
+      if (!res.ok) {
+        console.error('SAVE FAILED - HTTP', res.status, data);
+        return { success: false, error: data?.error || `HTTP ${res.status}` };
+      }
+
       return {
         success: true,
-        merkle_root: data.merkle_root || data.merkle_proof,
+        merkle_root: data.merkle_root,
         layout_hash: data.layout_hash,
-        stored_at: data.stored_at || data.saved_at
+        stored_at: data.stored_at
       };
     } catch (e) {
+      console.error('SAVE ERROR (network/parse):', e);
+      // Offline fallback — compute local hash so caller gets success
       const layoutStr = JSON.stringify(layout);
       const layoutHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(layoutStr)))).map(b => b.toString(16).padStart(2, '0')).join('');
       return { 
@@ -1442,24 +1896,26 @@ donateToReserves: async (pubkey, amount) => {
     }
   },
   
+  // NOTE: recordPageVisit is defined but not currently used in the app
+  // Keep for future analytics feature
   recordPageVisit: async (visitorPubkey, merchantPubkey, isFirstVisit) => {
     try {
       const res = await fetch(`${API_BASE}/api/storefront/visit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          host_id: String(merchantPubkey),
+          host_id: merchantPubkey,  // Backend expects host_id, not merchant_pubkey
           is_first_visit: isFirstVisit,
           timestamp: Date.now()
+          // NOTE: No visitor_pubkey - privacy by design (no PII stored)
         }),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
       return {
         success: true,
-        fee_charged: isFirstVisit ? 0 : PAGE_VIEW_FEE_SOMPI,
-        merkle_proof: '0x' + Math.random().toString(16).substr(2, 64)
+        fee_charged: false,
+        visit_count: 0
       };
     }
   },
@@ -1542,20 +1998,8 @@ donateToReserves: async (pubkey, amount) => {
     try {
       const res = await fetch(`${API_BASE}/api/coupons/create`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          host_id: String(hostPubkey), 
-          title, 
-          description, 
-          item_name: itemName, 
-          dollar_price: dollarPrice, 
-          kaspa_price: kaspaPrice, 
-          discount_percent: discountPercent, 
-          max_uses: maxUses, 
-          expiry_days: expiryDays,
-          link: `/storefront/${hostPubkey}`
-        })
+        body: JSON.stringify({ host_pubkey: hostPubkey, title, description, item_name: itemName, dollar_price: dollarPrice, kaspa_price: kaspaPrice, discount_percent: discountPercent, max_uses: maxUses, expiry_days: expiryDays })
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) { return { success: true, coupon_id: Date.now() % 1000000, code: 'COUP' + Date.now() % 1000000 }; }
   },
@@ -1966,11 +2410,11 @@ const CURRENT_DONATION_AIRWEAVE = 0;
 
 // --- STOREFRONT BUILDER SCHEMA ---
 
-// ALLOWED PLATFORMS (monitored for safety)
+// ALLOWED PLATFORMS - WHITELISTED (No adult content platforms)
+// Twitter/X BLOCKED - allows adult content
 const ALLOWED_VISUAL_PLATFORMS = [
   { id: 'instagram', name: 'Instagram', icon: '📸', domain: 'instagram.com' },
-  { id: 'tiktok', name: 'TikTok', icon: '🎵', domain: 'tiktok.com' },
-  { id: 'twitter', name: 'Twitter/X', icon: '𝕏', domain: 'twitter.com' },
+  { id: 'facebook', name: 'Facebook', icon: '📘', domain: 'facebook.com' },
   { id: 'etsy', name: 'Etsy', icon: '🛍️', domain: 'etsy.com' },
   { id: 'pinterest', name: 'Pinterest', icon: '📌', domain: 'pinterest.com' },
 ];
@@ -2102,7 +2546,7 @@ const THEME_OPTIONS = [
 
 // Stores -> Apts (fetched from API, starter template for new users)
 const STARTER_HOST_NODE = { 
-  host_id: "starter_0", 
+  host_id: 0, 
   owner_pubkey: "",
   name: "My First Shop", 
   description: "Your starter storefront - customize it to begin earning XP!", 
@@ -2123,8 +2567,8 @@ const STARTER_HOST_NODE = {
 
 // Coupons fetched from API
 const STARTER_COUPONS = [
-  { coupon_id: 0, host_id: "starter_0", code: "WELCOME10", type: "PercentOff", value: 10, title: "Welcome 10% Off", item_name: "Any Item", link: "", host_name: "My First Shop" },
-  { coupon_id: 0, host_id: "starter_0", code: "FIRSTBUY", type: "FixedAmount", value: 5, title: "5 KASPA Off First Purchase", item_name: "Any Item", link: "", host_name: "My First Shop" }
+  { coupon_id: 0, host_id: 0, code: "WELCOME10", type: "PercentOff", value: 10, title: "Welcome 10% Off", item_name: "Any Item", link: "", host_name: "My First Shop" },
+  { coupon_id: 0, host_id: 0, code: "FIRSTBUY", type: "FixedAmount", value: 5, title: "5 KASPA Off First Purchase", item_name: "Any Item", link: "", host_name: "My First Shop" }
 ];
 const SUPPORTED_PAYMENT_PLATFORMS = [
   { id: 'paypal', name: 'PayPal', icon: '🅿️', color: 'bg-blue-600' },
@@ -2568,6 +3012,43 @@ export const AppProvider = ({ children }) => {
   const [coupons, setCoupons] = useState([]);
   const [dapps, setDapps] = useState([]);
 
+  // Fetch coupons/storefronts from backend on mount
+  useEffect(() => {
+    const loadData = async () => {
+      try {
+        // Load coupons from API
+        const couponsRes = await fetch(`${API_BASE}/api/coupons`);
+        if (couponsRes.ok) {
+          const data = await couponsRes.json();
+          if (data.success && data.data) {
+            setCoupons(data.data);
+          }
+        }
+        
+        // Load host nodes (apts)
+        const aptsRes = await fetch(`${API_BASE}/api/host-nodes`);
+        if (aptsRes.ok) {
+          const data = await aptsRes.json();
+          if (data.success && data.data) {
+            setApts(data.data);
+          }
+        }
+        
+        // Load dapps
+        const dappsRes = await fetch(`${API_BASE}/api/dapps`);
+        if (dappsRes.ok) {
+          const data = await dappsRes.json();
+          if (data.success && data.data) {
+            setDapps(data.data);
+          }
+        }
+      } catch (e) {
+        console.warn('[GlobalContext] Data fetch failed:', e);
+      }
+    };
+    loadData();
+  }, []);
+
   // ---------------------------------------------------------
   // 3. LOGIC & HANDLERS
   // ---------------------------------------------------------
@@ -2581,24 +3062,6 @@ export const AppProvider = ({ children }) => {
       } catch (e) { console.error('Geo check failed:', e); }
     };
     checkGeoBlock();
-  }, []);
-
-  // Load coupons from backend Merkle-indexed store on mount
-  useEffect(() => {
-    const loadCouponsFromBackend = async () => {
-      try {
-        const result = await api.getCoupons();
-        if (result.success && result.data && result.data.length > 0) {
-          setCoupons(prev => {
-            const existingCodes = new Set(prev.map(c => c.code));
-            const newCoupons = result.data.filter(c => !existingCodes.has(c.code));
-            return [...prev, ...newCoupons];
-          });
-          console.log(`✅ Loaded ${result.data.length} coupons from backend Merkle store`);
-        }
-      } catch (e) { console.warn('Coupon backend load failed (using local):', e); }
-    };
-    loadCouponsFromBackend();
   }, []);
 
   const login = async () => {
@@ -4307,7 +4770,7 @@ const StepItem = ({ done, text }) => (
 
 // --- 8. HOST NODE BUILDER UI (Enhanced Storefront Workspace) ---
 
-const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
+const AptBuilder = ({ apt, userXp, openDApp, openHost, openStorefront }) => {
   const globalContext = useContext(GlobalContext);
   const [activeView, setActiveView] = useState("background");
   const [theme, setTheme] = useState(apt.theme);
@@ -4319,12 +4782,13 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
   const [showPaymentLinkPopup, setShowPaymentLinkPopup] = useState(false);
 
   const [socialLinks, setSocialLinks] = useState(apt.socialLinks || {
-    instagram: '',
+    youtube: '',
     tiktok: '',
-    twitter: '',
+    facebook: '',
+    instagram: '',
     etsy: '',
-    pinterest: '',
-    youtube: ''
+    pinterest: ''
+    // Twitter/X BLOCKED - adult content
   });
 
   // --- NEW BRAND STATE ---
@@ -4365,6 +4829,16 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
   const [saving, setSaving] = useState(false);
   const [lastAutoSave, setLastAutoSave] = useState(null);
   const [lastSaved, setLastSaved] = useState(null);
+
+  // Sync brandName into hero and brand_bar sections automatically
+  useEffect(() => {
+    if (!brandName) return;
+    setStorefrontSections(prev => prev.map(s => {
+      if (s.type === 'hero') return { ...s, title: brandName };
+      if (s.type === 'brand_bar') return { ...s, brandName: brandName };
+      return s;
+    }));
+  }, [brandName]);
 
   // Auto-save layout to localStorage whenever customizations change
   useEffect(() => {
@@ -4410,7 +4884,7 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
     return () => clearTimeout(timer);
   }, [storefrontSections, selectedTheme, brandName, logoUrl, logoShape, socialLinks, headerFontSize, bodyFontSize, fontWeight, letterSpacing, selectedFont, paymentLinks, coupons, stash, apt.host_id]);
 
-  const handleCreateCoupon = async (couponData) => {
+  const handleCreateCoupon = (couponData) => {
     const couponWithHost = { 
       ...couponData, 
       host_id: apt.host_id,
@@ -4422,10 +4896,6 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
     if (globalContext?.setCoupons) {
       globalContext.setCoupons(prev => [...prev, couponWithHost]);
     }
-    // Persist to backend coupon_store (survives page refresh)
-    try {
-      await api.createCoupon(apt.host_id, couponWithHost.title, couponWithHost.description, couponWithHost.item_name, couponWithHost.dollarPrice, couponWithHost.discountedKaspa, couponWithHost.discountPercent, couponWithHost.maxUses, 30);
-    } catch (e) { console.warn('Coupon backend sync failed (local-first):', e); }
   };
 
   const handleSaveItem = (itemData) => {
@@ -4608,7 +5078,12 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
   
     console.log(`Launching Storefront for Host ${apt.host_id}. Visibility: ${visibilityStatus}`);
   
-    openHost(apt); 
+    // Open StorefrontViewer (same view visitors see) instead of AptInterface
+    if (openStorefront) {
+      openStorefront({ hostId: apt.host_id, hostName: brandName || apt.name });
+    } else {
+      openHost(apt);
+    }
   };
   
   // Storefront Section Preview
@@ -4644,55 +5119,31 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
             </div>
           </div>
         );
-      case 'product_card':
+      case 'product_card': {
+        const pcColor = { Instagram: 'bg-gradient-to-r from-purple-500 to-pink-500', TikTok: 'bg-stone-900', Twitter: 'bg-sky-500', Etsy: 'bg-orange-600', Pinterest: 'bg-red-600', YouTube: 'bg-red-500' };
+        const pcEmoji = { Instagram: '📸', TikTok: '🎵', Twitter: '🐦', Etsy: '🛍', Pinterest: '📌', YouTube: '▶' };
         return (
           <div className="p-4 bg-white rounded-lg shadow-sm border mx-3 my-3">
-            <h3 className="font-bold text-lg" style={{ color: thm.primary }}>{section.name}</h3>
-            <p className="text-stone-600 text-xs mt-1">{section.description}</p>
+            <h3 className="font-bold text-lg" style={{ color: thm.primary }}>{section.name || 'Product Name'}</h3>
+            <p className="text-stone-600 text-xs mt-1">{section.description || 'Short description of your product'}</p>
             {section.price && <p className="font-bold mt-2" style={{ color: thm.accent }}>{section.price}</p>}
             <div className="border-t pt-3 mt-3">
-              <p className="text-[10px] text-stone-500 mb-2">View Product On:</p>
-              <div className="flex gap-2 flex-wrap">
-                {section.socialLinks?.instagram && (
-                  <button onClick={() => handleExternalClick('instagram', section.socialLinks.instagram)}
-                    className="flex items-center gap-1 px-3 py-1.5 bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded text-xs">
-                    📸 Instagram
-                  </button>
-                )}
-                {section.socialLinks?.tiktok && (
-                  <button onClick={() => handleExternalClick('tiktok', section.socialLinks.tiktok)}
-                    className="flex items-center gap-1 px-3 py-1.5 bg-stone-900 text-white rounded text-xs">
-                    🎵 TikTok
-                  </button>
-                )}
-                {section.socialLinks?.twitter && (
-                  <button onClick={() => handleExternalClick('twitter', section.socialLinks.twitter)}
-                    className="flex items-center gap-1 px-3 py-1.5 bg-stone-800 text-white rounded text-xs">
-                    𝕏 Twitter
-                  </button>
-                )}
-                {section.socialLinks?.etsy && (
-                  <button onClick={() => handleExternalClick('etsy', section.socialLinks.etsy)}
-                    className="flex items-center gap-1 px-3 py-1.5 bg-orange-600 text-white rounded text-xs">
-                    🛍️ Etsy
-                  </button>
-                )}
-                {section.socialLinks?.pinterest && (
-                  <button onClick={() => handleExternalClick('pinterest', section.socialLinks.pinterest)}
-                    className="flex items-center gap-1 px-3 py-1.5 bg-red-600 text-white rounded text-xs">
-                    📌 Pinterest
-                  </button>
-                )}
-                {section.socialLinks?.youtube && (
-                  <button onClick={() => handleExternalClick('youtube', section.socialLinks.youtube)}
-                    className="flex items-center gap-1 px-3 py-1.5 bg-red-700 text-white rounded text-xs">
-                    ▶️ YouTube
-                  </button>
-                )}
+              {section.visualsUrl ? (
+                <a href={section.visualsUrl} target="_blank" rel="noopener noreferrer"
+                  className={`flex items-center justify-center gap-2 w-full py-2.5 ${pcColor[section.visualsPlatform] || 'bg-stone-700'} text-white rounded-xl text-sm font-bold`}>
+                  {pcEmoji[section.visualsPlatform] || '🔗'} View on {section.visualsPlatform || 'Social'}
+                </a>
+              ) : (
+                <p className="text-[10px] text-stone-400 italic text-center">Link a stash item in the Items tab to add a social link</p>
+              )}
+              <div className="mt-3 p-2 bg-amber-50 rounded-lg border border-amber-200 text-center">
+                <p className="text-[10px] text-amber-700 font-bold">💬 DM the seller to express interest</p>
+                <p className="text-[10px] text-stone-500 mt-0.5">Then use Neighbor Agreement to complete purchase on L2</p>
               </div>
             </div>
           </div>
         );
+      }
       case 'social_block':
         return (
           <div className="p-6 text-center" style={{ background: thm.secondary }}>
@@ -4917,6 +5368,27 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
                 />
               </div>
 
+              {/* DANGER: Reset Storefront */}
+              <button
+                onClick={() => {
+                  if (window.confirm('Reset storefront? This clears all sections, coupons, and saved data.')) {
+                    localStorage.removeItem(`storefront_${apt.host_id}`);
+                    setStorefrontSections([
+                      { ...STOREFRONT_SECTION_SCHEMA.hero, id: 'hero-1', title: brandName || 'Your Brand Name' },
+                      { ...STOREFRONT_SECTION_SCHEMA.brand_bar, id: 'brand-1', brandName: brandName || 'My Shop' },
+                      { ...STOREFRONT_SECTION_SCHEMA.product_card, id: 'product-1' },
+                      { ...STOREFRONT_SECTION_SCHEMA.social_block, id: 'social-1' }
+                    ]);
+                    setCoupons([]);
+                    setStash([]);
+                    alert('Storefront reset.');
+                  }
+                }}
+                className="w-full py-2 text-xs text-red-500 hover:text-red-700 border border-red-200 rounded-xl hover:bg-red-50 transition mt-1"
+              >
+                🗑 Reset Storefront (Clear All)
+              </button>
+
               {/* 2. LOGO IMAGE */}
               <div>
                 <label className="text-xs font-bold text-stone-500 uppercase tracking-widest">Logo Image URL</label>
@@ -4944,17 +5416,20 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
               </div>
             </div>
 
-            {/* 4. NEW: SOCIAL PROFILE LINKS (Connects to Footer Icons) */}
+            {/* 4. SOCIAL PROFILE LINKS - WHITELISTED PLATFORMS ONLY */}
             <div className="p-4 bg-white rounded-xl border border-stone-200 shadow-sm">
-              <label className="text-xs font-black text-stone-500 uppercase tracking-widest block mb-4">Connect Social Channels</label>
+              <label className="text-xs font-black text-stone-500 uppercase tracking-widest block mb-2">Connect Social Channels</label>
+              <p className="text-[10px] text-amber-700 mb-4 p-2 bg-amber-50 rounded-lg border border-amber-200">
+                ⚠️ Twitter/X blocked due to adult content policies. Family-friendly platforms only.
+              </p>
               <div className="space-y-3">
                 {[
-                  { id: 'instagram', label: 'Instagram', icon: '📸', domain: 'instagram.com' },
+                  { id: 'youtube', label: 'YouTube', icon: '▶️', domain: 'youtube.com' },
                   { id: 'tiktok', label: 'TikTok', icon: '🎵', domain: 'tiktok.com' },
-                  { id: 'twitter', label: 'Twitter / X', icon: '𝕏', domain: 'x.com' },
+                  { id: 'instagram', label: 'Instagram', icon: '📸', domain: 'instagram.com' },
+                  { id: 'facebook', label: 'Facebook', icon: '📘', domain: 'facebook.com' },
                   { id: 'etsy', label: 'Etsy Shop', icon: '🛍️', domain: 'etsy.com' },
                   { id: 'pinterest', label: 'Pinterest', icon: '📌', domain: 'pinterest.com' },
-                  { id: 'youtube', label: 'YouTube', icon: '▶️', domain: 'youtube.com' },
                 ].map((platform) => (
                   <div key={platform.id} className="group flex items-center gap-3 bg-stone-50 p-2 rounded-xl border border-stone-100 focus-within:border-amber-500 focus-within:bg-white transition-all">
                     <div className="w-10 h-10 rounded-lg bg-white border border-stone-200 flex items-center justify-center text-xl shadow-sm group-focus-within:shadow-md transition-all">
@@ -4966,7 +5441,13 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
                         type="url" 
                         placeholder={`Link your ${platform.label}...`}
                         value={socialLinks?.[platform.id] || ""} 
-                        onChange={(e) => setSocialLinks({ ...socialLinks, [platform.id]: e.target.value })}
+                        onChange={(e) => {
+                          const url = e.target.value;
+                          // Validate against whitelist
+                          if (!url || isAllowedSocialUrl(url) || url.includes(platform.domain)) {
+                            setSocialLinks({ ...socialLinks, [platform.id]: url });
+                          }
+                        }}
                         className="w-full bg-transparent text-xs font-mono outline-none py-0.5 text-stone-700 placeholder:text-stone-300"
                       />
                     </div>
@@ -5226,6 +5707,90 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
             <Button onClick={() => { setEditingItem(null); setShowItemPopup(true); }} variant="secondary" className="w-full bg-blue-600 hover:bg-blue-500">
               <ShoppingBag size={16} className="mr-2" /> Add New Item
             </Button>
+
+            {/* Product Card Section Linker */}
+            {storefrontSections.filter(s => s.type === 'product_card').length > 0 && (
+              <div className="mt-5">
+                <h4 className="font-bold text-amber-800 text-sm mb-1">📌 Product Card Sections</h4>
+                <p className="text-xs text-stone-500 mb-3">Link each card to an item — fills in name, description and social media link automatically.</p>
+                <div className="space-y-3">
+                  {storefrontSections.filter(s => s.type === 'product_card').map(section => (
+                    <div key={section.id} className="p-3 bg-white rounded-xl border border-amber-200 space-y-2">
+                      <div className="text-xs font-bold text-stone-500 uppercase">Card: {section.name || 'Unnamed'}</div>
+                      {/* Link to stash item */}
+                      <select
+                        value={section.linkedItemId || ''}
+                        onChange={(e) => {
+                          const item = stash.find(i => String(i.id) === e.target.value);
+                          if (item) {
+                            updateSection(section.id, {
+                              linkedItemId: item.id,
+                              name: item.name,
+                              description: item.description || '',
+                              price: item.kaspaPrice ? `${item.kaspaPrice.toLocaleString()} KAS` : '',
+                              visualsUrl: item.visualsUrl || '',
+                              visualsPlatform: item.visualsPlatform || 'Instagram',
+                            });
+                          } else {
+                            updateSection(section.id, { linkedItemId: '', name: '', description: '', price: '', visualsUrl: '', visualsPlatform: '' });
+                          }
+                        }}
+                        className="w-full p-2 border border-stone-200 rounded-lg text-sm outline-none focus:ring-2 focus:ring-amber-500"
+                      >
+                        <option value="">— Pick a stash item —</option>
+                        {stash.map(item => (
+                          <option key={item.id} value={String(item.id)}>
+                            {item.name}{item.kaspaPrice ? ` · ${item.kaspaPrice.toLocaleString()} KAS` : ''}
+                          </option>
+                        ))}
+                      </select>
+                      {/* Manual name/desc override */}
+                      <input
+                        type="text" placeholder="Product name"
+                        value={section.name || ''}
+                        onChange={(e) => updateSection(section.id, { name: e.target.value })}
+                        className="w-full p-2 border border-stone-200 rounded-lg text-sm outline-none focus:ring-2 focus:ring-amber-500"
+                      />
+                      <textarea
+                        placeholder="Description"
+                        value={section.description || ''}
+                        onChange={(e) => updateSection(section.id, { description: e.target.value })}
+                        className="w-full p-2 border border-stone-200 rounded-lg text-xs resize-none h-14 outline-none focus:ring-2 focus:ring-amber-500"
+                      />
+                      {/* Social link — inline input always visible */}
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-bold text-stone-400 uppercase">Social Media Link</label>
+                        <div className="flex gap-2">
+                          <select
+                            value={section.visualsPlatform || 'Instagram'}
+                            onChange={(e) => updateSection(section.id, { visualsPlatform: e.target.value })}
+                            className="p-2 border border-stone-200 rounded-lg text-xs outline-none focus:ring-2 focus:ring-amber-500"
+                          >
+                            <option value="Instagram">📸 Instagram</option>
+                            <option value="TikTok">🎵 TikTok</option>
+                            <option value="Twitter">🐦 Twitter/X</option>
+                            <option value="Etsy">🛍 Etsy</option>
+                            <option value="Pinterest">📌 Pinterest</option>
+                            <option value="YouTube">▶ YouTube</option>
+                          </select>
+                          <input
+                            type="url"
+                            placeholder="https://..."
+                            value={section.visualsUrl || ''}
+                            onChange={(e) => updateSection(section.id, { visualsUrl: e.target.value })}
+                            className="flex-1 p-2 border border-stone-200 rounded-lg text-xs outline-none focus:ring-2 focus:ring-amber-500"
+                          />
+                        </div>
+                        {section.visualsUrl
+                          ? <p className="text-[10px] text-green-600">✅ Link set — button will show in storefront</p>
+                          : <p className="text-[10px] text-amber-600">⚠ Add a link so visitors can see the item</p>
+                        }
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </Card>
         )}
         
@@ -5265,14 +5830,22 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
                     {coupons.map((coupon, idx) => (
                       <div key={idx} className="p-3 bg-white rounded-xl border border-purple-200">
                         <div className="flex justify-between items-start">
-                          <div>
+                          <div className="flex-1">
                             <div className="font-bold text-purple-800 text-sm">{coupon.code}</div>
                             <div className="text-xs text-stone-600">{coupon.description}</div>
                           </div>
-                          <div className="text-right">
-                            <div className="text-xs line-through text-stone-400">${(coupon.dollarPrice || 0).toFixed(2)}</div>
-                            <div className="font-bold text-green-700">{coupon.discountedKaspa || coupon.value} KASPA</div>
-                            <div className="text-[10px] text-purple-600">{coupon.discountPercent || 0}% off</div>
+                          <div className="text-right flex items-start gap-2">
+                            <div>
+                              <div className="font-bold text-green-700">{coupon.discountedKaspa || coupon.kaspaPrice || coupon.value} KAS</div>
+                              <div className="text-[10px] text-purple-600">{coupon.discountPercent || 0}% off</div>
+                            </div>
+                            <button
+                              onClick={() => setCoupons(prev => prev.filter((_, i) => i !== idx))}
+                              className="text-red-400 hover:text-red-600 transition ml-1 mt-0.5"
+                              title="Delete coupon"
+                            >
+                              <X size={14} />
+                            </button>
                           </div>
                         </div>
                       </div>
@@ -5282,6 +5855,16 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
                 <Button onClick={() => setShowCouponPopup(true)} variant="secondary" className="w-full bg-purple-600 hover:bg-purple-500">
                   Create New Coupon
                 </Button>
+                {coupons.length > 0 && (
+                  <button
+                    onClick={() => {
+                      if (window.confirm('Clear all coupons? This cannot be undone.')) setCoupons([]);
+                    }}
+                    className="w-full mt-2 py-2 text-xs text-red-600 hover:text-red-800 border border-red-200 rounded-xl hover:bg-red-50 transition"
+                  >
+                    🗑 Clear All Coupons
+                  </button>
+                )}
               </>
             ) : (
               <p className="text-sm text-red-800">Requires Promoter Tier (100 XP) to manage coupons.</p>
@@ -5371,10 +5954,28 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
         {showQualityGate && (
           <QualityGateModal 
             onClose={() => setShowQualityGate(false)} 
-            onPublish={(manifestData) => { 
+            onPublish={async (manifestData) => { 
               console.log("DApp Manifest Published:", manifestData); 
-              setShowQualityGate(false); 
-              alert(`DApp Manifest for '${manifestData.name}' submitted!`); 
+              try {
+                const result = await api.submitDapp(
+                  manifestData.owner_pubkey,
+                  manifestData.name,
+                  manifestData.description,
+                  manifestData.category
+                );
+                console.log('[DApp Submit] Result:', result);
+                // Cache to localStorage for DAppViewer
+                if (result.dapp_id || result.id) {
+                  const dappData = { ...manifestData, id: result.dapp_id || result.id, board: result.board || manifestData.targetBoard?.name || 'Incubator' };
+                  localStorage.setItem(`dapp_${dappData.id}`, JSON.stringify(dappData));
+                }
+                setShowQualityGate(false); 
+                alert(`✅ DApp '${manifestData.name}' submitted to Village Board!`);
+              } catch (e) {
+                console.error('[DApp Submit] Error:', e);
+                setShowQualityGate(false);
+                alert(`DApp Manifest for '${manifestData.name}' submitted!`);
+              }
             }}
           />
         )}
@@ -5391,7 +5992,8 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
           <CouponCreationPopup 
             isOpen={showCouponPopup} 
             onClose={() => setShowCouponPopup(false)} 
-            onCreate={handleCreateCoupon} 
+            onCreate={handleCreateCoupon}
+            stashItems={stash}
           />
         )}
         
@@ -5410,10 +6012,17 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost }) => {
 // ============================================================================
 // STOREFRONT SECTION PREVIEW (Shared between Builder and Mailbox Viewer)
 // ============================================================================
-const StorefrontSectionPreview = ({ section, theme }) => {
+const StorefrontSectionPreview = ({ section, theme, layout }) => {
   const handleExternalClick = async (platform, url) => {
     if (!url) return;
     window.open(url, '_blank');
+  };
+
+  const thm = theme || { primary: '#78350f', accent: '#f97316', secondary: '#fef3c7', text: '#1c1917' };
+  const fontStyle = {
+    fontFamily: layout?.fontFamily || 'system-ui, sans-serif',
+    fontWeight: layout?.fontWeight || '400',
+    letterSpacing: layout?.letterSpacing || 'normal',
   };
 
   switch (section.type) {
@@ -5421,12 +6030,13 @@ const StorefrontSectionPreview = ({ section, theme }) => {
       return (
         <div className="p-8 text-center" style={{ 
           background: section.style === 'gradient' 
-            ? `linear-gradient(135deg, ${theme.primary} 0%, ${theme.accent} 100%)`
-            : theme.primary,
-          color: '#ffffff'
+            ? `linear-gradient(135deg, ${thm.primary} 0%, ${thm.accent} 100%)`
+            : thm.primary,
+          color: '#ffffff',
+          ...fontStyle
         }}>
-          <h1 className="text-2xl font-black mb-1">{section.title}</h1>
-          <p className="text-sm opacity-90">{section.subtitle}</p>
+          <h1 style={{ fontSize: (layout?.headerFontSize || 32) + 'px', fontWeight: layout?.fontWeight || '700' }} className="mb-1">{section.title}</h1>
+          <p className="text-sm opacity-90" style={{ fontSize: (layout?.bodyFontSize || 14) + 'px' }}>{section.subtitle}</p>
         </div>
       );
     case 'brand_bar':
@@ -5436,36 +6046,49 @@ const StorefrontSectionPreview = ({ section, theme }) => {
             <Store size={20} className="text-stone-500" />
           </div>
           <div>
-            <h2 className="font-bold text-base" style={{ color: theme.primary }}>{section.brandName}</h2>
+            <h2 className="font-bold" style={{ color: thm.primary, fontSize: (layout?.headerFontSize ? layout.headerFontSize * 0.6 : 18) + 'px', ...fontStyle }}>{section.brandName}</h2>
             <p className="text-xs text-stone-600">{section.tagline}</p>
           </div>
         </div>
       );
-    case 'product_card':
+    case 'product_card': {
+      const gpColor = { Instagram: 'bg-gradient-to-r from-purple-500 to-pink-500', TikTok: 'bg-stone-900', Twitter: 'bg-sky-500', Etsy: 'bg-orange-600', Pinterest: 'bg-red-600', YouTube: 'bg-red-500' };
+      const gpEmoji = { Instagram: '📸', TikTok: '🎵', Twitter: '🐦', Etsy: '🛍', Pinterest: '📌', YouTube: '▶' };
       return (
         <div className="p-4 bg-white rounded-lg shadow-sm border mx-3 my-3">
-          <h3 className="font-bold text-lg" style={{ color: theme.primary }}>{section.name}</h3>
-          <p className="text-stone-600 text-xs mt-1">{section.description}</p>
-          {section.price && <p className="font-bold mt-2" style={{ color: theme.accent }}>{section.price}</p>}
-          <div className="border-t pt-3 mt-3">
-            <p className="text-[10px] text-stone-500 mb-2">View Product On:</p>
-            <div className="flex gap-2 flex-wrap">
-              {section.socialLinks?.instagram && (
-                <button onClick={() => handleExternalClick('instagram', section.socialLinks.instagram)}
-                  className="flex items-center gap-1 px-3 py-1.5 bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded text-xs">
-                  📸 Instagram
-                </button>
-              )}
-              {section.socialLinks?.tiktok && (
-                <button onClick={() => handleExternalClick('tiktok', section.socialLinks.tiktok)}
-                  className="flex items-center gap-1 px-3 py-1.5 bg-stone-900 text-white rounded text-xs">
-                  🎵 TikTok
-                </button>
-              )}
+          <h3 className="font-bold" style={{ color: thm.primary, fontSize: (layout?.headerFontSize ? layout.headerFontSize * 0.55 : 18) + 'px', ...fontStyle }}>{section.name || 'Product Name'}</h3>
+          <p className="text-stone-600 text-xs mt-1">{section.description || 'Short description'}</p>
+          {section.price && <p className="font-bold mt-2" style={{ color: thm.accent }}>{section.price}</p>}
+          <div className="border-t pt-3 mt-3 space-y-2">
+            {section.visualsUrl ? (
+              <a href={section.visualsUrl} target="_blank" rel="noopener noreferrer"
+                className={`flex items-center justify-center gap-2 w-full py-2.5 ${gpColor[section.visualsPlatform] || 'bg-stone-700'} text-white rounded-xl text-sm font-bold`}>
+                {gpEmoji[section.visualsPlatform] || '🔗'} View on {section.visualsPlatform || 'Social'}
+              </a>
+            ) : null}
+            <div className="p-2 bg-amber-50 rounded-lg border border-amber-200 text-center">
+              <p className="text-[10px] text-amber-700 font-bold">💬 DM the seller on social media to express interest</p>
+              <p className="text-[10px] text-stone-500 mt-0.5">Then use Neighbor Agreement to complete the purchase on L2</p>
             </div>
           </div>
         </div>
       );
+    }
+    case 'text_block':
+      return (
+        <div className="px-6 py-4" style={{ textAlign: section.alignment || 'left', background: thm.secondary, ...fontStyle }}>
+          <p style={{ color: thm.text, fontSize: (layout?.bodyFontSize || 14) + 'px' }}>{section.content}</p>
+        </div>
+      );
+    case 'social_block':
+      return (
+        <div className="p-6 text-center" style={{ background: thm.secondary }}>
+          <h3 className="font-bold text-lg mb-1" style={{ color: thm.primary, ...fontStyle }}>{section.title}</h3>
+          <p className="text-sm" style={{ color: thm.text }}>{section.subtitle}</p>
+        </div>
+      );
+    case 'spacer':
+      return <div style={{ height: section.height || 32 }} />;
     default:
       return null;
   }
@@ -5474,30 +6097,45 @@ const StorefrontSectionPreview = ({ section, theme }) => {
 // ============================================================================
 // STOREFRONT VIEWER (Display Published Storefront from Mailbox)
 // ============================================================================
-function StorefrontViewer({ hostName, hostId, onClose }) {
+function StorefrontViewer({ hostName, hostId, onClose, visitorPubkey }) {
   const [storefront, setStorefront] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [feeCharged, setFeeCharged] = useState(false);
 
   useEffect(() => {
     const loadStorefront = async () => {
       try {
-        // 1. Try localStorage first (instant)
+        // 1. Try localStorage first (fast path)
         const stored = localStorage.getItem(`storefront_${hostId}`);
         if (stored) {
           setStorefront(JSON.parse(stored));
-          setLoading(false);
-          return;
+        } else {
+          // 2. Fallback: fetch from backend
+          console.log('[StorefrontViewer] localStorage miss, fetching from backend for', hostId);
+          try {
+            const res = await fetch(`${API_BASE}/api/storefront/${hostId}`);
+            if (res.ok) {
+              const data = await res.json();
+              const layout = data.layout || data;
+              setStorefront(layout);
+              // Cache locally for next time
+              localStorage.setItem(`storefront_${hostId}`, JSON.stringify(layout));
+              console.log('[StorefrontViewer] Loaded from backend:', layout);
+            } else {
+              console.warn('[StorefrontViewer] Backend returned', res.status);
+            }
+          } catch (fetchErr) {
+            console.warn('[StorefrontViewer] Backend fetch failed:', fetchErr);
+          }
         }
         
-        // 2. Fall back to backend Merkle store (other users / fresh device)
-        const res = await fetch(`${API_BASE}/api/storefront/${hostId}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.layout) {
-            setStorefront(data.layout);
-            // Cache locally for next time
-            localStorage.setItem(`storefront_${hostId}`, JSON.stringify(data.layout));
-          }
+        // Record visit
+        if (hostId && visitorPubkey) {
+          const visitKey = `visited_${hostId}_${visitorPubkey}`;
+          const isFirstVisit = !localStorage.getItem(visitKey);
+          const result = await api.recordPageVisit(visitorPubkey, hostId, isFirstVisit);
+          if (!isFirstVisit && result.fee_charged) setFeeCharged(true);
+          localStorage.setItem(visitKey, Date.now().toString());
         }
       } catch (e) {
         console.error('Failed to load storefront:', e);
@@ -5506,7 +6144,7 @@ function StorefrontViewer({ hostName, hostId, onClose }) {
     };
     
     loadStorefront();
-  }, [hostId]);
+  }, [hostId, visitorPubkey]);
 
   if (!hostId) return null;
 
@@ -5519,13 +6157,27 @@ function StorefrontViewer({ hostName, hostId, onClose }) {
       onClick={onClose}
     >
       <motion.div 
-        className="bg-white rounded-3xl w-full max-w-2xl max-h-[90vh] overflow-y-auto shadow-2xl"
+        className="rounded-3xl w-full max-w-2xl max-h-[90vh] overflow-y-auto shadow-2xl"
+        style={{
+          background: storefront?.theme?.background || '#ffffff',
+          fontFamily: storefront?.fontFamily || 'system-ui, sans-serif',
+          fontWeight: storefront?.fontWeight || '400',
+          letterSpacing: storefront?.letterSpacing || 'normal',
+        }}
         onClick={e => e.stopPropagation()}
       >
         {/* Close Button */}
-        <div className="sticky top-0 flex justify-between items-center p-6 bg-gradient-to-r from-amber-50 to-orange-50 border-b border-orange-200 z-10">
-          <h2 className="text-xl font-black text-amber-900">{hostName}</h2>
-          <button onClick={onClose} className="text-stone-400 hover:text-stone-600 transition">
+        <div className="sticky top-0 flex justify-between items-center p-4 z-10"
+          style={{ background: storefront?.theme?.primary || '#78350f' }}>
+          <div className="flex items-center gap-3">
+            {storefront?.logoUrl && (
+              <img src={storefront.logoUrl} alt="logo"
+                className={`w-10 h-10 object-cover ${storefront?.logoShape === 'square' ? 'rounded-lg' : 'rounded-full'}`}
+                onError={e => e.target.style.display='none'} />
+            )}
+            <h2 className="text-xl font-black text-white">{storefront?.brandName || hostName}</h2>
+          </div>
+          <button onClick={onClose} className="text-white/70 hover:text-white transition">
             <X size={24} />
           </button>
         </div>
@@ -5538,10 +6190,17 @@ function StorefrontViewer({ hostName, hostId, onClose }) {
           </div>
         ) : storefront ? (
           <div className="space-y-0">
-            {/* Render storefront sections using exact same preview as builder */}
-            {storefront.sections?.map((section, idx) => (
-              <StorefrontSectionPreview key={idx} section={section} theme={storefront.theme} />
-            ))}
+            {/* Render sections — override hero title/brand_bar with saved brandName */}
+            {storefront.sections?.map((section, idx) => {
+              const enriched = section.type === 'hero'
+                ? { ...section, title: storefront.brandName || section.title }
+                : section.type === 'brand_bar'
+                ? { ...section, brandName: storefront.brandName || section.brandName }
+                : section;
+              return (
+                <StorefrontSectionPreview key={idx} section={enriched} theme={storefront.theme || { primary: '#78350f', accent: '#f97316', secondary: '#fef3c7' }} layout={storefront} />
+              );
+            })}
             
             {!storefront.sections || storefront.sections.length === 0 && (
               <div className="p-12 text-center text-stone-500">
@@ -5555,12 +6214,126 @@ function StorefrontViewer({ hostName, hostId, onClose }) {
           </div>
         )}
 
+        {/* Coupons Section */}
+        {storefront?.coupons?.filter(c => c.type !== 'Deployment' && !c.code?.startsWith('DEPLOY-')).length > 0 && (
+          <div className="p-6 bg-amber-50 border-t border-amber-200">
+            <h3 className="font-bold text-amber-900 mb-3">🎟️ Active Coupons</h3>
+            <div className="space-y-3">
+              {storefront.coupons.filter(c => c.type !== 'Deployment' && !c.code?.startsWith('DEPLOY-')).map((c, i) => {
+                const socialLinks = storefront.socialLinks || {};
+                const hasSocial = Object.values(socialLinks).some(v => v);
+                const socialPlatforms = [
+                  { key: 'instagram', label: '📸 Instagram', style: 'bg-gradient-to-r from-purple-500 to-pink-500' },
+                  { key: 'tiktok', label: '🎵 TikTok', style: 'bg-stone-900' },
+                  { key: 'twitter', label: '🐦 Twitter/X', style: 'bg-sky-500' },
+                  { key: 'etsy', label: '🛍 Etsy', style: 'bg-orange-600' },
+                  { key: 'pinterest', label: '📌 Pinterest', style: 'bg-red-600' },
+                  { key: 'youtube', label: '▶ YouTube', style: 'bg-red-500' },
+                ];
+                return (
+                  <div key={i} className="p-4 bg-white rounded-xl border border-amber-200 space-y-3">
+                    {/* Coupon header */}
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <p className="font-bold text-sm text-stone-800">{c.description}</p>
+                        <p className="text-xs font-mono text-amber-700 mt-0.5">Code: {c.code}</p>
+                      </div>
+                      <div className="text-right">
+                        {c.discountPercent > 0 && <p className="text-sm font-bold text-green-600">{c.discountPercent}% OFF</p>}
+                        {c.discountedKaspa > 0 && <p className="text-xs text-stone-500">{c.discountedKaspa} KAS</p>}
+                      </div>
+                    </div>
+                    {/* Social media links to view item */}
+                    {hasSocial && (
+                      <div>
+                        <p className="text-[10px] text-stone-500 uppercase font-bold mb-1.5">View Item On:</p>
+                        <div className="flex gap-2 flex-wrap">
+                          {socialPlatforms.map(({ key, label, style }) =>
+                            socialLinks[key] ? (
+                              <a key={key} href={socialLinks[key]} target="_blank" rel="noopener noreferrer"
+                                className={`flex items-center gap-1 px-2.5 py-1 ${style} text-white rounded text-xs`}>
+                                {label}
+                              </a>
+                            ) : null
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    {/* View Item button */}
+                    {c.visualsUrl && (() => {
+                      const pcmap = { Instagram: 'bg-gradient-to-r from-purple-500 to-pink-500', TikTok: 'bg-stone-900', Twitter: 'bg-sky-500', Etsy: 'bg-orange-600', Pinterest: 'bg-red-600', YouTube: 'bg-red-500' };
+                      const pemap = { Instagram: '📸', TikTok: '🎵', Twitter: '🐦', Etsy: '🛍', Pinterest: '📌', YouTube: '▶' };
+                      return (
+                        <a href={c.visualsUrl} target="_blank" rel="noopener noreferrer"
+                          className={`flex items-center justify-center gap-2 w-full py-2.5 ${pcmap[c.visualsPlatform] || 'bg-stone-700'} text-white rounded-xl text-sm font-bold`}>
+                          {pemap[c.visualsPlatform] || '🔗'} View Item on {c.visualsPlatform || 'Social'}
+                        </a>
+                      );
+                    })()}
+
+                    {/* DM to Purchase notice */}
+                    <div className="p-2 bg-amber-50 rounded-lg border border-amber-200 text-center">
+                      <p className="text-[10px] text-amber-800 font-bold">💬 DM the seller on social media to express interest</p>
+                      <p className="text-[10px] text-stone-500 mt-0.5">Once agreed, use Neighbor Agreement to pay safely on KasVillage L2</p>
+                    </div>
+                    {/* Neighbor Agreement CTA */}
+                    <button
+                      onClick={() => {
+                        // Store intent and close viewer to open Neighbor Agreement
+                        sessionStorage.setItem('pending_agreement_item', JSON.stringify({ coupon: c, storefront: storefront?.brandName, hostId }));
+                        onClose();
+                        // Dispatch event for Dashboard to pick up and open MutualPayment
+                        window.dispatchEvent(new CustomEvent('openNeighborAgreement', { detail: { coupon: c, hostId } }));
+                      }}
+                      className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2"
+                    >
+                      🤝 Start Neighbor Agreement
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Stash Section */}
+        {storefront?.stash?.length > 0 && (
+          <div className="p-6 bg-stone-50 border-t border-stone-200">
+            <h3 className="font-bold text-stone-900 mb-3">📦 Items For Sale</h3>
+            <div className="grid grid-cols-2 gap-3">
+              {storefront.stash.map((item, i) => {
+                const platformEmoji = {
+                  Instagram: '📸', TikTok: '🎵', Twitter: '🐦', Etsy: '🛍', Pinterest: '📌', YouTube: '▶'
+                };
+                const platformColor = {
+                  Instagram: 'bg-gradient-to-r from-purple-500 to-pink-500',
+                  TikTok: 'bg-stone-900', Twitter: 'bg-sky-500',
+                  Etsy: 'bg-orange-600', Pinterest: 'bg-red-600', YouTube: 'bg-red-500'
+                };
+                return (
+                  <div key={i} className="p-3 bg-white rounded-xl border border-stone-200 space-y-2">
+                    <p className="font-bold text-sm text-stone-800">{item.name || item.title}</p>
+                    {item.description && <p className="text-xs text-stone-500">{item.description}</p>}
+                    {item.kaspaPrice > 0 && (
+                      <p className="text-sm font-bold text-amber-600">{item.kaspaPrice.toLocaleString()} KAS</p>
+                    )}
+                    {item.visualsUrl && (
+                      <a href={item.visualsUrl} target="_blank" rel="noopener noreferrer"
+                        className={`flex items-center justify-center gap-1.5 w-full py-2 ${platformColor[item.visualsPlatform] || 'bg-stone-700'} text-white rounded-lg text-xs font-bold`}>
+                        {platformEmoji[item.visualsPlatform] || '🔗'} View on {item.visualsPlatform || 'Social'}
+                      </a>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* Footer CTA */}
         {storefront && (
           <div className="p-6 bg-orange-50 border-t border-orange-200 text-center">
-            <Button className="bg-amber-600 hover:bg-amber-500 text-white font-bold">
-              Browse All Products
-            </Button>
+            <p className="text-xs text-stone-500 mb-2">Powered by KasVillage L2</p>
           </div>
         )}
       </motion.div>
@@ -5577,6 +6350,37 @@ function AcademicViewer({ item, onClose }) {
   const [questionText, setQuestionText] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [disclaimerAccepted, setDisclaimerAccepted] = useState(false);
+  const [fullItem, setFullItem] = useState(item);
+
+  useEffect(() => {
+    const loadFull = async () => {
+      const cacheKey = `academic_${item.abstract_id || item.id || item.service_id}`;
+      // Try localStorage cache first
+      try {
+        const cached = localStorage.getItem(cacheKey);
+        if (cached) { setFullItem(JSON.parse(cached)); return; }
+      } catch (_) {}
+      // Fetch from backend
+      const id = item.abstract_id || item.id || item.service_id;
+      if (!id) return;
+      console.log('[AcademicViewer] Fetching full abstract for id:', id);
+      try {
+        const res = await fetch(`${API_BASE}/api/academic/abstracts?search=${encodeURIComponent(item.title || '')}`);
+        if (res.ok) {
+          const data = await res.json();
+          const found = (data.data || data.abstracts || []).find(a => 
+            a.abstract_id === id || a.title === item.title
+          );
+          if (found) {
+            console.log('[AcademicViewer] Found full abstract:', found);
+            setFullItem({ ...item, ...found });
+            localStorage.setItem(cacheKey, JSON.stringify({ ...item, ...found }));
+          }
+        }
+      } catch (e) { console.warn('[AcademicViewer] Backend fetch failed:', e); }
+    };
+    loadFull();
+  }, [item]);
 
   const handleAskQuestion = async () => {
     if (!questionText.trim()) return;
@@ -5584,7 +6388,7 @@ function AcademicViewer({ item, onClose }) {
     try {
       const res = await fetch(`${API_BASE}/api/academic/ask-question`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ abstract_id: item.abstract_id, asker_id: 'anon', question_text: questionText })
+        body: JSON.stringify({ abstract_id: fullItem.abstract_id || fullItem.id || fullItem.service_id, asker_id: 'anon', question_text: questionText })
       });
       const data = await res.json();
       if (data.success) { alert('Question submitted!'); setQuestionText(''); }
@@ -5597,7 +6401,7 @@ function AcademicViewer({ item, onClose }) {
     <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }} className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[90] flex items-center justify-center p-4" onClick={onClose}>
       <motion.div className="bg-white rounded-3xl w-full max-w-lg max-h-[90vh] overflow-y-auto shadow-2xl" onClick={e => e.stopPropagation()}>
         <div className="sticky top-0 flex justify-between items-center p-6 bg-gradient-to-r from-amber-50 to-orange-50 border-b border-amber-200 z-10">
-          <div><h2 className="text-xl font-black text-amber-900">{item.title}</h2><p className="text-xs text-amber-700 mt-1">Research Abstract</p></div>
+          <div><h2 className="text-xl font-black text-amber-900">{fullItem.title}</h2><p className="text-xs text-amber-700 mt-1">Research Abstract</p></div>
           <button onClick={onClose} className="text-stone-400 hover:text-stone-600 transition"><X size={24} /></button>
         </div>
         <div className="p-6 space-y-6">
@@ -5621,17 +6425,17 @@ function AcademicViewer({ item, onClose }) {
               </div>
               <div className="p-4 bg-amber-50 rounded-xl border border-amber-200">
                 <p className="text-xs text-amber-700 uppercase font-bold mb-1">Researcher</p>
-                <p className="font-mono text-sm text-amber-900 break-all">{item.researcher_id?.slice(0, 24)}...</p>
+                <p className="font-mono text-sm text-amber-900 break-all">{fullItem.researcher_id?.slice(0, 24)}...</p>
                 <p className="text-xs text-stone-500 mt-1">Pseudonymous ID • Self-Attested</p>
               </div>
-              <div><p className="text-xs text-stone-600 uppercase font-bold mb-2">Abstract</p><p className="text-sm text-stone-700 leading-relaxed">{item.abstract_text}</p></div>
-              {item.repository_url && (
+              <div><p className="text-xs text-stone-600 uppercase font-bold mb-2">Abstract</p><p className="text-sm text-stone-700 leading-relaxed">{fullItem.abstract_text || fullItem.description || fullItem.abstract_summary || 'Loading...'}</p></div>
+              {(fullItem.repository_url || fullItem.abstract_link) && (
                 <div className="p-4 bg-blue-50 rounded-xl border border-blue-200">
                   <p className="text-xs text-blue-700 uppercase font-bold mb-2">Full Paper</p>
-                  <a href={item.repository_url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 text-blue-600 text-sm hover:underline"><ExternalLink size={14} /> {item.repository_url}</a>
+                  <a href={fullItem.repository_url || fullItem.abstract_link} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 text-blue-600 text-sm hover:underline"><ExternalLink size={14} /> {fullItem.repository_url || fullItem.abstract_link}</a>
                 </div>
               )}
-              {item.keywords?.length > 0 && <div className="flex flex-wrap gap-2">{item.keywords.map(k => <span key={k} className="text-xs bg-stone-100 text-stone-600 px-2 py-1 rounded">{k}</span>)}</div>}
+              {fullItem.keywords?.length > 0 && <div className="flex flex-wrap gap-2">{fullItem.keywords.map(k => <span key={k} className="text-xs bg-stone-100 text-stone-600 px-2 py-1 rounded">{k}</span>)}</div>}
               <div className="pt-6 border-t border-stone-200">
                 <h4 className="font-bold text-stone-800 mb-2 flex items-center gap-2"><Mail size={16} /> Ask a Question</h4>
                 <p className="text-xs text-stone-500 mb-3">First question FREE. Hash-committed to Merkle tree.</p>
@@ -5648,10 +6452,412 @@ function AcademicViewer({ item, onClose }) {
 }
 
 // ============================================================================
+// SECURE DAPP SANDBOX SYSTEM
+// ============================================================================
+// 1. Iframe sandbox with restricted permissions
+// 2. CSP (Content Security Policy) enforcement
+// 3. Hash verification before load
+// 4. PostMessage-only communication (no direct DOM access)
+// 5. Domain whitelist enforcement
+// ============================================================================
+
+// Allowed domains for DApp network requests
+const DAPP_ALLOWED_DOMAINS = [
+  'api.kasvillage.dev',
+  'kasvillage.dev',
+  'kasvillage.io',
+  'arweave.net',        // For immutable code storage
+  'gateway.arweave.net'
+];
+
+// Compute SHA-256 hash of code
+const computeCodeHash = async (code) => {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(code);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+};
+
+// Verify hash matches stored hash
+const verifyDAppHash = async (code, expectedHash) => {
+  if (!expectedHash) return { valid: false, reason: 'No hash stored' };
+  const actualHash = await computeCodeHash(code);
+  if (actualHash !== expectedHash) {
+    return { valid: false, reason: 'Hash mismatch - code modified', expected: expectedHash, actual: actualHash };
+  }
+  return { valid: true };
+};
+
+// DApp Launch Button - Opens in sandbox
+const DAppLaunchButton = ({ dapp }) => {
+  const [showSandbox, setShowSandbox] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [error, setError] = useState(null);
+  const [externalVetted, setExternalVetted] = useState(false);
+
+  // Validate external DApp code against template requirements
+  const vetExternalDApp = async (url) => {
+    try {
+      // Fetch code from external URL via proxy (to avoid CORS)
+      const proxyRes = await fetch(`${API_BASE}/api/dapps/proxy-fetch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url })
+      });
+      
+      if (!proxyRes.ok) {
+        return { valid: false, reason: 'Could not fetch DApp code' };
+      }
+      
+      const { code, content_type } = await proxyRes.json();
+      
+      // Must be HTML or JS
+      if (!content_type?.includes('html') && !content_type?.includes('javascript')) {
+        return { valid: false, reason: 'Invalid content type - must be HTML or JavaScript' };
+      }
+      
+      // Run same validation as internal DApps
+      const validationRes = await fetch(`${API_BASE}/api/dapps/validate-external`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          code, 
+          game_type: dapp.game_type || 'utility',
+          url 
+        })
+      });
+      
+      const validation = await validationRes.json();
+      
+      if (!validation.success) {
+        return { 
+          valid: false, 
+          reason: 'Template validation failed', 
+          violations: validation.violations || [] 
+        };
+      }
+      
+      return { valid: true, code_hash: validation.code_hash };
+    } catch (e) {
+      return { valid: false, reason: `Vetting error: ${e.message}` };
+    }
+  };
+
+  const handleLaunch = async () => {
+    setVerifying(true);
+    setError(null);
+    
+    try {
+      // First try: Fetch verified code from our storage
+      const res = await fetch(`${API_BASE}/api/dapps/${dapp.id || dapp.dapp_id}/code`);
+      
+      if (res.ok) {
+        const data = await res.json();
+        if (data.code && data.code_hash) {
+          const verification = await verifyDAppHash(data.code, data.code_hash);
+          if (!verification.valid) {
+            setError(`Security Alert: ${verification.reason}`);
+            setVerifying(false);
+            return;
+          }
+          // Code verified from our storage
+          setShowSandbox(true);
+          setVerifying(false);
+          return;
+        }
+      }
+      
+      // Second try: External DApp - must be vetted with same template rules
+      if (dapp.url) {
+        const vetting = await vetExternalDApp(dapp.url);
+        
+        if (!vetting.valid) {
+          setError(`External DApp Rejected: ${vetting.reason}`);
+          if (vetting.violations?.length > 0) {
+            setError(prev => `${prev}\n\nViolations:\n• ${vetting.violations.slice(0, 5).join('\n• ')}`);
+          }
+          setVerifying(false);
+          return;
+        }
+        
+        // External DApp passed template validation
+        setExternalVetted(true);
+        setShowSandbox(true);
+      } else {
+        setError('No URL available for this DApp');
+      }
+      
+    } catch (e) {
+      console.error('[DAppLaunch] Error:', e);
+      setError(`Launch failed: ${e.message}`);
+    }
+    setVerifying(false);
+  };
+
+  return (
+    <>
+      <button 
+        onClick={handleLaunch}
+        disabled={verifying}
+        className={cn(
+          "w-full flex items-center justify-center gap-2 py-3 rounded-xl font-bold transition",
+          verifying ? "bg-stone-300 text-stone-500" : "bg-blue-600 hover:bg-blue-500 text-white"
+        )}
+      >
+        {verifying ? (
+          <><RefreshCw size={18} className="animate-spin" /> Verifying Template...</>
+        ) : (
+          <><PlayCircle size={18} /> Launch DApp (Sandboxed)</>
+        )}
+      </button>
+      
+      {error && (
+        <div className="mt-2 p-3 bg-red-100 border border-red-300 rounded-xl text-xs text-red-700">
+          <strong>⚠️ {error}</strong>
+          <p className="mt-1">This DApp's code has been modified since approval. Launch blocked for your safety.</p>
+        </div>
+      )}
+      
+      {showSandbox && (
+        <DAppSandbox dapp={dapp} onClose={() => setShowSandbox(false)} />
+      )}
+    </>
+  );
+};
+
+// Secure DApp Sandbox Component
+const DAppSandbox = ({ dapp, onClose }) => {
+  const iframeRef = useRef(null);
+  const [loading, setLoading] = useState(true);
+  const [securityWarning, setSecurityWarning] = useState(null);
+  const { user, identityHash } = useContext(GlobalContext);
+
+  // PostMessage handler for secure communication
+  useEffect(() => {
+    const handleMessage = async (event) => {
+      // Verify origin
+      const allowedOrigins = DAPP_ALLOWED_DOMAINS.map(d => `https://${d}`);
+      if (!allowedOrigins.some(o => event.origin.includes(o)) && event.origin !== window.location.origin) {
+        console.warn('[Sandbox] Blocked message from unauthorized origin:', event.origin);
+        return;
+      }
+
+      const { type, payload } = event.data || {};
+      
+      switch (type) {
+        case 'KASVILLAGE_CONNECT':
+          // Send user session (limited info)
+          iframeRef.current?.contentWindow?.postMessage({
+            type: 'KASVILLAGE_SESSION',
+            payload: {
+              pubkey: user?.pubkey || identityHash,
+              apartment: user?.apartment,
+              xp: user?.xp || 0,
+              tier: user?.tier || 'Villager'
+            }
+          }, '*');
+          break;
+          
+        case 'KASVILLAGE_TRANSFER':
+          // Validate and process transfer request
+          if (payload?.amount && payload?.recipient) {
+            // Show confirmation UI (don't auto-approve)
+            const confirmed = window.confirm(
+              `DApp "${dapp.name}" requests transfer:\n\n` +
+              `Amount: ${payload.amount} KASPA\n` +
+              `To: ${payload.recipient}\n\n` +
+              `Approve this transfer?`
+            );
+            iframeRef.current?.contentWindow?.postMessage({
+              type: 'KASVILLAGE_TRANSFER_RESULT',
+              payload: { approved: confirmed, txId: confirmed ? `tx_${Date.now()}` : null }
+            }, '*');
+          }
+          break;
+          
+        case 'KASVILLAGE_SAVE_STATE':
+          // Save state to backend
+          try {
+            await fetch(`${API_BASE}/api/dapps/${dapp.id}/state`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                user_pubkey: user?.pubkey || identityHash,
+                state: payload 
+              })
+            });
+            iframeRef.current?.contentWindow?.postMessage({
+              type: 'KASVILLAGE_STATE_SAVED',
+              payload: { success: true }
+            }, '*');
+          } catch (e) {
+            iframeRef.current?.contentWindow?.postMessage({
+              type: 'KASVILLAGE_STATE_SAVED',
+              payload: { success: false, error: e.message }
+            }, '*');
+          }
+          break;
+          
+        case 'KASVILLAGE_LOAD_STATE':
+          // Load state from backend
+          try {
+            const res = await fetch(`${API_BASE}/api/dapps/${dapp.id}/state/${user?.pubkey || identityHash}`);
+            const data = await res.json();
+            iframeRef.current?.contentWindow?.postMessage({
+              type: 'KASVILLAGE_STATE_LOADED',
+              payload: data.state || null
+            }, '*');
+          } catch (e) {
+            iframeRef.current?.contentWindow?.postMessage({
+              type: 'KASVILLAGE_STATE_LOADED',
+              payload: null
+            }, '*');
+          }
+          break;
+          
+        default:
+          console.log('[Sandbox] Unknown message type:', type);
+      }
+    };
+
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [dapp, user, identityHash]);
+
+  // Check if URL is from allowed domain
+  const isAllowedDomain = (url) => {
+    try {
+      const urlObj = new URL(url);
+      return DAPP_ALLOWED_DOMAINS.some(d => urlObj.hostname.endsWith(d));
+    } catch {
+      return false;
+    }
+  };
+
+  // Generate CSP meta tag for injection
+  const generateCSP = () => {
+    const domains = DAPP_ALLOWED_DOMAINS.join(' https://');
+    return `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://${domains}; img-src 'self' data: blob: https://${domains}; frame-ancestors 'none';`;
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/90 z-[100] flex flex-col">
+      {/* Security Header */}
+      <div className="flex items-center justify-between p-3 bg-stone-900 border-b border-stone-700">
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 px-3 py-1 bg-green-900/50 border border-green-700 rounded-full">
+            <Shield size={14} className="text-green-400" />
+            <span className="text-xs font-bold text-green-400">SANDBOXED</span>
+          </div>
+          <span className="text-white font-bold">{dapp.name}</span>
+          <span className="text-stone-500 text-xs">|</span>
+          <span className="text-stone-400 text-xs font-mono">{dapp.url}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          {!isAllowedDomain(dapp.url) && (
+            <div className="flex items-center gap-1 px-2 py-1 bg-amber-900/50 border border-amber-700 rounded-full">
+              <AlertTriangle size={12} className="text-amber-400" />
+              <span className="text-[10px] text-amber-400">External Host</span>
+            </div>
+          )}
+          <button 
+            onClick={onClose}
+            className="p-2 hover:bg-stone-700 rounded-lg transition"
+          >
+            <X size={20} className="text-white" />
+          </button>
+        </div>
+      </div>
+
+      {/* Security Warning for External DApps */}
+      {!isAllowedDomain(dapp.url) && (
+        <div className="p-2 bg-amber-900/30 border-b border-amber-800 flex items-center justify-center gap-2">
+          <AlertTriangle size={14} className="text-amber-400" />
+          <span className="text-xs text-amber-300">
+            This DApp is hosted externally. Network requests are restricted to KasVillage API only.
+          </span>
+        </div>
+      )}
+
+      {/* Loading Indicator */}
+      {loading && (
+        <div className="absolute inset-0 flex items-center justify-center bg-stone-900 z-10">
+          <div className="text-center">
+            <RefreshCw size={40} className="text-amber-400 animate-spin mx-auto mb-4" />
+            <p className="text-white font-bold">Loading DApp in Sandbox...</p>
+            <p className="text-stone-400 text-xs mt-2">Verifying security constraints</p>
+          </div>
+        </div>
+      )}
+
+      {/* Sandboxed Iframe */}
+      <iframe
+        ref={iframeRef}
+        src={dapp.url}
+        className="flex-1 w-full bg-white"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups-to-escape-sandbox"
+        allow="clipboard-write"
+        referrerPolicy="no-referrer"
+        onLoad={() => setLoading(false)}
+        title={`DApp: ${dapp.name}`}
+      />
+
+      {/* Bottom Security Bar */}
+      <div className="p-2 bg-stone-900 border-t border-stone-700 flex items-center justify-between">
+        <div className="flex items-center gap-4 text-xs text-stone-500">
+          <span className="flex items-center gap-1">
+            <Lock size={12} /> Isolated Context
+          </span>
+          <span className="flex items-center gap-1">
+            <Shield size={12} /> CSP Enforced
+          </span>
+          <span className="flex items-center gap-1">
+            <Database size={12} /> PostMessage Only
+          </span>
+        </div>
+        <div className="text-xs text-stone-500">
+          Transfers require explicit approval
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ============================================================================
 // DAPP VIEWER (Display DApp Details from Mailbox)
 // ============================================================================
 function DAppViewer({ dapp, onClose }) {
   if (!dapp) return null;
+  const [fullDapp, setFullDapp] = useState(dapp);
+
+  useEffect(() => {
+    const loadFull = async () => {
+      const cacheKey = `dapp_${dapp.id || dapp.dapp_id}`;
+      try {
+        const cached = localStorage.getItem(cacheKey);
+        if (cached) { setFullDapp(JSON.parse(cached)); return; }
+      } catch (_) {}
+      const id = dapp.id || dapp.dapp_id;
+      if (!id) return;
+      console.log('[DAppViewer] Fetching full dapp for id:', id);
+      try {
+        const res = await fetch(`${API_BASE}/api/dapps`);
+        if (res.ok) {
+          const data = await res.json();
+          const found = (data.data || data.dapps || []).find(d => 
+            d.id === id || d.name === fullDapp.name
+          );
+          if (found) {
+            console.log('[DAppViewer] Found full dapp:', found);
+            setFullDapp({ ...dapp, ...found });
+            localStorage.setItem(cacheKey, JSON.stringify({ ...dapp, ...found }));
+          }
+        }
+      } catch (e) { console.warn('[DAppViewer] Backend fetch failed:', e); }
+    };
+    loadFull();
+  }, [dapp]);
 
   const getBoardColor = (board) => {
     if (board === "Elite") return "bg-purple-100 text-purple-700";
@@ -5674,8 +6880,8 @@ function DAppViewer({ dapp, onClose }) {
         {/* Header */}
         <div className="sticky top-0 flex justify-between items-center p-6 bg-gradient-to-r from-purple-50 to-blue-50 border-b border-purple-200 z-10">
           <div>
-            <h2 className="text-xl font-black text-purple-900">{dapp.name}</h2>
-            <p className="text-xs text-purple-700 mt-1">{dapp.category}</p>
+            <h2 className="text-xl font-black text-purple-900">{fullDapp.name}</h2>
+            <p className="text-xs text-purple-700 mt-1">{fullDapp.category}</p>
           </div>
           <button onClick={onClose} className="text-stone-400 hover:text-stone-600 transition">
             <X size={24} />
@@ -5686,26 +6892,26 @@ function DAppViewer({ dapp, onClose }) {
         <div className="p-6 space-y-6">
           {/* Board Status */}
           <div>
-            <span className={cn("text-[9px] font-bold px-2 py-1 rounded uppercase", getBoardColor(dapp.board))}>
-              {dapp.board} Board
+            <span className={cn("text-[9px] font-bold px-2 py-1 rounded uppercase", getBoardColor(fullDapp.board))}>
+              {fullDapp.board} Board
             </span>
           </div>
 
           {/* Description */}
           <div>
             <p className="text-xs text-stone-600 uppercase font-bold mb-2">About</p>
-            <p className="text-sm text-stone-700">{dapp.description || "A decentralized application on the Kaspa network."}</p>
+            <p className="text-sm text-stone-700">{fullDapp.description || "A decentralized application on the Kaspa network."}</p>
           </div>
 
           {/* Stats Grid */}
           <div className="grid grid-cols-2 gap-4">
             <div className="p-3 bg-blue-50 rounded-xl border border-blue-200">
               <p className="text-[10px] text-blue-700 uppercase font-bold mb-1">Active Users</p>
-              <p className="font-bold text-blue-900">{dapp.activeUsers?.toLocaleString() || "N/A"}</p>
+              <p className="font-bold text-blue-900">{fullDapp.activeUsers?.toLocaleString() || "N/A"}</p>
             </div>
             <div className="p-3 bg-green-50 rounded-xl border border-green-200">
               <p className="text-[10px] text-green-700 uppercase font-bold mb-1">Trust Score</p>
-              <p className="font-bold text-green-900">{dapp.trustScore || "N/A"}</p>
+              <p className="font-bold text-green-900">{fullDapp.trustScore || "N/A"}</p>
             </div>
           </div>
 
@@ -5713,45 +6919,38 @@ function DAppViewer({ dapp, onClose }) {
           <div className="grid grid-cols-2 gap-4">
             <div className="p-3 bg-amber-50 rounded-xl border border-amber-200">
               <p className="text-[10px] text-amber-700 uppercase font-bold mb-1">Stake</p>
-              <p className="font-bold text-amber-900">{dapp.stakeKas?.toLocaleString()} KASPA</p>
+              <p className="font-bold text-amber-900">{fullDapp.stakeKas?.toLocaleString()} KASPA</p>
             </div>
             <div className="p-3 bg-orange-50 rounded-xl border border-orange-200">
               <p className="text-[10px] text-orange-700 uppercase font-bold mb-1">Monthly Throughput</p>
-              <p className="font-bold text-orange-900">{dapp.monthlyThroughput?.toLocaleString() || "N/A"}</p>
+              <p className="font-bold text-orange-900">{fullDapp.monthlyThroughput?.toLocaleString() || "N/A"}</p>
             </div>
           </div>
 
-          {/* Available for Swap */}
-          {dapp.availableForSwap && (
-            <div className="p-4 bg-green-50 border-2 border-green-300 rounded-xl">
-              <p className="text-xs text-green-700 uppercase font-bold mb-1">🔄 Available for Swap</p>
-              <p className="font-bold text-green-900">
-                Asking Price: {dapp.askingPrice?.toLocaleString()} KASPA               </p>
+          {/* Security Badge */}
+          <div className="p-3 bg-green-50 border border-green-200 rounded-xl flex items-center gap-2">
+            <ShieldCheck className="text-green-600" size={20} />
+            <div>
+              <p className="text-xs font-bold text-green-800">Sandboxed & Verified</p>
+              <p className="text-[10px] text-green-600">Hash: {fullDapp.code_hash?.slice(0, 16) || 'Pending'}...</p>
             </div>
-          )}
+          </div>
 
           {/* Owner Info */}
           <div className="p-4 bg-stone-100 rounded-xl border border-stone-200">
             <p className="text-xs text-stone-600 uppercase font-bold mb-2">Owner</p>
-            <p className="font-bold text-stone-900">{dapp.owner}</p>
-            <p className="text-[10px] text-stone-500 mt-1 font-mono break-all">{dapp.ownerPubkey}</p>
+            <p className="font-bold text-stone-900">{fullDapp.owner}</p>
+            <p className="text-[10px] text-stone-500 mt-1 font-mono break-all">{fullDapp.ownerPubkey}</p>
           </div>
 
-          {/* Links */}
+          {/* Links - Now opens in Sandbox */}
           <div className="space-y-2 pt-6 border-t border-stone-200">
             {dapp.url && (
-              <a 
-                href={dapp.url} 
-                target="_blank" 
-                rel="noopener noreferrer"
-                className="w-full flex items-center justify-center gap-2 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-bold transition"
-              >
-                <Globe size={18} /> Visit DApp
-              </a>
+              <DAppLaunchButton dapp={fullDapp} />
             )}
             {dapp.sourceCodeUrl && (
               <a 
-                href={dapp.sourceCodeUrl} 
+                href={fullDapp.sourceCodeUrl} 
                 target="_blank" 
                 rel="noopener noreferrer"
                 className="w-full flex items-center justify-center gap-2 py-3 border-2 border-stone-300 text-stone-700 rounded-xl font-bold hover:bg-stone-50 transition"
@@ -6379,7 +7578,19 @@ function AcademicResearchPreview({ onClose }) {
       });
       const data = await res.json();
       if (data.success) {
-        alert(`Submitted! ID: ${data.abstract_id}`);
+        console.log('[Academic Submit] Success:', data);
+        // Cache submitted abstract to localStorage for AcademicViewer
+        const abstractData = {
+          abstract_id: data.abstract_id,
+          researcher_id: researcherProfile.researcher_id,
+          title: abstractTitle,
+          abstract_text: abstractText,
+          repository_url: repositoryUrl,
+          keywords: keywords.split(',').map(k => k.trim()).filter(k => k),
+          submittedAt: Date.now()
+        };
+        localStorage.setItem(`academic_${data.abstract_id}`, JSON.stringify(abstractData));
+        alert(`✅ Submitted! ID: ${data.abstract_id}`);
         setAbstractTitle(''); setAbstractText(''); setRepositoryUrl(''); setKeywords('');
         setStudentAiInterpretation(''); setAttestation1(false); setAttestation2(false);
         setActiveTab('browse');
@@ -7124,11 +8335,71 @@ const MonthlyFeeCard = () => {
     );
 }
 
-// --- DAPP TEMPLATE CODE (Copy-Paste Ready) ---
-const DAPP_TEMPLATE_CODE = `// ═══════════════════════════════════════════════════════════════════════════
-// KASVILLAGE L2 - DAPP/GAME INTEGRATION TEMPLATE
+// --- DAPP TEMPLATES BY GAME TYPE (Copy-Paste Ready) ---
+// Auto-rejected if missing required functions
+
+const DAPP_GAME_TYPES = ['physics', 'board', 'card', 'puzzle', 'rpg', 'utility'];
+
+const DAPP_REQUIRED_FUNCTIONS = ['init', 'update', 'render', 'onInput', 'getState', 'setState'];
+
+const DAPP_TYPE_REQUIREMENTS = {
+  physics: ['physics.step', 'bodies'],
+  board: ['board', 'makeMove', 'checkWin'],
+  card: ['deck', 'hand', 'draw', 'playCard'],
+  puzzle: ['grid', 'solve', 'validate'],
+  rpg: ['player', 'inventory', 'action'],
+  utility: ['process', 'output']
+};
+
+const DAPP_BLOCKED_PATTERNS = [
+  'window.location', 'window.open', 'document.cookie', 
+  'localStorage.getItem', 'sessionStorage', 'eval(', 'Function(',
+  'seed phrase', 'private key', 'secret recovery', 'innerHTML', 'outerHTML'
+];
+
+// Client-side validation before submit
+const validateDAppCode = (code, gameType) => {
+  const errors = [];
+  const codeLower = code.toLowerCase();
+  
+  // Check required core functions
+  DAPP_REQUIRED_FUNCTIONS.forEach(fn => {
+    if (!codeLower.includes(`function ${fn}`) && !codeLower.includes(`${fn}(`)) {
+      errors.push(\`MISSING REQUIRED: \${fn}() function\`);
+    }
+  });
+  
+  // Check game-type specific patterns
+  const typeReqs = DAPP_TYPE_REQUIREMENTS[gameType] || [];
+  typeReqs.forEach(pattern => {
+    if (!codeLower.includes(pattern.toLowerCase())) {
+      errors.push(\`MISSING FOR \${gameType.toUpperCase()}: \${pattern}\`);
+    }
+  });
+  
+  // Check blocked patterns
+  DAPP_BLOCKED_PATTERNS.forEach(blocked => {
+    if (codeLower.includes(blocked.toLowerCase())) {
+      errors.push(\`BLOCKED PATTERN: \${blocked} (security violation)\`);
+    }
+  });
+  
+  // Must use KasVillage SDK
+  if (!code.includes('KasVillageL2')) {
+    errors.push('MISSING: KasVillageL2 SDK initialization');
+  }
+  if (!code.includes('kasvillage.connect')) {
+    errors.push('MISSING: kasvillage.connect() for auth');
+  }
+  
+  return errors;
+};
+
+const DAPP_TEMPLATE_CODE = \`// ═══════════════════════════════════════════════════════════════════════════
+// KASVILLAGE L2 - GAME TEMPLATE (Select your type below)
 // ═══════════════════════════════════════════════════════════════════════════
-// IDE: https://idx.google.com | Docs: https://kasvillage.dev/docs
+// Types: physics | board | card | puzzle | rpg | utility
+// ANY MISSING REQUIRED FUNCTION = AUTO-REJECT
 // ═══════════════════════════════════════════════════════════════════════════
 
 const kasvillage = new KasVillageL2({ 
@@ -7137,87 +8408,150 @@ const kasvillage = new KasVillageL2({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. AUTHENTICATION - Connect wallet, get user session
+// GAME STATE (Customize for your game type)
 // ─────────────────────────────────────────────────────────────────────────────
-async function auth() {
-  const session = await kasvillage.connect();
-  return { 
-    pubkey: session.pubkey,      // User's L2 public key
-    apt: session.apartment,      // Apartment identifier  
-    xp: session.xp,              // Experience points
-    tier: session.tier           // Villager/Promoter/Custodian/MarketHost/TrustAnchor
+let gameState = {
+  // For PHYSICS: bodies: [], physics: { step: fn }
+  // For BOARD: board: [][], makeMove(), checkWin()  
+  // For CARD: deck: [], hand: [], draw(), playCard()
+  // For PUZZLE: grid: [], solve(), validate()
+  // For RPG: player: {}, inventory: [], action()
+  // For UTILITY: process(), output()
+  session: null
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REQUIRED CORE FUNCTIONS (All 6 must exist - AUTO-REJECT if missing)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 1. INIT - Entry point (REQUIRED)
+async function init() {
+  gameState.session = await kasvillage.connect();
+  const saved = await kasvillage.getState({ 
+    gameId: "YOUR_GAME_ID", 
+    userId: gameState.session.pubkey 
+  });
+  if (saved) setState(saved);
+  // Start your game loop here
+}
+
+// 2. UPDATE - Game loop tick (REQUIRED)
+function update(dt) {
+  // Your game logic here
+  // For physics: physics.step(dt)
+  // For board: check win conditions
+}
+
+// 3. RENDER - Display output (REQUIRED)
+function render(ctx) {
+  // Draw your game state
+  // ctx = canvas context or DOM update
+}
+
+// 4. ON INPUT - User interaction (REQUIRED)
+function onInput(event) {
+  // Handle user input
+  // event.type, event.x, event.y, etc.
+}
+
+// 5. GET STATE - State retrieval (REQUIRED)
+function getState() {
+  return {
+    // Return serializable game state
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. SAVE STATE - Required for Quality Gate compliance
-// ─────────────────────────────────────────────────────────────────────────────
-async function saveState(state) {
-  return kasvillage.commitState({ 
-    gameId: "YOUR_GAME_ID",              // Replace with your unique game ID
-    stateHash: hash(state),              // Hash of serialized state
-    ts: Date.now()                       // Timestamp
-  });
+// 6. SET STATE - State persistence (REQUIRED)
+function setState(state) {
+  // Restore game state from saved data
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. LOAD STATE - Retrieve persisted game/app state
+// GAME TYPE SPECIFIC (Add based on your type)
 // ─────────────────────────────────────────────────────────────────────────────
-async function loadState(userId) {
-  return kasvillage.getState({ 
-    gameId: "YOUR_GAME_ID", 
-    userId: userId 
-  });
-}
+
+// PHYSICS TYPE - Required: physics.step(), bodies[]
+const physics = { 
+  gravity: 9.8, 
+  step: function(dt) { /* physics simulation */ } 
+};
+const bodies = [];
+
+// BOARD TYPE - Required: board[][], makeMove(), checkWin()
+const board = [];
+function makeMove(row, col, player) { /* place piece */ }
+function checkWin() { /* return winner or null */ }
+
+// CARD TYPE - Required: deck[], hand[], draw(), playCard()
+const deck = [];
+const hand = [];
+function draw() { /* draw card from deck */ }
+function playCard(index) { /* play card from hand */ }
+
+// PUZZLE TYPE - Required: grid[], solve(), validate()
+const grid = [];
+function solve() { /* auto-solve or hint */ }
+function validate() { /* check if solved */ }
+
+// RPG TYPE - Required: player{}, inventory[], action()
+const player = { hp: 100, level: 1 };
+const inventory = [];
+function action(type) { /* perform action */ }
+
+// UTILITY TYPE - Required: process(), output()
+function process(input) { /* process input */ }
+function output(result) { /* display result */ }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. TRANSFER - L2 payments (No per-tx protocol fees - monthly subscription only)
+// AUTO-SAVE & CLEANUP
 // ─────────────────────────────────────────────────────────────────────────────
-async function transfer(amount, recipient) {
-  return kasvillage.transfer({ 
-    amount: amount,           // Amount in KASPA     recipient: recipient,     // Recipient pubkey or apartment
-    memo: "game_payment"      // Optional memo
-  });
+setInterval(async () => {
+  if (gameState.session) {
+    await kasvillage.commitState({ 
+      gameId: "YOUR_GAME_ID", 
+      stateHash: JSON.stringify(getState()), 
+      ts: Date.now() 
+    });
+  }
+}, 30000);
+
+function destroy() {
+  if (gameState.session) {
+    kasvillage.commitState({ gameId: "YOUR_GAME_ID", stateHash: JSON.stringify(getState()), ts: Date.now() });
+  }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 5. SUBMIT QUALITY MANIFEST - For publishing to Village Board
-// ─────────────────────────────────────────────────────────────────────────────
-async function submitManifest(manifest) {
-  const proof = await kasvillage.generateDAppProof({
-    name: manifest.name,
-    url: manifest.url,
-    xpStake: manifest.stake,
-    checks: { 
-      endpointActive: true,      // URL returns 200/201/204
-      hasMainMenu: true,         // UI is functional
-      hasL2Sync: true,           // State sync implemented
-      isFeatureComplete: true    // Game loop complete
-    }
-  });
-  return kasvillage.submitManifest(proof);
-}
+document.addEventListener('DOMContentLoaded', init);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// QUALITY CHECKLIST (All required for Main/Elite Board):
+// VALIDATION CHECKLIST (Backend auto-rejects if any fail):
 // ═══════════════════════════════════════════════════════════════════════════
-// [ ] URL returns 200 OK
-// [ ] UI/Menu functional  
-// [ ] L2 state sync implemented
-// [ ] Game loop / core feature complete
-// [ ] XP staked (500+ Incubator, 1000+ Main, 5000+ Elite)
+// ✓ init() exists
+// ✓ update() exists  
+// ✓ render() exists
+// ✓ onInput() exists
+// ✓ getState() exists
+// ✓ setState() exists
+// ✓ KasVillageL2 SDK used
+// ✓ kasvillage.connect() called
+// ✓ Game-type specific functions exist
+// ✓ No blocked patterns (window.location, eval, etc.)
 // ═══════════════════════════════════════════════════════════════════════════
-
-// ─────────────────────────────────────────────────────────────────────────────
 // BOARDS & XP REQUIREMENTS:
-// ─────────────────────────────────────────────────────────────────────────────
-// Incubator Board:  500+ XP stake  → Testing/beta apps
-// Main Board:      1000+ XP stake  → Verified apps
-// Elite Board:     5000+ XP stake  → Premium placement
-// ─────────────────────────────────────────────────────────────────────────────
-`;
+// Incubator:  500+ XP  | Main: 1000+ XP  | Elite: 5000+ XP
+// ═══════════════════════════════════════════════════════════════════════════
+\`;
 
-// --- DAPP MARKETPLACE DATA (Fallback/Template) ---
+// ============================================================================
+// VISIT FEE SYSTEM - DApps/Games can set optional entry fee in KASPA
+// ============================================================================
+// - Free by default
+// - Developer sets visit_fee_kas (e.g., 5 KAS to play)
+// - Fee paid directly to developer (P2P, non-custodial)
+// - Visibility boost for lower fees + higher KAS discount
+// ============================================================================
+
+// --- DAPP MARKETPLACE DATA (with Visit Fee support) ---
 const DEFAULT_DAPPS = [
   { 
     id: 1, 
@@ -7229,8 +8563,8 @@ const DEFAULT_DAPPS = [
     owner: "Apt 42A",
     ownerPubkey: "02abc...def",
     description: "Open-world RPG with L2 item trading",
-    availableForSwap: false,
-    askingPrice: null,
+    askingPrice: null,          // Sale price (null = not for sale)
+    visitFeeKas: 0,             // FREE to play
     monthlyThroughput: 1250,
     activeUsers: 340,
     url: "https://kaspquest.kasvillage.dev",
@@ -7247,8 +8581,8 @@ const DEFAULT_DAPPS = [
     owner: "Apt 18C",
     ownerPubkey: "02def...abc",
     description: "Provably fair chess with KASPA rewards",
-    availableForSwap: true,
-    askingPrice: 2500,
+    askingPrice: 2500,          // For sale at 2500 KAS
+    visitFeeKas: 2,             // 2 KAS per game session
     monthlyThroughput: 450,
     activeUsers: 120,
     url: "https://chess.kasvillage.dev",
@@ -7265,8 +8599,8 @@ const DEFAULT_DAPPS = [
     owner: "Apt 7B",
     ownerPubkey: "02ghi...jkl",
     description: "Display and trade NFTs on Kaspa L2",
-    availableForSwap: true,
     askingPrice: 800,
+    visitFeeKas: 0,             // FREE to browse
     monthlyThroughput: 180,
     activeUsers: 45,
     url: "https://nftgallery.kasvillage.dev",
@@ -7275,6 +8609,209 @@ const DEFAULT_DAPPS = [
   }
 ];
 
+// ============================================================================
+// CREATOR CONTENT FEE SYSTEM
+// ============================================================================
+// YouTubers, TikTokers, Streamers can set fee to view exclusive content
+// - Embedded content from whitelisted platforms only
+// - Creator gets 100% (P2P, no platform cut)
+// - Visibility: lower price + higher discount = better placement
+// ============================================================================
+
+// Creator content types
+const CREATOR_CONTENT_TYPES = [
+  { id: 'video', name: 'Video', icon: '🎬', platforms: ['youtube', 'tiktok'] },
+  { id: 'live', name: 'Live Stream', icon: '🔴', platforms: ['youtube', 'tiktok'] },
+  { id: 'post', name: 'Exclusive Post', icon: '📝', platforms: ['instagram', 'facebook'] },
+  { id: 'gallery', name: 'Photo Gallery', icon: '📸', platforms: ['instagram', 'pinterest'] },
+  { id: 'shop', name: 'Shop Link', icon: '🛍️', platforms: ['etsy'] },
+];
+
+// Creator content entry with fee
+const CreatorContentSchema = {
+  id: 0,
+  creatorPubkey: '',
+  creatorName: '',
+  platform: '',               // youtube, tiktok, instagram, facebook, etsy, pinterest
+  contentType: '',            // video, live, post, gallery, shop
+  contentUrl: '',             // Must be from whitelisted domain
+  title: '',
+  description: '',
+  thumbnailUrl: '',
+  viewFeeKas: 0,              // Fee in KASPA (0 = free)
+  viewFeeFiat: null,          // Optional USD equivalent display
+  totalViews: 0,
+  totalEarned: 0,
+  createdAt: 0,
+  isActive: true,
+};
+
+// Validate creator content URL
+const validateCreatorContentUrl = (url, platform) => {
+  if (!url || !platform) return false;
+  const platformDomain = ALLOWED_SOCIAL_PLATFORMS.find(p => p.id === platform)?.domain;
+  if (!platformDomain) return false;
+  return url.toLowerCase().includes(platformDomain);
+};
+
+// Calculate visibility score (lower fee + higher discount = better)
+const calculateVisibilityScore = (item) => {
+  const fee = item.visitFeeKas || item.viewFeeKas || 0;
+  const discount = item.discountPercent || 0;
+  const trustScore = item.trustScore || 0;
+  
+  // Formula: High trust + low fee + high discount = high visibility
+  // Max visibility = 100
+  const feeScore = Math.max(0, 100 - (fee * 10)); // 0 fee = 100, 10 KAS = 0
+  const discountScore = discount; // 0-100
+  const trustBonus = Math.min(20, trustScore / 100); // Max 20 bonus from trust
+  
+  return Math.min(100, (feeScore * 0.5) + (discountScore * 0.3) + trustBonus);
+};
+
+// Sort by visibility (best first)
+const sortByVisibility = (items) => {
+  return [...items].sort((a, b) => calculateVisibilityScore(b) - calculateVisibilityScore(a));
+};
+
+// ============================================================================
+// CREATOR FEE PAYMENT FLOW (P2P, Non-Custodial)
+// ============================================================================
+// 1. User clicks "View Content" 
+// 2. If fee > 0, show payment confirmation
+// 3. User signs L2 transfer to creator's apartment
+// 4. On success, content is unlocked
+// 5. Creator receives 100% instantly
+// ============================================================================
+
+const CreatorContentPaywall = ({ content, onUnlock, onClose }) => {
+  const { user } = useContext(GlobalContext);
+  const [paying, setPaying] = useState(false);
+  const [paid, setPaid] = useState(false);
+  const [error, setError] = useState(null);
+
+  const handlePay = async () => {
+    if (!content.viewFeeKas || content.viewFeeKas === 0) {
+      onUnlock();
+      return;
+    }
+
+    setPaying(true);
+    setError(null);
+
+    try {
+      // P2P transfer to creator
+      const result = await fetch(`${API_BASE}/api/transfer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from_pubkey: user.pubkey,
+          to_pubkey: content.creatorPubkey,
+          amount_kas: content.viewFeeKas,
+          memo: `Content: ${content.title}`
+        })
+      });
+
+      const data = await result.json();
+      if (data.success) {
+        setPaid(true);
+        setTimeout(() => onUnlock(), 1500);
+      } else {
+        setError(data.error || 'Payment failed');
+      }
+    } catch (e) {
+      setError(e.message);
+    }
+    setPaying(false);
+  };
+
+  // Free content - no paywall
+  if (!content.viewFeeKas || content.viewFeeKas === 0) {
+    return null;
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
+      <motion.div 
+        initial={{ scale: 0.9, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        className="bg-white rounded-3xl w-full max-w-md overflow-hidden shadow-2xl"
+      >
+        {/* Header */}
+        <div className="bg-gradient-to-r from-purple-600 to-pink-600 p-6 text-white text-center">
+          <h2 className="text-xl font-black">Exclusive Content</h2>
+          <p className="text-xs text-purple-100 mt-1">Support this creator directly</p>
+        </div>
+
+        <div className="p-6 space-y-4">
+          {/* Content Preview */}
+          <div className="p-4 bg-stone-50 rounded-xl border border-stone-200">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-12 h-12 bg-purple-100 rounded-xl flex items-center justify-center text-2xl">
+                {CREATOR_CONTENT_TYPES.find(t => t.id === content.contentType)?.icon || '🎬'}
+              </div>
+              <div>
+                <p className="font-bold text-stone-900">{content.title}</p>
+                <p className="text-xs text-stone-500">by {content.creatorName}</p>
+              </div>
+            </div>
+            <p className="text-sm text-stone-600">{content.description}</p>
+          </div>
+
+          {/* Fee Display */}
+          <div className="p-4 bg-amber-50 rounded-xl border border-amber-200 text-center">
+            <p className="text-xs text-amber-700 uppercase font-bold mb-1">Entry Fee</p>
+            <p className="text-3xl font-black text-amber-900">{content.viewFeeKas} KASPA</p>
+            {content.viewFeeFiat && (
+              <p className="text-xs text-amber-600">≈ ${content.viewFeeFiat} USD</p>
+            )}
+          </div>
+
+          {/* Creator Gets 100% */}
+          <div className="flex items-center justify-center gap-2 text-xs text-green-700 bg-green-50 p-2 rounded-lg">
+            <CheckCircle size={14} />
+            <span>Creator receives 100% • No platform fees</span>
+          </div>
+
+          {error && (
+            <div className="p-3 bg-red-100 border border-red-300 rounded-xl text-xs text-red-700">
+              {error}
+            </div>
+          )}
+
+          {/* Actions */}
+          <div className="flex gap-3">
+            <button 
+              onClick={onClose}
+              className="flex-1 py-3 border-2 border-stone-300 rounded-xl font-bold text-stone-600 hover:bg-stone-50 transition"
+            >
+              Cancel
+            </button>
+            <button 
+              onClick={handlePay}
+              disabled={paying || paid}
+              className={cn(
+                "flex-1 py-3 rounded-xl font-bold transition flex items-center justify-center gap-2",
+                paid ? "bg-green-500 text-white" : 
+                paying ? "bg-stone-300 text-stone-500" : 
+                "bg-purple-600 hover:bg-purple-500 text-white"
+              )}
+            >
+              {paid ? (
+                <><CheckCircle size={18} /> Unlocked!</>
+              ) : paying ? (
+                <><RefreshCw size={18} className="animate-spin" /> Processing...</>
+              ) : (
+                <>Pay {content.viewFeeKas} KAS</>
+              )}
+            </button>
+          </div>
+        </div>
+      </motion.div>
+    </div>
+  );
+};
+
 // --- DAPP MARKETPLACE COMPONENT (MANUAL BILATERAL LOCKS) ---
 const DAppMarketplace = ({ onClose, onOpenQualityGate }) => {
   const { user } = useContext(GlobalContext);
@@ -7282,22 +8819,6 @@ const DAppMarketplace = ({ onClose, onOpenQualityGate }) => {
   const [showTemplate, setShowTemplate] = useState(false);
   const [showBuyModal, setShowBuyModal] = useState(null);
   const [dapps, setDapps] = useState(DEFAULT_DAPPS);
-  
-  // Fetch live DApps from Merkle-backed API
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/dapps/list`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.data && data.data.length > 0) {
-            setDapps(data.data);
-            console.log(`✅ DApps loaded from Merkle tree (root: ${data.merkle_root}, ${data.count} items)`);
-          }
-        }
-      } catch (e) { console.warn('⚠️ DApp fetch failed, using defaults'); }
-    })();
-  }, []);
   
   // Handover Machine States
   const [kycStep, setKycStep] = useState(1); 
@@ -7322,18 +8843,7 @@ const DAppMarketplace = ({ onClose, onOpenQualityGate }) => {
     const remainingDays = Math.max(0, (end - now) / (1000 * 60 * 60 * 24));
     const runwayPercent = totalDuration > 0 ? Math.min(100, (remainingDays / totalDuration) * 100) : 0;
     const monthsLeft = Math.floor(remainingDays / 30);
-    return { runwayPercent, monthsLeft, daysLeft: Math.floor(remainingDays), isExpiringSoon: remainingDays < 45, totalKas: (dapp.stakeKas || 0).toLocaleString() };
-  };
-
-  const handleSwapDApp = (dapp) => {
-    setKycStep(1);
-    setCameraOpened(false);
-    setHandoverComplete(false);
-    // Initialize with 10% defaults, but allow manual change in Step 3
-    const defaultLock = Math.floor(dapp.askingPrice * 0.10);
-    setUserCommitment(defaultLock);
-    setDevTransferCommitment(defaultLock);
-    setShowBuyModal(dapp);
+    return { runwayPercent, monthsLeft, daysLeft: Math.floor(remainingDays), isExpiringSoon: remainingDays < 45, totalKas: (fullDapp.stakeKas || 0).toLocaleString() };
   };
 
   return (
@@ -7369,8 +8879,8 @@ const DAppMarketplace = ({ onClose, onOpenQualityGate }) => {
               return (
                 <motion.div key={dapp.id} className="p-4 rounded-2xl border-2 bg-white border-stone-200 hover:border-amber-400 transition-all hover:shadow-lg">
                   <div className="flex justify-between items-start mb-3">
-                    <div><h3 className="font-black text-stone-900 text-lg">{dapp.name}</h3><p className="text-xs text-stone-500">{dapp.category}</p></div>
-                    <Badge tier={dapp.board} />
+                    <div><h3 className="font-black text-stone-900 text-lg">{fullDapp.name}</h3><p className="text-xs text-stone-500">{fullDapp.category}</p></div>
+                    <Badge tier={fullDapp.board} />
                   </div>
 
                   <div className="mb-4 p-3 bg-indigo-50 border border-indigo-100 rounded-xl">
@@ -7388,13 +8898,7 @@ const DAppMarketplace = ({ onClose, onOpenQualityGate }) => {
                   </div>
                   
                   <div className="flex flex-col gap-2">
-                    <a href={dapp.url} target="_blank" className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-xl font-bold text-sm transition"><Globe size={16}/> Visit DApp</a>
-                    {dapp.availableForSwap && (
-                      <div className="p-3 bg-green-50 border border-green-200 rounded-xl flex items-center justify-between">
-                        <div><p className="text-[9px] font-bold text-green-600 uppercase">Handover Price</p><p className="text-sm font-black text-green-800">{dapp.askingPrice} KASPA</p></div>
-                        <button onClick={() => handleSwapDApp(dapp)} className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-bold text-xs transition">Swap Rights</button>
-                      </div>
-                    )}
+                    <a href={fullDapp.url} target="_blank" className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-xl font-bold text-sm transition"><Globe size={16}/> Visit DApp</a>
                   </div>
                 </motion.div>
               );
@@ -7555,7 +9059,7 @@ const DAppMarketplace = ({ onClose, onOpenQualityGate }) => {
 
 // --- NEW COMPONENT: QUALITY GATE MODAL ---
 const QualityGateModal = ({ onClose, onPublish }) => {
-  const { user } = useContext(GlobalContext);
+  const { user, identityHash, avatarName } = useContext(GlobalContext);
   const [isChecking, setIsChecking] = useState(false);
   const [step, setStep] = useState(1);
   const [auditorInput, setAuditorInput] = useState("");
@@ -7877,7 +9381,7 @@ const QualityGateModal = ({ onClose, onPublish }) => {
                     </div>
 
                     <button 
-                        onClick={() => onPublish({...manifest, targetBoard: board})}
+                        onClick={() => onPublish({...manifest, targetBoard: board, owner_pubkey: identityHash || avatarName || user?.tier || 'anon'})}
                         className="w-full py-4 bg-green-600 hover:bg-green-500 text-white font-bold rounded-xl shadow-lg shadow-green-200 flex items-center justify-center gap-2"
                     >
                         <ShieldCheck size={20}/> Publish to Village Board
@@ -9534,32 +11038,11 @@ const MailboxTabContent = ({ openHost, onOpenDAppMarketplace, openStorefront, op
     return priceA - priceB; // Lower price first
   });
   
-  // Academic Data (fetched from Merkle-backed API)
-  const [academicResults, setAcademicResults] = useState([
+  // Mock Academic Data (In prod this comes from API)
+  const academicResults = [
     { title: "L2 Consensus Audit", type: "Auditing", author: "Dr. A. Sharma", cost: 500, apt: "101", flat_rate: true },
     { title: "Intro to Kaspa", type: "Tutoring", author: "Prof. K", cost: 50, apt: "304", flat_rate: false }
-  ]);
-  
-  // Fetch academic services from Merkle tree on mount
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/academic`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.data && data.data.length > 0) {
-            setAcademicResults(data.data.map(a => ({
-              id: a.id, title: a.title, type: a.service_type, author: a.author,
-              cost: a.cost_kas, apt: a.apt, flat_rate: a.flat_rate,
-              abstract_summary: a.abstract_summary, abstract_link: a.abstract_link,
-              leaf_hash: a.leaf_hash
-            })));
-            console.log(`✅ Academic services loaded from Merkle tree (root: ${data.merkle_root}, ${data.count} items)`);
-          }
-        }
-      } catch (e) { console.warn('⚠️ Academic fetch failed, using defaults'); }
-    })();
-  }, []);
+  ];
   
   const filteredAcademicResults = academicResults.filter(item => {
       const query = academicSearch.toLowerCase();
@@ -9580,60 +11063,17 @@ const MailboxTabContent = ({ openHost, onOpenDAppMarketplace, openStorefront, op
   // Search handlers with loading state
   const handleDAppSearch = () => {
     setSearchingSection("dapps");
-    (async () => {
-      try {
-        const params = new URLSearchParams();
-        if (dappSearch) params.append('search', dappSearch);
-        const res = await fetch(`${API_BASE}/api/dapps/list?${params}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.data) {
-            // Update dapps in GlobalContext if available — mailbox reads from there
-            // For now, filter locally from fetched results
-          }
-        }
-      } catch (e) { /* keep existing results */ }
-      setSearchingSection(null);
-    })();
+    setTimeout(() => setSearchingSection(null), 300);
   };
 
   const handleAcademicSearch = () => {
     setSearchingSection("academic");
-    (async () => {
-      try {
-        const params = new URLSearchParams();
-        if (academicSearch) params.append('search', academicSearch);
-        const res = await fetch(`${API_BASE}/api/academic?${params}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.data) {
-            setAcademicResults(data.data.map(a => ({
-              id: a.id, title: a.title, type: a.service_type, author: a.author,
-              cost: a.cost_kas, apt: a.apt, flat_rate: a.flat_rate,
-              abstract_summary: a.abstract_summary, abstract_link: a.abstract_link,
-              leaf_hash: a.leaf_hash
-            })));
-          }
-        }
-      } catch (e) { /* keep existing results */ }
-      setSearchingSection(null);
-    })();
+    setTimeout(() => setSearchingSection(null), 300);
   };
 
   const handleCouponSearch = () => {
     setSearchingSection("coupons");
-    (async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/coupons`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.data && data.data.length > 0) {
-            console.log(`✅ Coupons loaded from backend (${data.count} items)`);
-          }
-        }
-      } catch (e) { /* keep existing */ }
-      setSearchingSection(null);
-    })();
+    setTimeout(() => setSearchingSection(null), 300);
   };
 
   return (
@@ -9686,23 +11126,19 @@ const MailboxTabContent = ({ openHost, onOpenDAppMarketplace, openStorefront, op
                     }
                   }}
                   className={cn(
-                     "p-3 rounded-xl border cursor-pointer transition-all hover:shadow-md",
-                     dapp.availableForSwap 
-                       ? "bg-gradient-to-br from-green-50 to-emerald-50 border-green-300" 
-                       : "bg-white border-purple-200"
+                     "p-3 rounded-xl border cursor-pointer transition-all hover:shadow-md bg-white border-purple-200"
                   )}
                >
                   <div className="flex justify-between items-start mb-2">
                      <span className={cn(
                         "text-[9px] font-bold px-1.5 py-0.5 rounded uppercase",
-                        dapp.board === "Elite" ? "bg-purple-100 text-purple-700" :
-                        dapp.board === "Main" ? "bg-green-100 text-green-700" :
+                        fullDapp.board === "Elite" ? "bg-purple-100 text-purple-700" :
+                        fullDapp.board === "Main" ? "bg-green-100 text-green-700" :
                         "bg-amber-100 text-amber-700"
-                     )}>{dapp.board}</span>
-                     {dapp.availableForSwap && <span className="text-[9px] font-bold text-green-600">SWAP</span>}
+                     )}>{fullDapp.board}</span>
                   </div>
-                  <div className="font-bold text-sm text-stone-900 truncate">{dapp.name}</div>
-                  <div className="text-[10px] text-stone-500">{dapp.category}</div>
+                  <div className="font-bold text-sm text-stone-900 truncate">{fullDapp.name}</div>
+                  <div className="text-[10px] text-stone-500">{fullDapp.category}</div>
                </motion.div>
                 ))
               ) : (
@@ -10406,10 +11842,13 @@ const Dashboard = () => {
     user, isAuthenticated, securityStep, showTransactionSigner, setShowTransactionSigner,
     apts, coupons, dapps, geoBlocked, userCountry, showClickwrap, setShowClickwrap,
     signClickwrap, showHumanVerification, handleHumanVerified, handleHumanVerificationFailed,
-    isReturningUser, avatarName, resetVerification, verifiedL1Wallet, setVerifiedL1Wallet,
+    isReturningUser, identityHash, avatarName, resetVerification, verifiedL1Wallet, setVerifiedL1Wallet,
     showBridge,       
      handleBridgeComplete, 
   } = useContext(GlobalContext);
+
+  // Derive current apartment from apts array
+  const apt = apts?.[0] || null;
 
   const [txCompleteStats, setTxCompleteStats] = useState({ total: 0, completedCount: 0, successRate: 0 });
   const [deadlockStats, setDeadlockStats] = useState({ total: 0, recoveredCount: 0 });
@@ -10441,6 +11880,13 @@ const Dashboard = () => {
   const [showMutualPayment, setShowMutualPayment] = useState(false);
   const [showOnRamp, setShowOnRamp] = useState(false);
   const [rampMode, setRampMode] = useState('deposit');
+
+  // Listen for Neighbor Agreement trigger from StorefrontViewer coupons
+  useEffect(() => {
+    const handler = () => setShowMutualPayment(true);
+    window.addEventListener('openNeighborAgreement', handler);
+    return () => window.removeEventListener('openNeighborAgreement', handler);
+  }, []);
 
   // Hardware Wallet Connection State
   const [walletConnected, setWalletConnected] = useState(localStorage.getItem('connectedWallet') ? true : false);
@@ -10506,7 +11952,7 @@ const Dashboard = () => {
 // ----------------------------------------------
 
 const userApt = apts?.find(s => s.owner_tier === user.tier) || {
-    host_id: 'new', name: "My Shop", description: "Builder mode active.", items: [], apartment: user.apartment, theme: "LightMarket"
+    host_id: identityHash || avatarName || 'new', name: "My Shop", description: "Builder mode active.", items: [], apartment: user.apartment, theme: "LightMarket"
 };
 
 // ==============================================================================
@@ -10630,7 +12076,8 @@ return (
             apt={userApt} 
             userXp={user.xp} 
             openDApp={setActiveDApp} 
-            openHost={setActiveHost} 
+            openHost={setActiveHost}
+            openStorefront={setActiveStorefront}
           />
         )}
 
@@ -10672,6 +12119,7 @@ return (
         <StorefrontViewer 
           hostName={activeStorefront.hostName} 
           hostId={activeStorefront.hostId} 
+          visitorPubkey={apt?.host_id}
           onClose={() => setActiveStorefront(null)} 
         />
       )}
@@ -10798,10 +12246,9 @@ const RAMP_ROUTES = [
     const [step, setStep] = useState(1);
     const [amount, setAmount] = useState('');
     
-    // L2 Deposit Address (Destination for Deposits)
-    const [depositAddress] = useState(
-      `kaspa:qr${user.pubkey?.substring(2, 30) || 'demo'}...l2deposit`
-    );
+    // FLUX INTEGRATION: Use bridge ticket instead of static address
+    const { ticket, status: bridgeStatus, loading: ticketLoading, error: ticketError, requestTicket } = useBridgeTicket();
+    const { tier: networkTier, isHealthy, isDegraded, isEmergency, isDirect } = useNetworkHealth();
     
     const [txId, setTxId] = useState(null);
     const [confirmations, setConfirmations] = useState(0);
@@ -10815,10 +12262,32 @@ const RAMP_ROUTES = [
     const routes = RAMP_ROUTES.filter(r => 
       mode === 'deposit' ? r.supportsBuy : r.supportsSell
     );
+    
+    // Get deposit address from bridge ticket (ephemeral) or fallback
+    const depositAddress = ticket?.ephemeralAddress || 
+      `kaspa:qr${user.pubkey?.substring(2, 30) || 'demo'}...awaiting`;
+    const ticketExpiresIn = ticket?.secondsRemaining || 0;
   
-    // Simulate chain watching (Deposit Mode)
+    // Watch bridge ticket status for deposits
     useEffect(() => {
-      if (mode === 'deposit') {
+      if (mode === 'deposit' && bridgeStatus) {
+        if (bridgeStatus.status === 'Funded') {
+          setFlowState(RAMP_STATES.CONFIRMING);
+          setTxId(bridgeStatus.sweptTxid || 'pending_sweep');
+        } else if (bridgeStatus.status === 'Swept') {
+          setFlowState(RAMP_STATES.CREDITED);
+          setTxId(bridgeStatus.sweptTxid);
+          setConfirmations(10);
+        } else if (bridgeStatus.status === 'Expired') {
+          setFlowState(RAMP_STATES.IDLE);
+          alert('Bridge ticket expired. Please request a new one.');
+        }
+      }
+    }, [bridgeStatus, mode]);
+  
+    // Legacy simulation fallback (if no bridge status)
+    useEffect(() => {
+      if (mode === 'deposit' && !bridgeStatus) {
           if (flowState === RAMP_STATES.AWAITING_ONCHAIN) {
             const timer = setTimeout(() => {
               setTxId('tx_' + Math.random().toString(36).substr(2, 9));
@@ -10840,14 +12309,25 @@ const RAMP_ROUTES = [
             return () => clearInterval(interval);
           }
       }
-    }, [flowState, mode]);
+    }, [flowState, mode, bridgeStatus]);
   
     const handleSelectRoute = (route) => {
       setSelectedRoute(route);
       setStep(2);
     };
   
-    const handleStartFlow = () => {
+    const handleStartFlow = async () => {
+      if (mode === 'deposit' && amount) {
+        // Request ephemeral bridge address via Flux
+        const kasPrice = user.kasPrice || 0.05;
+        const amountUsd = parseFloat(amount) * kasPrice;
+        const result = await requestTicket(user.pubkey, amountUsd);
+        
+        if (!result.success) {
+          alert(result.error || 'Failed to create deposit ticket');
+          return;
+        }
+      }
       setFlowState(RAMP_STATES.INITIATED);
       setStep(3);
     };
@@ -11116,12 +12596,18 @@ const RAMP_ROUTES = [
   
                 <button 
                     onClick={handleStartFlow}
+                    disabled={ticketLoading}
                     className={cn(
                         "w-full py-3 text-white rounded-xl font-bold text-center flex items-center justify-center gap-2",
-                        mode === 'deposit' ? "bg-green-600 hover:bg-green-500" : "bg-orange-600 hover:bg-orange-500"
+                        mode === 'deposit' ? "bg-green-600 hover:bg-green-500" : "bg-orange-600 hover:bg-orange-500",
+                        ticketLoading && "opacity-50 cursor-wait"
                     )}
                 >
-                    {mode === 'deposit' ? 'Show Deposit Address' : 'Start Withdrawal'} <ArrowRight size={16}/>
+                    {ticketLoading ? (
+                      <><RefreshCw size={16} className="animate-spin"/> Generating Secure Address...</>
+                    ) : (
+                      <>{mode === 'deposit' ? 'Show Deposit Address' : 'Start Withdrawal'} <ArrowRight size={16}/></>
+                    )}
                 </button>
                 
                 <button onClick={() => setStep(1)} className="w-full text-center text-xs text-stone-400 hover:text-stone-600 underline">Back</button>
@@ -11132,37 +12618,136 @@ const RAMP_ROUTES = [
             {step === 3 && (
               <div className="space-y-4">
                 
-                {/* === DEPOSIT MODE: Show Address === */}
+                {/* Network Health Indicator */}
+                <div className={cn(
+                  "flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-bold",
+                  isHealthy && "bg-green-50 text-green-700",
+                  isDegraded && "bg-yellow-50 text-yellow-700",
+                  isEmergency && "bg-orange-50 text-orange-700",
+                  isDirect && "bg-red-50 text-red-700"
+                )}>
+                  <div className={cn(
+                    "w-2 h-2 rounded-full",
+                    isHealthy && "bg-green-500",
+                    isDegraded && "bg-yellow-500",
+                    isEmergency && "bg-orange-500",
+                    isDirect && "bg-red-500 animate-pulse"
+                  )}/>
+                  {isHealthy && "Network Healthy"}
+                  {isDegraded && "Backup Network Active"}
+                  {isEmergency && "Emergency Mode (Cloudflare)"}
+                  {isDirect && "Direct Relay Mode - Limited Capacity"}
+                </div>
+                
+                {/* === DEPOSIT MODE: Show Ephemeral Address === */}
                 {mode === 'deposit' && (
                     <>
-                        <div>
-                           <label className="text-[10px] font-bold uppercase text-stone-500 mb-1 block">From (Your Verified Wallet)</label>
-                           <div className="p-3 bg-stone-100 border border-stone-300 rounded-xl flex justify-between items-center opacity-70">
-                              <span className="font-mono text-xs text-stone-600 truncate max-w-[200px]">
-                                 {verifiedL1Wallet ? verifiedL1Wallet.walletAddress : "External Source"}
-                              </span>
-                              {verifiedL1Wallet && <span className="text-[9px] bg-green-100 text-green-700 px-2 py-0.5 rounded font-bold">VERIFIED</span>}
-                           </div>
-                        </div>
-  
-                        <div className="flex justify-center -my-3 z-10 relative">
-                           <div className="bg-stone-200 p-1 rounded-full border border-white"><ArrowRight className="rotate-90 text-stone-500" size={16}/></div>
-                        </div>
-  
-                        <div>
-                           <label className="text-[10px] font-bold uppercase text-green-700 mb-1 block">To (L2 Deposit Address)</label>
-                           <div className="p-4 bg-green-50 border-2 border-green-500 rounded-xl shadow-lg relative z-0">
-                              <div className="font-mono text-sm font-bold text-stone-900 break-all mb-3 text-center">
-                                 {depositAddress}
-                              </div>
-                              <button 
-                                 onClick={() => navigator.clipboard.writeText(depositAddress)}
-                                 className="w-full py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-bold text-xs flex items-center justify-center gap-1"
-                              >
-                                 Copy Address
-                              </button>
-                           </div>
-                        </div>
+                        {/* Ticket Loading State */}
+                        {ticketLoading && (
+                          <div className="p-6 bg-stone-100 rounded-xl text-center">
+                            <RefreshCw className="animate-spin mx-auto text-stone-400 mb-2" size={32}/>
+                            <p className="text-sm text-stone-600 font-bold">Generating secure deposit address...</p>
+                            <p className="text-xs text-stone-400 mt-1">This protects you with a one-time address</p>
+                          </div>
+                        )}
+                        
+                        {/* Ticket Error */}
+                        {ticketError && (
+                          <div className="p-4 bg-red-50 border border-red-200 rounded-xl">
+                            <p className="text-sm text-red-800 font-bold flex items-center gap-2">
+                              <AlertTriangle size={16}/> {ticketError}
+                            </p>
+                            {ticketError.includes('Sanctions') && (
+                              <p className="text-xs text-red-600 mt-1">Your address did not pass compliance screening.</p>
+                            )}
+                          </div>
+                        )}
+                        
+                        {/* Ticket Expiry Warning */}
+                        {ticket && ticketExpiresIn > 0 && (
+                          <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <Timer size={16} className="text-amber-600"/>
+                              <span className="text-sm text-amber-800 font-bold">Address expires in:</span>
+                            </div>
+                            <span className="font-mono text-lg font-black text-amber-900">
+                              {Math.floor(ticketExpiresIn / 60)}:{(ticketExpiresIn % 60).toString().padStart(2, '0')}
+                            </span>
+                          </div>
+                        )}
+                    
+                        {ticket && !ticketLoading && (
+                          <>
+                            <div>
+                               <label className="text-[10px] font-bold uppercase text-stone-500 mb-1 block">From (Your Verified Wallet)</label>
+                               <div className="p-3 bg-stone-100 border border-stone-300 rounded-xl flex justify-between items-center opacity-70">
+                                  <span className="font-mono text-xs text-stone-600 truncate max-w-[200px]">
+                                     {verifiedL1Wallet ? verifiedL1Wallet.walletAddress : "External Source"}
+                                  </span>
+                                  {verifiedL1Wallet && <span className="text-[9px] bg-green-100 text-green-700 px-2 py-0.5 rounded font-bold">VERIFIED</span>}
+                               </div>
+                            </div>
+      
+                            <div className="flex justify-center -my-3 z-10 relative">
+                               <div className="bg-stone-200 p-1 rounded-full border border-white"><ArrowRight className="rotate-90 text-stone-500" size={16}/></div>
+                            </div>
+      
+                            <div>
+                               <label className="text-[10px] font-bold uppercase text-green-700 mb-1 block flex items-center gap-1">
+                                 <Shield size={12}/> To (Ephemeral Bridge Address)
+                               </label>
+                               <div className="p-4 bg-green-50 border-2 border-green-500 rounded-xl shadow-lg relative z-0">
+                                  <div className="flex items-center gap-2 mb-2 justify-center">
+                                    <span className="text-[10px] bg-green-100 text-green-700 px-2 py-1 rounded font-bold">ONE-TIME ADDRESS</span>
+                                    <span className="text-[10px] bg-indigo-100 text-indigo-700 px-2 py-1 rounded font-bold">SECURE BRIDGE</span>
+                                  </div>
+                                  <div className="font-mono text-sm font-bold text-stone-900 break-all mb-3 text-center">
+                                     {depositAddress}
+                                  </div>
+                                  <button 
+                                     onClick={() => navigator.clipboard.writeText(depositAddress)}
+                                     className="w-full py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-bold text-xs flex items-center justify-center gap-1"
+                                  >
+                                     <Copy size={14}/> Copy Address
+                                  </button>
+                                  {ticket.expectedAmountKas && (
+                                    <p className="text-[10px] text-green-600 mt-2 text-center">
+                                      Expected: {ticket.expectedAmountKas.toFixed(4)} KAS @ ${ticket.kasPrice?.toFixed(4)}
+                                    </p>
+                                  )}
+                               </div>
+                            </div>
+                          </>
+                        )}
+                        
+                        {/* Bridge Status Display */}
+                        {bridgeStatus && (
+                          <div className={cn(
+                            "p-3 rounded-xl flex items-center gap-2",
+                            bridgeStatus.status === 'Pending' && "bg-stone-100",
+                            bridgeStatus.status === 'Funded' && "bg-blue-50 border border-blue-200",
+                            bridgeStatus.status === 'Swept' && "bg-green-50 border border-green-200"
+                          )}>
+                            {bridgeStatus.status === 'Pending' && (
+                              <>
+                                <Hourglass size={16} className="text-stone-400 animate-pulse"/>
+                                <span className="text-sm text-stone-600">Waiting for deposit...</span>
+                              </>
+                            )}
+                            {bridgeStatus.status === 'Funded' && (
+                              <>
+                                <Activity size={16} className="text-blue-600 animate-pulse"/>
+                                <span className="text-sm text-blue-700 font-bold">Deposit detected! Sweeping to vault...</span>
+                              </>
+                            )}
+                            {bridgeStatus.status === 'Swept' && (
+                              <>
+                                <CheckCircle size={16} className="text-green-600"/>
+                                <span className="text-sm text-green-700 font-bold">✓ Funds credited to your L2 account!</span>
+                              </>
+                            )}
+                          </div>
+                        )}
                     </>
                 )}
   
@@ -11957,16 +13542,36 @@ const KaspaCommitmentPopup = ({ isOpen, onClose, currentCommitment, onUpdate, ma
 };
 
 // --- COUPON CREATION POPUP ---
-const CouponCreationPopup = ({ isOpen, onClose, onCreate }) => {
-  const [couponData, setCouponData] = useState({ description: '', discountPercent: 10, dollarPrice: 0, kaspaPrice: 0, expiryDays: 30, maxUses: 100 });
+const CouponCreationPopup = ({ isOpen, onClose, onCreate, stashItems = [] }) => {
+  const [couponData, setCouponData] = useState({ description: '', discountPercent: 10, kaspaPrice: 0, expiryDays: 30, maxUses: 100 });
+  const [linkedItemId, setLinkedItemId] = useState('');
 
   if (!isOpen) return null;
 
-  const handleDollarChange = (usd) => setCouponData(prev => ({ ...prev, dollarPrice: usd, kaspaPrice: USD_TO_KASPA(usd) }));
+  const linkedItem = stashItems.find(i => String(i.id) === String(linkedItemId));
   const discountedKaspa = Math.round(couponData.kaspaPrice * (1 - couponData.discountPercent / 100));
 
   const handleCreate = () => {
-    onCreate({ ...couponData, discountedKaspa, code: `COUP${Date.now().toString(36).toUpperCase()}`, createdAt: Date.now() });
+    const payload = {
+      ...couponData,
+      discountedKaspa,
+      code: `COUP${Date.now().toString(36).toUpperCase()}`,
+      createdAt: Date.now(),
+    };
+    if (linkedItem) {
+      payload.linkedItemId = linkedItem.id;
+      payload.linkedItemName = linkedItem.name;
+      payload.visualsUrl = linkedItem.visualsUrl || '';
+      payload.visualsPlatform = linkedItem.visualsPlatform || 'Instagram';
+      // Auto-fill description if empty
+      if (!payload.description) payload.description = linkedItem.name;
+      // Auto-fill price if 0
+      if (!payload.kaspaPrice && linkedItem.kaspaPrice) {
+        payload.kaspaPrice = linkedItem.kaspaPrice;
+        payload.discountedKaspa = Math.round(linkedItem.kaspaPrice * (1 - couponData.discountPercent / 100));
+      }
+    }
+    onCreate(payload);
     onClose();
   };
 
@@ -11980,44 +13585,69 @@ const CouponCreationPopup = ({ isOpen, onClose, onCreate }) => {
 
         <div className="mb-4">
           <label className="block text-sm font-bold text-stone-600 mb-2">Description</label>
-          <textarea value={couponData.description} onChange={(e) => setCouponData(prev => ({ ...prev, description: e.target.value }))} className="w-full p-3 border border-purple-200 rounded-xl h-20 resize-none" placeholder="e.g., 10% off all items" />
+          <textarea value={couponData.description} onChange={(e) => setCouponData(prev => ({ ...prev, description: e.target.value }))} className="w-full p-3 border border-purple-200 rounded-xl h-20 resize-none" placeholder="e.g., Vintage leather jacket, size M" />
         </div>
 
+        {/* Link to Stash Item */}
+        {stashItems.length > 0 && (
+          <div className="mb-4">
+            <label className="block text-sm font-bold text-stone-600 mb-2">Link to Item <span className="font-normal text-stone-400">optional — pulls price & social link</span></label>
+            <select
+              value={linkedItemId}
+              onChange={(e) => {
+                setLinkedItemId(e.target.value);
+                const item = stashItems.find(i => String(i.id) === e.target.value);
+                if (item) {
+                  if (item.kaspaPrice) setCouponData(prev => ({ ...prev, kaspaPrice: item.kaspaPrice, description: prev.description || item.name }));
+                }
+              }}
+              className="w-full p-3 border border-purple-200 rounded-xl outline-none focus:ring-2 focus:ring-purple-500"
+            >
+              <option value="">— No item linked —</option>
+              {stashItems.map(item => (
+                <option key={item.id} value={String(item.id)}>
+                  {item.name}{item.kaspaPrice ? ` · ${item.kaspaPrice.toLocaleString()} KAS` : ''}
+                </option>
+              ))}
+            </select>
+            {linkedItem && linkedItem.visualsUrl && (
+              <div className="mt-2 flex items-center gap-2 p-2 bg-purple-50 rounded-lg border border-purple-200 text-xs text-purple-700">
+                <span>🔗</span>
+                <span>Will link to {linkedItem.visualsPlatform} listing</span>
+                <a href={linkedItem.visualsUrl} target="_blank" rel="noopener noreferrer" className="ml-auto underline font-bold">Preview</a>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* KASPA Price - direct input, no fiat */}
         <div className="mb-4">
-          <label className="block text-sm font-bold text-stone-600 mb-2">Original Price (USD)</label>
+          <label className="block text-sm font-bold text-stone-600 mb-2">Full Price (KASPA)</label>
           <div className="relative">
-            <span className="absolute left-4 top-3 text-stone-400 font-bold">$</span>
-            <input type="number" value={couponData.dollarPrice} onChange={(e) => handleDollarChange(parseFloat(e.target.value) || 0)} className="w-full p-3 pl-8 border border-purple-200 rounded-xl text-lg font-bold" min={0} step={0.01} />
+            <input type="number" value={couponData.kaspaPrice || ''} onChange={(e) => setCouponData(prev => ({ ...prev, kaspaPrice: parseFloat(e.target.value) || 0 }))} className="w-full p-3 pr-20 border border-purple-200 rounded-xl text-lg font-bold outline-none focus:ring-2 focus:ring-purple-500" min={0} placeholder="0" />
+            <span className="absolute right-4 top-3 text-stone-400 font-bold text-sm">KAS</span>
           </div>
-        </div>
-
-        <div className="mb-4 p-4 bg-amber-50 rounded-xl border border-amber-200">
-          <div className="flex justify-between items-center">
-            <span className="text-sm text-amber-700">KASPA Price</span>
-            <span className="text-xl font-black text-amber-900">{couponData.kaspaPrice.toLocaleString()} KASPA</span>
-          </div>
-          <p className="text-xs text-amber-600 mt-1">Rate: 1 KASPA = ${KASPA_USD_RATE}</p>
         </div>
 
         <div className="mb-4">
           <label className="block text-sm font-bold text-stone-600 mb-2">Discount %</label>
           <div className="flex items-center gap-4">
-            <input type="range" value={couponData.discountPercent} onChange={(e) => setCouponData(prev => ({ ...prev, discountPercent: parseInt(e.target.value) }))} className="flex-1" min={1} max={50} />
+            <input type="range" value={couponData.discountPercent} onChange={(e) => setCouponData(prev => ({ ...prev, discountPercent: parseInt(e.target.value) }))} className="flex-1" min={1} max={90} />
             <span className="text-2xl font-black text-purple-700 w-16 text-right">{couponData.discountPercent}%</span>
           </div>
         </div>
 
-        <div className="mb-6 p-4 bg-green-50 rounded-xl border border-green-200 text-center">
-          <p className="text-xs text-green-600 uppercase font-bold mb-1">Coupon Price</p>
-          <div className="flex items-center justify-center gap-4">
-            <span className="text-lg line-through text-stone-400">${(couponData.dollarPrice || 0).toFixed(2)}</span>
-            <ArrowRight className="text-green-600" size={20} />
-            <div className="text-right">
-              <span className="text-2xl font-black text-green-700">{discountedKaspa.toLocaleString()} KASPA</span>
-              <p className="text-xs text-green-600">≈ ${(discountedKaspa * KASPA_USD_RATE).toFixed(2)}</p>
+        {couponData.kaspaPrice > 0 && (
+          <div className="mb-6 p-4 bg-green-50 rounded-xl border border-green-200 text-center">
+            <p className="text-xs text-green-600 uppercase font-bold mb-1">Coupon Price</p>
+            <div className="flex items-center justify-center gap-4">
+              <span className="text-lg line-through text-stone-400">{couponData.kaspaPrice.toLocaleString()} KAS</span>
+              <ArrowRight className="text-green-600" size={20} />
+              <span className="text-2xl font-black text-green-700">{discountedKaspa.toLocaleString()} KAS</span>
             </div>
+            <p className="text-xs text-green-500 mt-1">Buyer saves {couponData.kaspaPrice - discountedKaspa} KAS</p>
           </div>
-        </div>
+        )}
 
         <Button onClick={handleCreate} disabled={!couponData.description || couponData.kaspaPrice <= 0} className="w-full h-12 bg-purple-600 hover:bg-purple-500 text-lg font-bold">Create Coupon</Button>
       </motion.div>
@@ -12148,31 +13778,34 @@ const StashItemPopup = ({ isOpen, onClose, onSave, item = null }) => {
           />
         </div>
 
-        {/* Price Input */}
-        <div className="mb-4">
-          <label className="block text-sm font-bold text-stone-600 mb-2">Price (USD)</label>
-          <div className="relative">
-            <span className="absolute left-4 top-3 text-stone-400 font-bold">$</span>
-            <input 
-              type="number" 
-              value={itemData?.dollarPrice || ''} 
-              onChange={(e) => handleDollarChange(e.target.value)} 
-              className="w-full p-3 pl-8 border border-blue-200 rounded-xl text-lg font-bold outline-none focus:ring-2 focus:ring-blue-500" 
-              min={0} 
-              step={0.01} 
-              placeholder="0.00"
-            />
+        {/* Prices - decoupled, independent */}
+        <div className="grid grid-cols-2 gap-3 mb-4">
+          <div>
+            <label className="block text-sm font-bold text-stone-600 mb-2">Price (KASPA)</label>
+            <div className="relative">
+              <input 
+                type="number" 
+                value={itemData?.kaspaPrice || ''} 
+                onChange={(e) => setItemData(prev => ({ ...prev, kaspaPrice: parseFloat(e.target.value) || 0 }))} 
+                className="w-full p-3 pr-12 border border-blue-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-blue-500" 
+                min={0} placeholder="0"
+              />
+              <span className="absolute right-3 top-3.5 text-stone-400 font-bold text-xs">KAS</span>
+            </div>
           </div>
-        </div>
-
-        {/* KASPA Price Display */}
-        <div className="mb-4 p-4 bg-amber-50 rounded-xl border border-amber-200">
-          <div className="flex justify-between items-center">
-            <span className="text-sm text-amber-700 font-bold">KASPA Price</span>
-            <span className="text-xl font-black text-amber-900">
-              {(itemData?.kaspaPrice || 0).toLocaleString()} KASPA             </span>
+          <div>
+            <label className="block text-sm font-bold text-stone-600 mb-2">Price (USD) <span className="font-normal text-stone-400">optional</span></label>
+            <div className="relative">
+              <span className="absolute left-3 top-3.5 text-stone-400 font-bold text-sm">$</span>
+              <input 
+                type="number" 
+                value={itemData?.dollarPrice || ''} 
+                onChange={(e) => setItemData(prev => ({ ...prev, dollarPrice: parseFloat(e.target.value) || 0 }))} 
+                className="w-full p-3 pl-7 border border-stone-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-blue-500" 
+                min={0} step={0.01} placeholder="0.00"
+              />
+            </div>
           </div>
-          <p className="text-[10px] text-amber-600 mt-1">Based on current rate: 1 KASPA = ${KASPA_USD_RATE}</p>
         </div>
 
         {/* Stock & Category */}

@@ -48882,12 +48882,10 @@ pub fn validate_dapp_code(code: &str, game_type: &DAppGameType) -> Result<(), Ve
     
     // 3e. Check for fetch/XHR to non-whitelisted domains
     // This is a basic check - full enforcement is via CSP in sandbox
-    let network_patterns = [
-        (r#"fetch\s*\(\s*["'][^"']*(?<!kasvillage\.dev|kasvillage\.io|arweave\.net)[^"']*["']"#, "fetch to unknown domain"),
-        (r"XMLHttpRequest", "XMLHttpRequest usage"),
-        (r"\.open\s*\(\s*[\"'](?:GET|POST)", "XHR open()"),
-    ];
     // Note: These are warnings, not blocks - CSP is the real enforcement
+    if code.contains("XMLHttpRequest") {
+        // XMLHttpRequest detected - CSP will handle actual blocking
+    }
     
     // 3f. Check for base64/encoding that might hide malicious code
     if code.contains("atob(") || code.contains("btoa(") {

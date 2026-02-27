@@ -4955,20 +4955,49 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost, openStorefront }) => {
       }
     }
   
-    // 1.3 Social Links Check (Domain Matching)
-    const socialEntries = Object.entries(socialLinks);
-    for (const [platform, url] of socialEntries) {
-      if (url) {
-        const domainMap = { 
-          instagram: 'instagram.com', tiktok: 'tiktok.com', twitter: 'x.com', 
-          etsy: 'etsy.com', pinterest: 'pinterest.com', youtube: 'youtube.com' 
-        };
-        if (!url.toLowerCase().includes(domainMap[platform])) {
-          alert(`🚫 INVALID LINK: The link for ${platform} is incorrect. Please use a real ${platform} URL.`);
+    // 1.3 Social Links Check - STRICT WHITELIST ENFORCEMENT
+    // Only YouTube, TikTok, Facebook, Instagram, Etsy, Pinterest allowed
+    // Twitter/X is BLOCKED
+    const sanitizedSocialLinks = {};
+    const allowedDomainMap = { 
+      youtube: 'youtube.com', 
+      tiktok: 'tiktok.com', 
+      facebook: 'facebook.com',
+      instagram: 'instagram.com',
+      etsy: 'etsy.com', 
+      pinterest: 'pinterest.com' 
+    };
+    
+    for (const [platform, url] of Object.entries(socialLinks)) {
+      if (url && url.trim()) {
+        const urlLower = url.toLowerCase();
+        
+        // Check if platform is allowed
+        if (!allowedDomainMap[platform]) {
+          alert(`🚫 BLOCKED PLATFORM: ${platform} is not allowed. Only YouTube, TikTok, Facebook, Instagram, Etsy, and Pinterest are permitted.`);
           return;
         }
+        
+        // Check if URL matches platform domain
+        if (!urlLower.includes(allowedDomainMap[platform])) {
+          alert(`🚫 INVALID LINK: The link for ${platform} must be from ${allowedDomainMap[platform]}`);
+          return;
+        }
+        
+        // Check against blocked domains (Twitter/X, OnlyFans, etc.)
+        for (const blocked of BLOCKED_SOCIAL_DOMAINS) {
+          if (urlLower.includes(blocked)) {
+            alert(`🚫 BLOCKED: Links to ${blocked} are not allowed due to adult content policies.`);
+            return;
+          }
+        }
+        
+        // URL passed validation - add to sanitized list
+        sanitizedSocialLinks[platform] = url.trim();
       }
     }
+    
+    // Use sanitized social links from here on
   
     setSaving(true);
   
@@ -4978,7 +5007,7 @@ const AptBuilder = ({ apt, userXp, openDApp, openHost, openStorefront }) => {
       brandName, 
       logoUrl, 
       logoShape, 
-      socialLinks, // <--- CRITICAL: Added this so icons work on deployed site
+      socialLinks: sanitizedSocialLinks, // SANITIZED - only whitelisted URLs
       
       // Typography & Robust Font Controls
       headerFontSize, 
@@ -6489,12 +6518,53 @@ const verifyDAppHash = async (code, expectedHash) => {
   return { valid: true };
 };
 
-// DApp Launch Button - Opens in sandbox
+// DApp Launch Button - Opens in sandbox with VISIT FEE enforcement
 const DAppLaunchButton = ({ dapp }) => {
+  const { user } = useContext(GlobalContext);
   const [showSandbox, setShowSandbox] = useState(false);
+  const [showPaywall, setShowPaywall] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [error, setError] = useState(null);
   const [externalVetted, setExternalVetted] = useState(false);
+  const [feePaid, setFeePaid] = useState(false);
+
+  // Check if visit fee is required
+  const visitFee = dapp.visitFeeKas || 0;
+  const requiresPayment = visitFee > 0 && !feePaid;
+
+  // Handle fee payment
+  const handlePayFee = async () => {
+    if (visitFee <= 0) {
+      setFeePaid(true);
+      return true;
+    }
+
+    try {
+      const result = await fetch(`${API_BASE}/api/transfer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from_pubkey: user?.pubkey,
+          to_pubkey: dapp.ownerPubkey,
+          amount_kas: visitFee,
+          memo: `DApp Visit: ${dapp.name}`
+        })
+      });
+
+      const data = await result.json();
+      if (data.success) {
+        setFeePaid(true);
+        setShowPaywall(false);
+        return true;
+      } else {
+        setError(data.error || 'Payment failed');
+        return false;
+      }
+    } catch (e) {
+      setError(e.message);
+      return false;
+    }
+  };
 
   // Validate external DApp code against template requirements
   const vetExternalDApp = async (url) => {
@@ -6545,6 +6615,12 @@ const DAppLaunchButton = ({ dapp }) => {
   };
 
   const handleLaunch = async () => {
+    // CHECK VISIT FEE FIRST
+    if (requiresPayment) {
+      setShowPaywall(true);
+      return;
+    }
+
     setVerifying(true);
     setError(null);
     
@@ -6602,20 +6678,84 @@ const DAppLaunchButton = ({ dapp }) => {
         disabled={verifying}
         className={cn(
           "w-full flex items-center justify-center gap-2 py-3 rounded-xl font-bold transition",
-          verifying ? "bg-stone-300 text-stone-500" : "bg-blue-600 hover:bg-blue-500 text-white"
+          verifying ? "bg-stone-300 text-stone-500" : 
+          requiresPayment ? "bg-amber-600 hover:bg-amber-500 text-white" :
+          "bg-blue-600 hover:bg-blue-500 text-white"
         )}
       >
         {verifying ? (
           <><RefreshCw size={18} className="animate-spin" /> Verifying Template...</>
+        ) : requiresPayment ? (
+          <><Coins size={18} /> Pay {visitFee} KAS to Play</>
         ) : (
           <><PlayCircle size={18} /> Launch DApp (Sandboxed)</>
         )}
       </button>
       
+      {/* Visit Fee Info */}
+      {visitFee > 0 && (
+        <div className={cn(
+          "mt-2 p-2 rounded-lg text-xs flex items-center justify-between",
+          feePaid ? "bg-green-100 text-green-700" : "bg-amber-100 text-amber-700"
+        )}>
+          <span className="flex items-center gap-1">
+            <Coins size={12} />
+            {feePaid ? "Fee Paid ✓" : `Entry Fee: ${visitFee} KASPA`}
+          </span>
+          <span className="text-[10px]">100% to developer</span>
+        </div>
+      )}
+      
       {error && (
         <div className="mt-2 p-3 bg-red-100 border border-red-300 rounded-xl text-xs text-red-700">
           <strong>⚠️ {error}</strong>
           <p className="mt-1">This DApp's code has been modified since approval. Launch blocked for your safety.</p>
+        </div>
+      )}
+      
+      {/* Visit Fee Paywall */}
+      {showPaywall && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
+          <motion.div 
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="bg-white rounded-3xl w-full max-w-md overflow-hidden shadow-2xl"
+          >
+            <div className="bg-gradient-to-r from-amber-600 to-orange-600 p-6 text-white text-center">
+              <h2 className="text-xl font-black">{dapp.name}</h2>
+              <p className="text-xs text-amber-100 mt-1">Entry fee required to play</p>
+            </div>
+            <div className="p-6 space-y-4">
+              <div className="p-4 bg-amber-50 rounded-xl border border-amber-200 text-center">
+                <p className="text-xs text-amber-700 uppercase font-bold mb-1">Visit Fee</p>
+                <p className="text-3xl font-black text-amber-900">{visitFee} KASPA</p>
+              </div>
+              <div className="flex items-center justify-center gap-2 text-xs text-green-700 bg-green-50 p-2 rounded-lg">
+                <CheckCircle size={14} />
+                <span>Developer receives 100% • No platform fees</span>
+              </div>
+              <div className="flex gap-3">
+                <button 
+                  onClick={() => setShowPaywall(false)}
+                  className="flex-1 py-3 border-2 border-stone-300 rounded-xl font-bold text-stone-600 hover:bg-stone-50 transition"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={async () => {
+                    const success = await handlePayFee();
+                    if (success) {
+                      setShowPaywall(false);
+                      handleLaunch();
+                    }
+                  }}
+                  className="flex-1 py-3 bg-amber-600 hover:bg-amber-500 text-white rounded-xl font-bold transition"
+                >
+                  Pay & Play
+                </button>
+              </div>
+            </div>
+          </motion.div>
         </div>
       )}
       

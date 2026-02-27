@@ -67739,11 +67739,105 @@ pub fn configure_arweave_content_routes(cfg: &mut web::ServiceConfig) {
     );
 }
 
+// ============================================================================
+// SOCIAL URL WHITELIST - BACKEND ENFORCEMENT
+// ============================================================================
+// Only these domains allowed for social links in storefronts
+// Twitter/X is BLOCKED due to adult content policies
+// ============================================================================
+
+/// Allowed social platform domains
+pub const ALLOWED_SOCIAL_DOMAINS: [&str; 6] = [
+    "youtube.com",
+    "tiktok.com",
+    "facebook.com",
+    "instagram.com",
+    "etsy.com",
+    "pinterest.com",
+];
+
+/// Blocked social platform domains (adult content risk)
+pub const BLOCKED_SOCIAL_DOMAINS: [&str; 7] = [
+    "twitter.com",
+    "x.com",
+    "onlyfans.com",
+    "patreon.com",
+    "reddit.com",
+    "tumblr.com",
+    "snapchat.com",
+];
+
+/// Validate a social URL against whitelist
+pub fn validate_social_url(url: &str) -> Result<(), String> {
+    let url_lower = url.to_lowercase();
+    
+    // Check if blocked
+    for blocked in BLOCKED_SOCIAL_DOMAINS.iter() {
+        if url_lower.contains(blocked) {
+            return Err(format!("Blocked domain: {} - adult content not allowed", blocked));
+        }
+    }
+    
+    // Check if allowed
+    let is_allowed = ALLOWED_SOCIAL_DOMAINS.iter().any(|d| url_lower.contains(d));
+    if !is_allowed {
+        return Err(format!("Domain not whitelisted. Allowed: {:?}", ALLOWED_SOCIAL_DOMAINS));
+    }
+    
+    Ok(())
+}
+
+/// Sanitize social links map, removing invalid URLs
+pub fn sanitize_social_links(links: &serde_json::Value) -> serde_json::Value {
+    let mut sanitized = serde_json::Map::new();
+    
+    if let Some(obj) = links.as_object() {
+        for (platform, url) in obj {
+            if let Some(url_str) = url.as_str() {
+                if !url_str.is_empty() && validate_social_url(url_str).is_ok() {
+                    sanitized.insert(platform.clone(), url.clone());
+                }
+            }
+        }
+    }
+    
+    serde_json::Value::Object(sanitized)
+}
+
 async fn api_save_storefront(
     state: web::Data<ArweaveContentState>,
     body: web::Json<StorefrontArchive>,
 ) -> HttpResponse {
-    match state.manager.save_storefront(body.into_inner()).await {
+    // Validate social links before saving
+    let mut storefront = body.into_inner();
+    
+    // If socialLinks field exists, validate and sanitize
+    if let Some(layout) = storefront.layout.as_object_mut() {
+        if let Some(social_links) = layout.get("socialLinks") {
+            // Validate each URL
+            if let Some(links_obj) = social_links.as_object() {
+                for (platform, url) in links_obj {
+                    if let Some(url_str) = url.as_str() {
+                        if !url_str.is_empty() {
+                            if let Err(e) = validate_social_url(url_str) {
+                                return HttpResponse::BadRequest().json(serde_json::json!({
+                                    "error": "INVALID_SOCIAL_URL",
+                                    "message": format!("{} link rejected: {}", platform, e),
+                                    "blocked_url": url_str
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Sanitize for safety
+            let sanitized = sanitize_social_links(social_links);
+            layout.insert("socialLinks".to_string(), sanitized);
+        }
+    }
+    
+    match state.manager.save_storefront(storefront).await {
         Ok(txid) => HttpResponse::Ok().json(serde_json::json!({"txid": txid})),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
     }

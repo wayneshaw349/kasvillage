@@ -18100,7 +18100,6 @@ impl L2ClientSDK {
 // Format: 32-byte root in OP_DATA script
 //
 
-use reqwest::Client;
 use tokio::runtime::Runtime;
 
 /// Probability proof summary (for L1 metadata reference)
@@ -33986,7 +33985,7 @@ impl KaspaRpcClient {
     pub fn new(endpoint: &str) -> Self {
         Self {
             endpoint: endpoint.to_string(),
-            client: Client::new(),
+            client: reqwest::Client::new(),
         }
     }
 
@@ -54583,6 +54582,7 @@ pub async fn api_storefront_save(
             accepted_currencies: vec!["KAS".to_string()],
             dispute_resolution: "mutual_release".to_string(),
         },
+        layout: req.layout.clone(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         version: 1,
@@ -55475,6 +55475,8 @@ pub fn configure_routes_additions(cfg: &mut web::ServiceConfig) {
         .route("/api/academic/answer-question", web::post().to(api_academic_answer_question))
         .route("/api/academic/decline/{question_hash}", web::post().to(api_academic_decline_question))
         .route("/api/academic/set-price", web::post().to(api_academic_set_price))
+        .route("/api/academic/set-service-prices", web::post().to(api_academic_set_service_prices))
+        .route("/api/academic/services", web::get().to(api_academic_list_services))
         .route("/api/academic/abstracts", web::get().to(api_academic_list_abstracts))
         .route("/api/academic/abstracts/{id}", web::get().to(api_academic_get_abstract))
         .route("/api/academic/profile/{id}", web::get().to(api_academic_get_profile))
@@ -59171,6 +59173,8 @@ pub struct ResearcherProfile {
     pub xp: u64,
     pub abstract_count: u32,
     pub question_price_sompi: u64,
+    pub tutoring_hourly_sompi: u64,
+    pub flat_rate_sompi: u64,
 }
 
 /// Research abstract (public data only)
@@ -59183,6 +59187,7 @@ pub struct ResearchAbstract {
     pub repository_url: String,
     pub url_validated: bool,
     pub keywords: Vec<String>,
+    pub ai_interpretation: Option<String>,
     pub submitted_at: u64,
     pub view_count: u64,
 }
@@ -59252,6 +59257,14 @@ pub struct SubmitAbstractReq {
     pub abstract_text: String,
     pub repository_url: String,
     pub keywords: Vec<String>,
+    pub ai_interpretation: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SetServicePricesReq {
+    pub researcher_id: String,
+    pub tutoring_hourly_sompi: Option<u64>,
+    pub flat_rate_sompi: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -59418,8 +59431,51 @@ pub async fn api_academic_submit_abstract(
     req: web::Json<SubmitAbstractReq>,
     _state: web::Data<AppStateAdditions>,
 ) -> impl Responder {
+    // Validate repository URL against whitelist
+    if let Err(e) = validate_academic_repository_url(&req.repository_url) {
+        return HttpResponse::BadRequest().json(json!({"success": false, "error": e}));
+    }
+    
     let abstract_id = format!("abs_{:016x}", academic_timestamp_now());
-    HttpResponse::Ok().json(json!({"success": true, "abstract_id": abstract_id, "url_validated": true}))
+    HttpResponse::Ok().json(json!({
+        "success": true, 
+        "abstract_id": abstract_id, 
+        "url_validated": true,
+        "ai_interpretation_received": req.ai_interpretation.is_some()
+    }))
+}
+
+pub async fn api_academic_set_service_prices(
+    req: web::Json<SetServicePricesReq>,
+    _state: web::Data<AppStateAdditions>,
+) -> impl Responder {
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "tutoring_hourly_sompi": req.tutoring_hourly_sompi.unwrap_or(0),
+        "flat_rate_sompi": req.flat_rate_sompi.unwrap_or(0)
+    }))
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AcademicServicesQuery {
+    pub service_type: Option<String>,
+    pub category: Option<String>,
+    pub search: Option<String>,
+    pub min_xp: Option<u64>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+pub async fn api_academic_list_services(
+    _query: web::Query<AcademicServicesQuery>,
+    _state: web::Data<AppStateAdditions>,
+) -> impl Responder {
+    // Return mock data for now - real implementation would query researcher_profiles
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "data": [],
+        "total": 0
+    }))
 }
 
 pub async fn api_academic_ask_question(
@@ -59928,8 +59984,8 @@ pub async fn api_dapp_verify_hash(
 }
 
 /// Check if URL is in allowed domains
-pub fn is_allowed_domain(url: &str) -> bool {
-    match url::Url::parse(url) {
+pub fn is_allowed_domain(url_str: &str) -> bool {
+    match reqwest::Url::parse(url_str) {
         Ok(parsed) => {
             if let Some(host) = parsed.host_str() {
                 DAPP_ALLOWED_DOMAINS.iter().any(|d| host.ends_with(d))
@@ -60049,7 +60105,7 @@ pub async fn api_dapp_proxy_fetch(req: web::Json<serde_json::Value>) -> impl Res
     };
     
     // Validate URL format
-    let parsed_url = match url::Url::parse(url) {
+    let parsed_url = match reqwest::Url::parse(url) {
         Ok(u) => u,
         Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid URL"}))
     };
@@ -67362,6 +67418,7 @@ pub struct StorefrontArchive {
     pub banner_cid: Option<String>,     // IPFS CID for banner
     pub categories: Vec<String>,
     pub policies: StorefrontPolicies,
+    pub layout: serde_json::Value,      // Full layout JSON
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub version: u32,
@@ -67796,6 +67853,85 @@ pub fn sanitize_social_links(links: &serde_json::Value) -> serde_json::Value {
                     sanitized.insert(platform.clone(), url.clone());
                 }
             }
+
+// ============================================================================
+// ACADEMIC REPOSITORY WHITELIST - BACKEND ENFORCEMENT
+// ============================================================================
+
+/// Allowed academic repository domains for research abstracts
+pub const ALLOWED_ACADEMIC_DOMAINS: [&str; 19] = [
+    // Preprint servers
+    "arxiv.org",
+    "biorxiv.org",
+    "medrxiv.org",
+    "ssrn.com",
+    "preprints.org",
+    // Institutional repositories
+    "github.com",
+    "gitlab.com",
+    "bitbucket.org",
+    // Academic publishers (open access)
+    "plos.org",
+    "frontiersin.org",
+    "mdpi.com",
+    "hindawi.com",
+    // University domains (catch-all)
+    ".edu",
+    ".ac.uk",
+    ".edu.au",
+    // Research networks
+    "researchgate.net",
+    "academia.edu",
+    // DOI resolver
+    "doi.org",
+    // Blog platforms (allowed)
+    "medium.com",
+];
+
+/// Blocked domains for academic submissions (fraud/low quality risk)
+pub const BLOCKED_ACADEMIC_DOMAINS: [&str; 11] = [
+    "substack.com",
+    "wordpress.com",
+    "blogger.com",
+    "wix.com",
+    "squarespace.com",
+    "notion.so",
+    "docs.google.com",
+    "dropbox.com",
+    "drive.google.com",
+    "pastebin.com",
+    "scribd.com",
+];
+
+/// Validate academic repository URL against whitelist
+pub fn validate_academic_repository_url(url: &str) -> Result<(), String> {
+    let url_lower = url.to_lowercase();
+    
+    // Must start with https
+    if !url_lower.starts_with("https://") {
+        return Err("Repository URL must use HTTPS".to_string());
+    }
+    
+    // Check if blocked
+    for blocked in BLOCKED_ACADEMIC_DOMAINS.iter() {
+        if url_lower.contains(blocked) {
+            return Err(format!(
+                "Domain '{}' not accepted. Please use institutional repositories, arXiv, or other academic platforms.", 
+                blocked
+            ));
+        }
+    }
+    
+    // Check if allowed
+    let is_allowed = ALLOWED_ACADEMIC_DOMAINS.iter().any(|d| url_lower.contains(d));
+    if !is_allowed {
+        return Err(format!(
+            "Repository domain not whitelisted. Accepted: arXiv, bioRxiv, GitHub, Medium, institutional (.edu), ResearchGate, DOI links."
+        ));
+    }
+    
+    Ok(())
+}
         }
     }
     
